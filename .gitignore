@@ -1,0 +1,3 @@
+.DS_Store
+# A real-case target repository with its own history; it is not part of BoundaryX.
+examples/real-case-import-validator/

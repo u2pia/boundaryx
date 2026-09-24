@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "aperture.project.v1",
+  "productType": "application",
+  "context": {
+    "required": [
+      "workbench/README.md",
+      "workbench/package.json"
+    ],
+    "allowed": [
+      "README.md",
+      "workbench/README.md",
+      "workbench/package.json",
+      "docs/PRODUCT_CHARTER.md",
+      "docs/DOMAIN_MODEL.md",
+      "docs/CONTROL_PLANE_DESIGN_V0.3.md",
+      "docs/CONTROL_PLANE_DESIGN_V0.4_DELTA.md",
+      "docs/LOCAL_AGENT_PROTOCOL.md",
+      "docs/CODE_HOST_CONTRACT.md",
+      "docs/MERGE_EVIDENCE_CONTRACT.md"
+    ]
+  },
+  "checks": [
+    {
+      "name": "install-dependencies",
+      "kind": "build",
+      "command": ["npm", "--prefix", "workbench", "ci", "--offline", "--no-audit", "--no-fund"],
+      "timeoutMs": 600000
+    },
+    {
+      "name": "workbench-check",
+      "kind": "test",
+      "command": ["npm", "--prefix", "workbench", "run", "check"],
+      "timeoutMs": 1200000
+    }
+  ],
+  "testPaths": ["workbench/scripts"],
+  "policy": {
+    "maximumRisk": "high",
+    "allowUnisolatedRuntime": true
+  }
+}
