@@ -271,7 +271,15 @@ export type LocalAgentRunDetail = {
   agentRun: LocalAgentRun
   events: LocalDomainEvent[]
   declaredContextPaths: string[]
+  /** Only while the run is `running`: steps the builder has reported so far, before they reach the event log. */
+  liveToolSteps?: LocalAgentToolStep[]
+  liveModelUsage?: LocalAgentModelUsage | null
 }
+
+/** One builder tool call: tool, path or command, outcome. Never file content or command output. */
+export type LocalAgentToolStep = { step: number; tool: string; path?: string; command?: string; outcome: 'ok' | 'failed' | 'error' | 'not_run'; exitCode?: number | null; error?: string }
+
+export type LocalAgentModelUsage = { modelCalls: number; httpRequests: number; callsWithUsage: number; promptTokens: number; completionTokens: number; totalTokens: number; peakContextTokens: number; contextBudgetTokens?: number }
 
 export type LocalAgentRuntimeDescriptor = {
   id: string

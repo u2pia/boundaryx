@@ -6,6 +6,7 @@ import type { ControlPlaneDatabase } from './database.ts'
 import { codeHostFor } from './code-host/index.ts'
 import { CodeHostSyncer } from './code-host/syncer.ts'
 import { createPkcePair, fetchGithubIdentity, githubAuthorizeUrl, type GithubOAuthConfig } from './github-oauth.ts'
+import { readLiveToolSteps } from './git-worktree-agent-runner.ts'
 import type { LocalEvidenceStore } from './local-evidence-store.ts'
 import { LocalGitAuthority } from './local-git-authority.ts'
 import { LocalReleaseAuthority } from './local-release-authority.ts'
@@ -388,7 +389,17 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
 
       const agentRunRoute = routeMatch(path, /^\/api\/agent-runs\/(?<runId>[^/]+)$/u)
       if (method === 'GET' && agentRunRoute) requireIn(database.getAgentRun(agentRunRoute.runId).projectId)
-      if (method === 'GET' && agentRunRoute) return sendJson(response, 200, { agentRun: database.getAgentRun(agentRunRoute.runId), events: database.listAggregateEvents('agent_run', agentRunRoute.runId), declaredContextPaths: database.getDeclaredContextPaths(agentRunRoute.runId) })
+      if (method === 'GET' && agentRunRoute) {
+        const agentRun = database.getAgentRun(agentRunRoute.runId)
+        // A running builder's steps reach the event log only when it exits; until then they are read from the
+        // progress file it appends to. The held provider key is removed again here, whatever the builder wrote.
+        // The key is only compared against, never sent.
+        const providerKey = database.getAgentProviderSettings()?.apiKey
+        const redact = (text: string) => providerKey && providerKey.length >= 8 ? text.replaceAll(providerKey, '[redacted]') : text
+        const requestPath = agentRun.status === 'running' ? database.getAgentRunPlan(agentRun.id).requestPath : undefined
+        const live = requestPath ? readLiveToolSteps(requestPath, redact) : undefined
+        return sendJson(response, 200, { agentRun, events: database.listAggregateEvents('agent_run', agentRunRoute.runId), declaredContextPaths: database.getDeclaredContextPaths(agentRunRoute.runId), ...(live ? { liveToolSteps: live.steps, liveModelUsage: live.usage ?? null } : {}) })
+      }
 
       if (method === 'POST' && path === '/api/work-items') {
         const body = await readJson(request)

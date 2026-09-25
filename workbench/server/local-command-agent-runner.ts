@@ -1,7 +1,7 @@
 import { realpathSync, readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import type { ControlPlaneDatabase } from './database.ts'
-import { GitWorktreeAgentRunner, type AgentExecutionRuntime, type AgentRunPostprocessor, type AgentRuntimeContext } from './git-worktree-agent-runner.ts'
+import { GitWorktreeAgentRunner, runProgressPath, type AgentExecutionRuntime, type AgentRunPostprocessor, type AgentRuntimeContext } from './git-worktree-agent-runner.ts'
 import { sha256 } from './security.ts'
 import type { AgentProviderSettings, AgentRun, AgentRunRequest, AgentRunner, AgentRunnerDescriptor } from './types.ts'
 
@@ -48,16 +48,21 @@ class LocalProcessRuntime implements AgentExecutionRuntime {
   }
 
   execute(context: AgentRuntimeContext) {
-    const result = spawnSync(this.input.executable, this.input.args, { cwd: context.worktreePath, encoding: 'utf8', timeout: context.timeoutMs, maxBuffer: 20 * 1024 * 1024, env: { ...this.buildEnvironment(), APERTURE_RUN_REQUEST: context.requestPath, APERTURE_WORKTREE: context.worktreePath } })
+    const result = spawnSync(this.input.executable, this.input.args, { cwd: context.worktreePath, encoding: 'utf8', timeout: context.timeoutMs, maxBuffer: 20 * 1024 * 1024, env: { ...this.buildEnvironment(), APERTURE_RUN_REQUEST: context.requestPath, APERTURE_WORKTREE: context.worktreePath, APERTURE_RUN_PROGRESS: runProgressPath(context.requestPath) } })
     return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', error: result.error, diagnostic: this.diagnostic(result.stderr ?? '') }
   }
 
-  /** Last lines of stderr, so a failed run says why; the provider key and any other secret variable's value are removed first. */
-  private diagnostic(stderr: string) {
-    let text = stderr
+  /** The provider key and any other secret variable's value this runtime passes to the agent, removed from a text. */
+  redact(text: string) {
+    let redacted = text
     const environment = this.buildEnvironment() as Record<string, string | undefined>
-    for (const [key, value] of Object.entries(environment)) if (value && value.length >= 8 && /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/u.test(key)) text = text.replaceAll(value, '[redacted]')
-    const tail = text.trim().split('\n').slice(-40).join('\n')
+    for (const [key, value] of Object.entries(environment)) if (value && value.length >= 8 && /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/u.test(key)) redacted = redacted.replaceAll(value, '[redacted]')
+    return redacted
+  }
+
+  /** Last lines of stderr, so a failed run says why; secrets are removed first. */
+  private diagnostic(stderr: string) {
+    const tail = this.redact(stderr).trim().split('\n').slice(-40).join('\n')
     return tail ? tail.slice(-4000) : undefined
   }
 
@@ -65,6 +70,7 @@ class LocalProcessRuntime implements AgentExecutionRuntime {
     const allowed = new Set(['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS', ...this.input.environmentAllowlist])
     for (const key of Object.keys(process.env)) if (key.startsWith('CODEX_')) allowed.add(key)
     if (process.env.APERTURE_BUILDER_MAX_STEPS) allowed.add('APERTURE_BUILDER_MAX_STEPS')
+    if (process.env.APERTURE_BUILDER_MAX_CONTEXT_TOKENS) allowed.add('APERTURE_BUILDER_MAX_CONTEXT_TOKENS')
     // An operator who keeps the key in the server environment instead of in the Control Plane still needs
     // that one variable to reach the agent, without widening the allowlist by hand.
     if (this.input.provider?.apiKeyEnv && !this.input.provider.apiKey) allowed.add(this.input.provider.apiKeyEnv)
