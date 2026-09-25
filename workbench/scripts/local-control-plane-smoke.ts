@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { ControlPlaneDatabase } from '../server/database.ts'
 import { useProjectRepository } from './fixtures.ts'
 import { LocalGitAuthority } from '../server/local-git-authority.ts'
@@ -110,6 +111,19 @@ try {
   database.recordEvidenceView(refreshedEvidence.id, reviewer.id, refreshedEvidence.sha256)
   database.recordReview({ proposalId: proposal.id, headSha: refresh.proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'follow-up evidence verified' })
   git('checkout', 'main')
+  // An event inserted around the Control Plane (INSERT is not blocked by the append-only triggers) breaks the hash
+  // chain, and the merge refuses before the branch moves.
+  const forger = new DatabaseSync(databasePath)
+  const last = forger.prepare("SELECT * FROM domain_events WHERE aggregate_type = 'change_proposal' AND aggregate_id = ? ORDER BY aggregate_version DESC LIMIT 1").get(proposal.id) as Record<string, string | number>
+  forger.prepare("INSERT INTO domain_events(id, project_id, aggregate_type, aggregate_id, aggregate_version, event_type, actor_id, payload_json, previous_event_digest, event_digest, occurred_at, recorded_at) VALUES ('EVT-FORGED', ?, 'change_proposal', ?, ?, 'review.approved', ?, '{}', ?, 'sha256:forged', ?, ?)").run(last.project_id, proposal.id, Number(last.aggregate_version) + 1, reviewer.id, last.event_digest, String(last.occurred_at), String(last.recorded_at))
+  const mainBefore = git('rev-parse', 'main')
+  assert.throws(() => authority.mergeChangeProposal(proposal.id, owner.id), (error) => error instanceof AppError && error.code === 'event_chain_broken')
+  assert.equal(git('rev-parse', 'main'), mainBefore, 'a broken chain refuses before the branch moves')
+  // Undoing the forgery takes dropping a trigger, which only someone with the database file can do.
+  const deleteTrigger = forger.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'domain_events' AND sql LIKE '%DELETE%'").get() as { name: string; sql: string }
+  forger.exec(`DROP TRIGGER ${deleteTrigger.name}; DELETE FROM domain_events WHERE id = 'EVT-FORGED'; ${deleteTrigger.sql};`)
+  forger.close()
+  assert.equal(database.verifyAggregateEventChain('change_proposal', proposal.id), true)
   const merged = authority.mergeChangeProposal(proposal.id, owner.id)
   assert.equal(merged.changed, true)
   assert.equal(merged.proposal.status, 'merged')

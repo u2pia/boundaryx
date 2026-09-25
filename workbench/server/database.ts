@@ -850,6 +850,7 @@ export class ControlPlaneDatabase {
     if (readiness.status !== 'ready') throw new AppError(409, 'Merge requires complete successful checks and evidence', 'merge_evidence_incomplete')
     const approvalRows = this.db.prepare("SELECT id FROM review_decisions WHERE change_proposal_id = ? AND head_sha = ? AND decision = 'approved' AND invalidated_at IS NULL ORDER BY created_at, rowid").all(input.proposalId, proposal.headSha) as Array<{ id: string }>
     if (!approvalRows.length) throw new AppError(409, 'Merge requires an active approval for the current Head SHA', 'merge_approval_missing')
+    this.assertMergeEventChainsIntact(input.proposalId)
     const identity = this.decisionIdentity(actorId)
     const proposalEvents = this.listAggregateEvents('change_proposal', input.proposalId)
     const timestamp = nowIso()
@@ -882,6 +883,7 @@ export class ControlPlaneDatabase {
       ...(input.host.contentCheck === 'mismatch' ? ['merged revision contains neither the approved head nor its patch'] : []),
       ...(input.host.hostHeadSha && input.host.hostHeadSha !== proposal.headSha ? [`pull request head was ${input.host.hostHeadSha.slice(0, 12)}, not the approved ${proposal.headSha.slice(0, 12)}`] : []),
       ...(input.host.gateStateAtMerge !== 'success' ? [`aperture/gate was ${input.host.gateStateAtMerge} on the host`] : []),
+      ...(() => { try { this.assertMergeEventChainsIntact(input.proposalId); return [] } catch (error) { return [error instanceof Error ? error.message : String(error)] } })(),
     ]
     const hostMerge: HostMergeRecord = { ...input.host, outsideGate: reasons.length > 0, outsideGateReasons: reasons }
     const proposalEvents = this.listAggregateEvents('change_proposal', input.proposalId)
@@ -1498,6 +1500,17 @@ export class ControlPlaneDatabase {
   listAggregateEvents(aggregateType: string, aggregateId: string): DomainEvent[] {
     const rows = this.db.prepare('SELECT * FROM domain_events WHERE aggregate_type = ? AND aggregate_id = ? ORDER BY aggregate_version').all(aggregateType, aggregateId) as Array<Record<string, SqlValue>>
     return rows.map((row) => this.mapEvent(row))
+  }
+
+  /**
+   * Merging is the last moment the audit trail can still refuse something, so it re-verifies the hash chains the
+   * decision rests on: the proposal's own events and those of every run that produced its evidence. Append-only
+   * triggers stop UPDATE and DELETE; this catches a row inserted around them (a forged approval, say).
+   */
+  assertMergeEventChainsIntact(proposalId: string) {
+    const runIds = (this.db.prepare('SELECT DISTINCT run_id FROM evidence_packages WHERE change_proposal_id = ?').all(proposalId) as Array<{ run_id: string }>).map((row) => row.run_id)
+    const broken = [['change_proposal', proposalId], ...runIds.map((runId) => ['agent_run', runId])].filter(([type, aggregateId]) => !this.verifyAggregateEventChain(type, aggregateId)).map(([type, aggregateId]) => `${type} ${aggregateId}`)
+    if (broken.length) throw new AppError(409, `The event chain of ${broken.join(', ')} does not verify; the audit trail was altered outside the Control Plane`, 'event_chain_broken')
   }
 
   verifyAggregateEventChain(aggregateType: string, aggregateId: string) {

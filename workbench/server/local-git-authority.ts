@@ -118,6 +118,8 @@ export class LocalGitAuthority {
     if (currentHeadSha !== proposal.headSha) throw new AppError(409, 'Head branch changed after approval; refresh and review again', 'merge_head_drift')
     if (!isAncestor(proposal.repositoryPath, proposal.baseSha, proposal.headSha)) throw new AppError(409, 'Approved Head is not a fast-forward descendant of the target branch', 'merge_not_fast_forward')
     if (this.database.getReviewReadiness(proposalId).status !== 'ready') throw new AppError(409, 'Merge requires complete successful checks and evidence', 'merge_evidence_incomplete')
+    // Checked again when the record is written, but by then the branch has moved and been published.
+    this.database.assertMergeEventChainsIntact(proposalId)
 
     const baseWorktreePath = findBranchWorktree(proposal.repositoryPath, baseFullRef)
     if (baseWorktreePath) {

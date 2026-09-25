@@ -119,8 +119,12 @@ try {
     assert.deepEqual(unverified.map((item) => item.independent), [false, false], 'no testPaths and no verified dataset: nothing is independent')
     const withBaseline = mapCriteriaToChecks(intent, [{ name: 'unit', kind: 'test', provenance: 'all_tests' }, { name: 'unit@baseline', kind: 'test', provenance: 'pre_existing' }])
     assert.equal(withBaseline[0].independent, true, 'a re-run on the base test files is independent')
-    const datasetVerified = mapCriteriaToChecks(intent, [{ name: 'evaluation-dataset-integrity', kind: 'integrity', conclusion: 'success' }, { name: 'grader', kind: 'evaluation', conclusion: 'success' }])
-    assert.equal(datasetVerified[1].independent, true, 'a verified hidden dataset makes the evaluation independent')
+    // An evaluation is independent only with both an untouched dataset and a grader the run did not write.
+    const integrity = { name: 'evaluation-dataset-integrity', kind: 'integrity' as const, conclusion: 'success' }
+    assert.equal(mapCriteriaToChecks(intent, [integrity, { name: 'grader', kind: 'evaluation', conclusion: 'success' }])[1].independent, false, 'a verified dataset alone does not make the evaluation independent: the run may have written the grader')
+    assert.equal(mapCriteriaToChecks(intent, [integrity, { name: 'grader', kind: 'evaluation', provenance: 'all_tests', conclusion: 'success' }])[1].independent, false, 'a grader the run modified is not independent')
+    assert.equal(mapCriteriaToChecks(intent, [{ name: 'grader', kind: 'evaluation', provenance: 'pre_existing', conclusion: 'success' }])[1].independent, false, 'an untouched grader on an unverified dataset is not independent')
+    assert.equal(mapCriteriaToChecks(intent, [integrity, { name: 'grader', kind: 'evaluation', provenance: 'pre_existing', conclusion: 'success' }])[1].independent, true, 'a verified dataset scored by the base grader is independent')
 
     database.recordCheck({ proposalId: proposal.id, headSha: proposal.headSha, name: 'unit', status: 'completed', conclusion: 'success', source: 'run', runId: 'RUN-self-graded' }, owner.id)
     database.recordCheck({ proposalId: proposal.id, headSha: proposal.headSha, name: 'grader', status: 'completed', conclusion: 'success', source: 'run', runId: 'RUN-self-graded' }, owner.id)

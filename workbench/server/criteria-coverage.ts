@@ -20,7 +20,7 @@ export type CriterionCoverage = {
   /**
    * At least one mapped result does not depend on anything the run authored: a test run on the base revision's test
    * files (`pre_existing`, including `@baseline` re-runs), a build, or an evaluation whose hidden dataset was verified
-   * unchanged, or a check reported externally (the author is forbidden from reporting checks on their own proposal).
+   * unchanged and whose grader the run did not modify, or a check reported externally (the author is forbidden from reporting checks on their own proposal).
    * DOMAIN_MODEL.md §5.6: `added_by_run` evidence alone cannot prove a critical criterion.
    */
   independent?: boolean
@@ -36,7 +36,9 @@ const kindsFor = { deterministic: ['test', 'build', 'evaluation'], model: ['eval
 
 export function mapCriteriaToChecks(intent: IntentVersion, checks: Array<{ name: string; kind: CheckKind; provenance?: string; conclusion?: string }>): CriterionCoverage[] {
   const datasetVerified = checks.some((check) => check.name === 'evaluation-dataset-integrity' && check.conclusion === 'success')
-  const isIndependent = (check: { kind: CheckKind; provenance?: string }) => check.kind === 'build' || check.provenance === 'pre_existing' || check.provenance === 'external' || (check.kind === 'evaluation' && datasetVerified)
+  // An evaluation needs both: a dataset the run did not touch and a grader the run did not write (`pre_existing`,
+  // from evaluation.harnessPaths or its @baseline re-run). Either alone lets the run grade itself.
+  const isIndependent = (check: { kind: CheckKind; provenance?: string }) => check.kind === 'evaluation' ? datasetVerified && check.provenance === 'pre_existing' : check.kind === 'build' || check.provenance === 'pre_existing' || check.provenance === 'external'
   return intent.acceptanceCriteria.map((criterion) => {
     const base = { criterionId: criterion.id, label: `AC-${criterion.ordinal}`, statement: criterion.statement, criticality: criterion.criticality, verificationType: criterion.verificationType, mapping: 'rule' as const }
     if (criterion.verificationType === 'human') return { ...base, checkNames: [] }

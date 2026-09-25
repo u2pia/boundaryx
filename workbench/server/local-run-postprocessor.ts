@@ -42,6 +42,7 @@ type ExecutedCheck = {
   testTreeSha?: string
   agentModifiedTestFiles?: string[]
   metrics?: Record<string, number>
+  metricConflicts?: string[]
   thresholdResults?: Array<ProjectEvaluationThreshold & { actual?: number; passed: boolean }>
 }
 
@@ -49,17 +50,26 @@ function excerpt(value: string) {
   return value.replace(/\u001b\[[0-9;]*m/gu, '').slice(0, 4000)
 }
 
+/**
+ * The metrics an evaluation printed. A metric reported twice with different values is a conflict, not "the last one
+ * wins": the code under evaluation shares the grader's stdout and could otherwise print a better score after it.
+ */
 function evaluationMetrics(stdout: string) {
   const metrics: Record<string, number> = {}
+  const conflicts = new Set<string>()
   for (const line of stdout.split('\n')) {
     if (!line.trim().startsWith('{')) continue
     try {
       const value = JSON.parse(line) as Record<string, unknown>
       if (value.type !== 'evaluation_metrics' || !value.metrics || typeof value.metrics !== 'object' || Array.isArray(value.metrics)) continue
-      for (const [name, metric] of Object.entries(value.metrics as Record<string, unknown>)) if (typeof metric === 'number' && Number.isFinite(metric)) metrics[name] = metric
+      for (const [name, metric] of Object.entries(value.metrics as Record<string, unknown>)) {
+        if (typeof metric !== 'number' || !Number.isFinite(metric)) continue
+        if (name in metrics && metrics[name] !== metric) conflicts.add(name)
+        metrics[name] = metric
+      }
     } catch {}
   }
-  return metrics
+  return { metrics, conflicts: [...conflicts] }
 }
 
 export class LocalRunPostprocessor implements AgentRunPostprocessor {
@@ -75,9 +85,14 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const testPaths = input.projectManifest.manifest.testPaths
     const agentModifiedTestFiles = testPaths.length ? this.diffFiles(input.worktreePath, input.proposal.baseSha, input.proposal.headSha, testPaths) : []
     const headProvenance: CheckProvenance = !testPaths.length ? 'unverified' : agentModifiedTestFiles.length ? 'all_tests' : 'pre_existing'
+    // The grader gets the same treatment as the tests: which revision of it produced each evaluation result.
+    const harnessPaths = input.projectManifest.manifest.evaluation.harnessPaths ?? []
+    const agentModifiedHarnessFiles = harnessPaths.length ? this.diffFiles(input.worktreePath, input.proposal.baseSha, input.proposal.headSha, harnessPaths) : []
+    const harnessProvenance: CheckProvenance = !harnessPaths.length ? 'unverified' : agentModifiedHarnessFiles.length ? 'all_tests' : 'pre_existing'
     if (input.projectManifest.manifest.evaluation.profile === 'agent_dataset') checks.push(this.recordEvaluationDatasetIntegrity(input))
-    checks.push(...manifestChecks.map((check) => this.executeCheck({ name: check.name, kind: check.kind, executable: check.command[0], args: check.command.slice(1), timeoutMs: check.timeoutMs }, input, check.kind === 'test' ? { provenance: headProvenance, testTreeSha: input.proposal.headSha, agentModifiedTestFiles } : undefined)))
-    if (agentModifiedTestFiles.length) checks.push(...this.executeBaselineTestChecks(input, testPaths, agentModifiedTestFiles))
+    checks.push(...manifestChecks.map((check) => this.executeCheck({ name: check.name, kind: check.kind, executable: check.command[0], args: check.command.slice(1), timeoutMs: check.timeoutMs }, input, check.kind === 'test' ? { provenance: headProvenance, testTreeSha: input.proposal.headSha, agentModifiedTestFiles } : check.kind === 'evaluation' ? { provenance: harnessProvenance, testTreeSha: input.proposal.headSha, agentModifiedTestFiles: agentModifiedHarnessFiles } : undefined)))
+    if (agentModifiedTestFiles.length) checks.push(...this.executeBaselineChecks(input, 'test', testPaths, agentModifiedTestFiles))
+    if (agentModifiedHarnessFiles.length) checks.push(...this.executeBaselineChecks(input, 'evaluation', harnessPaths, agentModifiedHarnessFiles))
     const artifacts = this.collectBuildArtifacts(input, checks)
     const allowedArtifactPaths = new Set(artifacts.map((artifact) => artifact.path))
     const dirty = execFileSync('git', ['-C', input.worktreePath, 'status', '--porcelain', '--untracked-files=all'], { encoding: 'utf8' }).trim().split('\n').filter((line) => line && !allowedArtifactPaths.has(line.slice(3))).join('\n')
@@ -95,7 +110,20 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
         : headProvenance === 'pre_existing'
           ? 'The run did not modify any declared test path; every test result is independent of the change under review.'
           : 'The run modified declared test paths, so the head test results are not independent. The @baseline results were produced with the test files reset to the proposal base revision.',
+      // Everything else the run changed stayed at head during the @baseline re-runs: the code under test by design,
+      // but also any helper or fixture outside testPaths. Listed so the reviewer can see where the baseline ends.
+      filesAtHeadDuringBaseline: agentModifiedTestFiles.length ? this.diffFiles(input.worktreePath, input.proposal.baseSha, input.proposal.headSha, ['.']).filter((file) => !agentModifiedTestFiles.includes(file)) : [],
     }
+    const evaluationProvenance = input.projectManifest.manifest.evaluation.profile === 'agent_dataset' ? {
+      declaredHarnessPaths: harnessPaths,
+      agentModifiedHarnessFiles,
+      independent: harnessProvenance !== 'unverified',
+      note: harnessProvenance === 'unverified'
+        ? 'The project manifest declares no evaluation.harnessPaths, so the run could have edited the grader: no evaluation result in this package is independent of the change under review.'
+        : harnessProvenance === 'pre_existing'
+          ? 'The run did not modify the declared grader; the evaluation results come from the base revision of it.'
+          : 'The run modified the declared grader, so the head evaluation results are not independent. The @baseline results were produced with the grader reset to the proposal base revision.',
+    } : undefined
     const criteriaCoverage = mapCriteriaToChecks(input.intent, checks)
     const runEvents = this.input.database.listAggregateEvents('agent_run', input.runId)
     const proposalEvents = this.input.database.listAggregateEvents('change_proposal', input.proposal.id)
@@ -116,6 +144,7 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
       checks,
       criteriaCoverage,
       testProvenance,
+      ...(evaluationProvenance ? { evaluationProvenance } : {}),
       // DOMAIN_MODEL.md §9.1.1: marked prominently when the run edited the rules that govern it. Every check above ran
       // under the base revision's manifest, so none of them evaluates the new rules.
       policyChanges: { pathPrefix: POLICY_PATH_PREFIX, files: input.proposal.policyFiles ?? [], governedBy: `${input.projectManifest.path}@${input.projectManifest.baseSha}` },
@@ -150,11 +179,12 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
   }
 
   /**
-   * Re-runs every declared test check with the test files reset to the proposal base revision, so
-   * that the package carries at least one conclusion the agent could not have authored the tests for.
+   * Re-runs every declared check of `kind` with `paths` (the tests, or the grader) reset to the proposal base
+   * revision, so that the package carries at least one conclusion the agent could not have authored the questions or
+   * the scoring for. The code under test stays at head: that is what is being judged.
    */
-  private executeBaselineTestChecks(input: AgentRunPostprocessorInput, testPaths: string[], agentModifiedTestFiles: string[]): ExecutedCheck[] {
-    const definitions = input.projectManifest.manifest.checks.filter((check) => check.kind === 'test')
+  private executeBaselineChecks(input: AgentRunPostprocessorInput, kind: 'test' | 'evaluation', testPaths: string[], agentModifiedTestFiles: string[]): ExecutedCheck[] {
+    const definitions = input.projectManifest.manifest.checks.filter((check) => check.kind === kind)
     if (!definitions.length) return []
     const headFiles = this.treeFiles(input.worktreePath, input.proposal.headSha, testPaths)
     const baseFiles = this.treeFiles(input.worktreePath, input.proposal.baseSha, testPaths)
@@ -162,7 +192,7 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     try {
       this.materializeTestPaths(input.worktreePath, input.proposal.baseSha, testPaths, headFiles)
     } catch (error) {
-      return [this.recordBaselineUnavailable(input, error instanceof Error ? error.message : String(error))]
+      return [this.recordBaselineUnavailable(input, kind, error instanceof Error ? error.message : String(error))]
     }
     try {
       for (const definition of definitions) results.push(this.executeCheck({ name: `${definition.name}@baseline`, kind: definition.kind, executable: definition.command[0], args: definition.command.slice(1), timeoutMs: definition.timeoutMs }, input, { provenance: 'pre_existing', testTreeSha: input.proposal.baseSha, agentModifiedTestFiles }))
@@ -172,13 +202,14 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     return results
   }
 
-  private recordBaselineUnavailable(input: AgentRunPostprocessorInput, reason: string): ExecutedCheck {
-    const message = `Could not reset declared test paths to base revision ${input.proposal.baseSha}: ${reason}`
+  private recordBaselineUnavailable(input: AgentRunPostprocessorInput, kind: 'test' | 'evaluation', reason: string): ExecutedCheck {
+    const name = kind === 'test' ? 'baseline-tests-available' : 'baseline-evaluation-available'
+    const message = `Could not reset declared ${kind === 'test' ? 'test paths' : 'evaluation harness paths'} to base revision ${input.proposal.baseSha}: ${reason}`
     const stdoutDigest = `sha256:${sha256('')}`
     const stderrDigest = `sha256:${sha256(message)}`
-    const check = this.input.database.recordCheck({ proposalId: input.proposal.id, headSha: input.proposal.headSha, name: 'baseline-tests-available', status: 'completed', conclusion: 'failure', exitCode: 1, durationMs: 0, stdoutDigest, stderrDigest, source: 'run', runId: input.runId }, input.actorId)
-    this.input.database.recordAgentRunEvent(input.runId, 'agent_run.baseline_tests_unavailable', { checkId: check.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, baseSha: input.proposal.baseSha, reason }, input.actorId)
-    return { id: check.id, name: 'baseline-tests-available', kind: 'integrity', conclusion: 'failure', exitCode: 1, durationMs: 0, stdoutDigest, stderrDigest, stdoutExcerpt: '', stderrExcerpt: message }
+    const check = this.input.database.recordCheck({ proposalId: input.proposal.id, headSha: input.proposal.headSha, name, status: 'completed', conclusion: 'failure', exitCode: 1, durationMs: 0, stdoutDigest, stderrDigest, source: 'run', runId: input.runId }, input.actorId)
+    this.input.database.recordAgentRunEvent(input.runId, kind === 'test' ? 'agent_run.baseline_tests_unavailable' : 'agent_run.baseline_evaluation_unavailable', { checkId: check.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, baseSha: input.proposal.baseSha, reason }, input.actorId)
+    return { id: check.id, name, kind: 'integrity', conclusion: 'failure', exitCode: 1, durationMs: 0, stdoutDigest, stderrDigest, stdoutExcerpt: '', stderrExcerpt: message }
   }
 
   private executeCheck(definition: LocalCheckDefinition, input: AgentRunPostprocessorInput, testOrigin?: { provenance: CheckProvenance; testTreeSha: string; agentModifiedTestFiles: string[] }): ExecutedCheck {
@@ -188,15 +219,17 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const stderr = result.stderr ?? ''
     const durationMs = Date.now() - started
     const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT'
-    const metrics = definition.kind === 'evaluation' ? evaluationMetrics(stdout) : undefined
+    const reported = definition.kind === 'evaluation' ? evaluationMetrics(stdout) : undefined
+    const metrics = reported?.metrics
+    const metricConflicts = reported?.conflicts.length ? reported.conflicts : undefined
     const thresholdResults = definition.kind === 'evaluation' && input.projectManifest.manifest.evaluation.profile === 'agent_dataset' ? input.projectManifest.manifest.evaluation.thresholds.map((threshold) => { const actual = metrics?.[threshold.metric]; return { ...threshold, actual, passed: actual !== undefined && (threshold.operator === 'gte' ? actual >= threshold.threshold : actual <= threshold.threshold) } }) : undefined
     const thresholdFailed = thresholdResults?.some((threshold) => !threshold.passed) ?? false
-    const conclusion = timedOut ? 'cancelled' : result.status === 0 && !thresholdFailed ? 'success' : 'failure'
+    const conclusion = timedOut ? 'cancelled' : result.status === 0 && !thresholdFailed && !metricConflicts ? 'success' : 'failure'
     const stdoutDigest = `sha256:${sha256(stdout)}`
     const stderrDigest = `sha256:${sha256(stderr)}`
     const check = this.input.database.recordCheck({ proposalId: input.proposal.id, headSha: input.proposal.headSha, name: definition.name, status: 'completed', conclusion, exitCode: result.status ?? undefined, durationMs, stdoutDigest, stderrDigest, source: 'run', runId: input.runId }, input.actorId)
-    this.input.database.recordAgentRunEvent(input.runId, 'agent_run.check_completed', { checkId: check.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, name: definition.name, kind: definition.kind, conclusion, exitCode: result.status ?? null, durationMs, stdoutDigest, stderrDigest, provenance: testOrigin?.provenance ?? null, testTreeSha: testOrigin?.testTreeSha ?? null, metrics: metrics ?? null, thresholdResults: thresholdResults ?? null }, input.actorId)
-    return { id: check.id, name: definition.name, kind: definition.kind, conclusion, exitCode: result.status ?? undefined, durationMs, stdoutDigest, stderrDigest, stdoutExcerpt: excerpt(stdout), stderrExcerpt: excerpt(stderr || result.error?.message || ''), provenance: testOrigin?.provenance, testTreeSha: testOrigin?.testTreeSha, agentModifiedTestFiles: testOrigin?.agentModifiedTestFiles, metrics, thresholdResults }
+    this.input.database.recordAgentRunEvent(input.runId, 'agent_run.check_completed', { checkId: check.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, name: definition.name, kind: definition.kind, conclusion, exitCode: result.status ?? null, durationMs, stdoutDigest, stderrDigest, provenance: testOrigin?.provenance ?? null, testTreeSha: testOrigin?.testTreeSha ?? null, metrics: metrics ?? null, metricConflicts: metricConflicts ?? null, thresholdResults: thresholdResults ?? null }, input.actorId)
+    return { id: check.id, name: definition.name, kind: definition.kind, conclusion, exitCode: result.status ?? undefined, durationMs, stdoutDigest, stderrDigest, stdoutExcerpt: excerpt(stdout), stderrExcerpt: excerpt(stderr || result.error?.message || ''), provenance: testOrigin?.provenance, testTreeSha: testOrigin?.testTreeSha, agentModifiedTestFiles: testOrigin?.agentModifiedTestFiles, metrics, metricConflicts, thresholdResults }
   }
 
   private collectBuildArtifacts(input: AgentRunPostprocessorInput, checks: ExecutedCheck[]) {

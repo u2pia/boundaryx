@@ -36,6 +36,13 @@ export type ProjectManifest = {
   evaluation: {
     profile: 'application_checks' | 'agent_dataset'
     datasetPath?: string
+    /**
+     * Repository paths of the grader: the code that reads the dataset and prints the metrics. An unchanged dataset
+     * says nothing about honest scoring when the run can edit the scorer, so an evaluation is independent evidence
+     * only when the run left these paths untouched, and is re-run with them reset to the base revision when it did
+     * not. Undeclared means no evaluation result in the package is independent.
+     */
+    harnessPaths?: string[]
     thresholds: ProjectEvaluationThreshold[]
   }
   artifact?: {
@@ -127,7 +134,9 @@ function parseManifest(raw: string): ProjectManifest {
       return { metric: threshold.metric.trim(), operator: threshold.operator, threshold: threshold.threshold }
     })
     if (!checks.some((check) => check.kind === 'evaluation')) throw new AppError(422, 'Agent systems require at least one evaluation check', 'invalid_project_manifest')
-    evaluation = { profile: 'agent_dataset', datasetPath, thresholds }
+    const harnessPaths = configured.harnessPaths === undefined ? undefined : stringArray(configured.harnessPaths, 'evaluation.harnessPaths')
+    if (harnessPaths && !harnessPaths.length) throw new AppError(422, 'evaluation.harnessPaths must contain at least one path when declared', 'invalid_project_manifest')
+    evaluation = { profile: 'agent_dataset', datasetPath, ...(harnessPaths ? { harnessPaths } : {}), thresholds }
   } else {
     if (root.evaluation !== undefined) {
       const configured = requireObject(root.evaluation, 'evaluation')
