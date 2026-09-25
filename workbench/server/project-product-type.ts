@@ -1,5 +1,4 @@
-import { execFileSync } from 'node:child_process'
-import { resolveProjectRepository } from './code-host/index.ts'
+import { projectDefaultBranchHead } from './project-context.ts'
 import { loadProjectManifest } from './project-manifest.ts'
 import { AppError, type Project, type WorkItem } from './types.ts'
 
@@ -9,16 +8,9 @@ import { AppError, type Project, type WorkItem } from './types.ts'
  * its first Run for being the other. `undefined` means the project has no repository yet; nothing can run there.
  */
 export function projectProductType(database: { getProject(projectId: string): Project; dataDirectory: string }, projectId: string): WorkItem['productType'] | undefined {
-  const project = database.getProject(projectId)
-  if (project.codeHost === 'local' && !project.repositoryPath) return undefined
-  const { host, repositoryPath } = resolveProjectRepository(database, projectId)
-  host.prepareForRun()
-  let baseSha: string
-  try {
-    baseSha = execFileSync('git', ['-C', repositoryPath, 'rev-parse', '--verify', `${project.defaultBranch}^{commit}`], { encoding: 'utf8' }).trim()
-  } catch {
-    throw new AppError(409, `Project ${project.slug} has no branch ${project.defaultBranch}`, 'project_default_branch_missing')
-  }
+  const head = projectDefaultBranchHead(database, projectId)
+  if (!head) return undefined
+  const { project, repositoryPath, baseSha } = head
   try {
     return loadProjectManifest(repositoryPath, baseSha).manifest.productType
   } catch (error) {

@@ -196,10 +196,22 @@ try {
   // A work item's product type is the project's, read from the manifest on its default branch.
   const unconfigured = await call('/api/work-items', { cookie: aliceCookie, body: { title: 'x', description: 'x', projectId: beta.id } })
   assert.deepEqual([unconfigured.status, unconfigured.body.error.code], [422, 'project_manifest_missing'], 'no Intent before the project says what it builds')
+  const noManifest = (await call<{ context: { manifestFound: boolean; issues: Array<{ code: string }> } }>(`/api/projects/${beta.id}/context`, { cookie: aliceCookie })).body.context
+  assert.deepEqual([noManifest.manifestFound, noManifest.issues.map((issue) => issue.code)], [false, ['manifest_missing']])
   mkdirSync(join(betaRepository, '.aperture'))
-  writeFileSync(join(betaRepository, '.aperture/project.json'), JSON.stringify({ schemaVersion: 'aperture.project.v1', productType: 'application', context: { required: ['README.md'], allowed: ['README.md'] }, checks: [{ name: 'beta', kind: 'test', command: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 10_000 }], policy: { maximumRisk: 'high', allowUnisolatedRuntime: true } }))
-  execFileSync('git', ['-C', betaRepository, 'add', '.aperture'])
+  writeFileSync(join(betaRepository, 'CLAUDE.md'), 'See docs.\n')
+  writeFileSync(join(betaRepository, '.aperture/project.json'), JSON.stringify({ schemaVersion: 'aperture.project.v1', productType: 'application', context: { required: ['README.md'], allowed: ['README.md', 'docs/rules.md'] }, checks: [{ name: 'beta', kind: 'test', command: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 10_000 }], policy: { maximumRisk: 'high', allowUnisolatedRuntime: true } }))
+  execFileSync('git', ['-C', betaRepository, 'add', '.aperture', 'CLAUDE.md'])
   execFileSync('git', ['-C', betaRepository, 'commit', '--quiet', '-m', 'manifest'])
+  // The context a Run would bind is readable by members, flags what a Run would miss, and serves only declared files.
+  const context = (await call<{ context: { files: Array<{ path: string; required: boolean; exists: boolean; sizeBytes?: number; lastCommit?: { subject: string } }>; requiredBytes: number; issues: Array<{ code: string; path?: string }> } }>(`/api/projects/${beta.id}/context`, { cookie: aliceCookie })).body.context
+  assert.deepEqual(context.files.map((file) => [file.path, file.required, file.exists]), [['README.md', true, true], ['docs/rules.md', false, false]])
+  assert.equal(context.requiredBytes, '# beta\n'.length)
+  assert.equal(context.files[0].lastCommit?.subject, 'initial')
+  assert.deepEqual(context.issues.map((issue) => [issue.code, issue.path]), [['file_missing', 'docs/rules.md'], ['undeclared_instructions', 'CLAUDE.md']])
+  assert.equal((await call(`/api/projects/${beta.id}/context`, { cookie: bobCookie })).status, 404, 'a non-member cannot read the context')
+  assert.deepEqual((await call<{ file: { content: string } }>(`/api/projects/${beta.id}/context/file?path=README.md`, { cookie: aliceCookie })).body.file.content, '# beta\n')
+  for (const path of ['CLAUDE.md', '.aperture/project.json', '../etc/passwd']) assert.equal((await call(`/api/projects/${beta.id}/context/file?path=${encodeURIComponent(path)}`, { cookie: aliceCookie })).status, 404, `${path} is not declared context`)
   assert.deepEqual((await call(`/api/projects/${beta.id}/product-type`, { cookie: aliceCookie })).body, { productType: 'application' })
   assert.equal((await call(`/api/projects/${beta.id}/product-type`, { cookie: bobCookie })).status, 404, 'a non-member cannot read it')
   const mismatched = await call('/api/work-items', { cookie: aliceCookie, body: { title: 'x', description: 'x', projectId: beta.id, productType: 'agent_system' } })
@@ -266,7 +278,7 @@ try {
   assert.throws(() => upgraded.db.prepare("UPDATE domain_events SET event_type = 'x' WHERE id = 'EVT-L'").run(), /append-only/u, 'the append-only guard is back after the backfill')
   upgraded.close()
 
-  console.log('project scope smoke passed · non-members see nothing · roles per project · reviewers picked from members · repository from the project · local paths validated · 019 backfill splits by repository · everyone sees the default project · work items numbered per project · product type taken from the project manifest')
+  console.log('project scope smoke passed · non-members see nothing · roles per project · reviewers picked from members · repository from the project · local paths validated · 019 backfill splits by repository · everyone sees the default project · work items numbered per project · product type taken from the project manifest · project context read from the default branch')
 } finally {
   database.close()
   rmSync(root, { recursive: true, force: true })

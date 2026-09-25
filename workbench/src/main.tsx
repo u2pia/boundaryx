@@ -72,7 +72,7 @@ import { criteriaSyntaxHint, criticalityLabels, inspectStatement, intentTemplate
 import type { WorkbenchState } from './store-model'
 import { useWorkbench } from './use-workbench'
 import { useLocalControlPlane } from './local-control-plane-context'
-import type { LocalActor, LocalActorUpdate, LocalAgentRun, LocalAgentRunDetail, LocalAgentRuntimeDescriptor, LocalWorkItem, LocalCodeHostConnection, LocalProject, LocalProjectInput, LocalProjectRole, LocalIdentityMode, LocalChangeProposal, LocalEvidencePackageView, LocalIntentVersion, LocalReviewAssignment, LocalReviewReadiness } from './local-control-plane-client'
+import type { LocalActor, LocalActorUpdate, LocalAgentRun, LocalAgentRunDetail, LocalProjectContext, LocalAgentRuntimeDescriptor, LocalWorkItem, LocalCodeHostConnection, LocalProject, LocalProjectInput, LocalProjectRole, LocalIdentityMode, LocalChangeProposal, LocalEvidencePackageView, LocalIntentVersion, LocalReviewAssignment, LocalReviewReadiness } from './local-control-plane-client'
 import { DEMO_PROJECT_ID, localControlPlaneClient, type LocalAgentProviderTestResult } from './local-control-plane-client'
 import './styles.css'
 
@@ -886,6 +886,79 @@ function StageBadge({ stage }: { stage: string }) {
   return <span className={`stage-badge ${className}`}><i />{stage}</span>
 }
 
+/**
+ * The context a Run started now would be given, read from the manifest on the project's default branch. Read-only:
+ * the files change in the repository through review, so an edit link goes to the code host instead of a form here.
+ */
+function ProjectContextPanel() {
+  const local = useLocalControlPlane()
+  const projectId = local.currentProjectId
+  const [state, setState] = useState<{ context?: LocalProjectContext | null; error?: string; loading?: boolean }>({})
+  const [preview, setPreview] = useState<{ path: string; content?: string; truncated?: boolean; error?: string }>()
+  const load = (id: string) => {
+    setState((current) => ({ ...current, loading: true, error: undefined }))
+    return localControlPlaneClient.getProjectContext(id)
+      .then(({ context }) => setState({ context }))
+      .catch((caught: unknown) => setState({ error: caught instanceof Error ? caught.message : String(caught) }))
+  }
+  useEffect(() => {
+    if (local.status !== 'ready' || !projectId) return
+    setState({})
+    void load(projectId)
+  }, [local.status, projectId])
+  const openPreview = (path: string) => {
+    if (!projectId) return
+    setPreview({ path })
+    localControlPlaneClient.getProjectContextFile(projectId, path)
+      .then(({ file }) => setPreview({ path, content: file.content, truncated: file.truncated }))
+      .catch((caught: unknown) => setPreview({ path, error: caught instanceof Error ? caught.message : String(caught) }))
+  }
+  if (local.status !== 'ready' || !projectId) return null
+  const context = state.context
+  const errors = context?.issues.filter((issue) => issue.severity === 'error').length ?? 0
+  const warnings = context?.issues.filter((issue) => issue.severity === 'warning').length ?? 0
+  const budgetPercent = context ? Math.min(100, Math.round((context.requiredBytes / context.budgetBytes) * 100)) : 0
+  return (
+    <section className="panel local-core-section project-context">
+      <div className="local-core-heading">
+        <div><span className="eyebrow">真实数据 · {context ? `${context.branch} @ ${context.baseSha.slice(0, 7)}` : '项目仓库'}</span><h2>项目上下文</h2><p>下一个 Run 会拿到的上下文，读自默认分支的 {context?.manifestPath ?? '.aperture/project.json'}。文件在仓库里修改并经过评审；这里只读。</p></div>
+        <div className="local-core-heading-actions"><button className="secondary-button" disabled={state.loading} onClick={() => void load(projectId)}><RefreshCw size={13} className={state.loading ? 'spin' : undefined} />刷新</button></div>
+      </div>
+      {state.error && <p className="local-form-error" role="alert">{state.error}</p>}
+      {context === null && <div className="local-empty"><FolderGit2 size={18} /><p>项目还没有配置仓库。</p></div>}
+      {context && <>
+        <div className="project-context-summary">
+          <span className={errors ? 'context-no' : warnings ? 'context-unused' : 'context-yes'}>{errors ? <ShieldAlert size={13} /> : <ShieldCheck size={13} />}{errors ? `${errors} 个错误` : warnings ? `${warnings} 个提醒` : '检查通过'}</span>
+          <span>必需 {context.files.filter((file) => file.required).length} · 可追加 {context.files.filter((file) => !file.required).length}</span>
+          <span className="project-context-budget" title="所有声明的上下文会被直接写进 Agent 提示词，超出预算的部分被截断"><i style={{ width: `${budgetPercent}%` }} className={context.requiredBytes > context.budgetBytes ? 'over' : undefined} />必需上下文 {(context.requiredBytes / 1024).toFixed(1)} KB / {(context.budgetBytes / 1024).toFixed(0)} KB</span>
+        </div>
+        {context.issues.length > 0 && <ul className="project-context-issues">{context.issues.map((issue) => <li key={`${issue.code}-${issue.path ?? ''}`} className={issue.severity}>{issue.severity === 'error' ? <ShieldAlert size={12} /> : <Eye size={12} />}{issue.message}</li>)}</ul>}
+        {context.files.length > 0 && <div className="project-context-files">
+          <div className="project-context-row head"><span>文件</span><span>类型</span><span>大小</span><span>最后修改</span><span /></div>
+          {context.files.map((file) => <div className={`project-context-row${file.exists ? '' : ' missing'}`} key={file.path}>
+            <code>{file.path}</code>
+            <span className={file.required ? 'context-yes' : 'context-unused'}>{file.required ? '必需' : '可追加'}</span>
+            <span>{file.exists ? `${((file.sizeBytes ?? 0) / 1024).toFixed(1)} KB` : '不存在'}</span>
+            <small title={file.lastCommit ? `${file.lastCommit.sha} · ${file.lastCommit.subject}` : undefined}>{file.lastCommit ? `${file.lastCommit.author} · ${file.lastCommit.committedAt.slice(0, 10)} · ${file.lastCommit.subject}` : '—'}</small>
+            <span className="project-context-actions">
+              <button className="secondary-button" disabled={!file.exists} onClick={() => openPreview(file.path)}><Eye size={12} />查看</button>
+              {file.editUrl && <a className="secondary-button" href={file.editUrl} target="_blank" rel="noreferrer" title="在 GitHub 上编辑；修改经 PR 评审合并后，下一个 Run 生效"><ExternalLink size={12} />编辑</a>}
+            </span>
+          </div>)}
+        </div>}
+        <small className="project-context-note">必需文件每个 Run 都会带上；可追加文件在启动 Run 时填入「追加 Context」才会带上。要增删文件，修改 manifest 的 context.required / context.allowed 并合并到 {context.branch}。</small>
+      </>}
+      {preview && <>
+        <button className="local-evidence-overlay" aria-label="关闭预览" onClick={() => setPreview(undefined)} />
+        <aside className="local-evidence-drawer">
+          <header><div><span className="eyebrow">项目上下文 · {context?.branch} @ {context?.baseSha.slice(0, 7)}</span><h3>{preview.path}</h3><p>这是 Run 会拿到的版本。</p></div><button className="icon-button" onClick={() => setPreview(undefined)} aria-label="关闭"><X size={15} /></button></header>
+          {preview.error ? <p className="local-form-error" role="alert">{preview.error}</p> : preview.content === undefined ? <p className="local-evidence-empty"><RefreshCw size={13} className="spin" />读取中</p> : <section>{preview.truncated && <small>文件较大，只显示开头部分。</small>}<pre className="project-context-preview">{preview.content}</pre></section>}
+        </aside>
+      </>}
+    </section>
+  )
+}
+
 function ContextPage() {
   const { liveRun } = useWorkbench()
   const liveContextReads = liveRun?.events.filter((event): event is Extract<AgentRunEvent, { type: 'context_consumed' }> => event.type === 'context_consumed') ?? []
@@ -946,6 +1019,7 @@ function ContextPage() {
         title="上下文中心"
         description="管理 Agent 被允许知道什么，并对账它实际读取了什么。"
       />
+      <ProjectContextPanel />
       <DemoRegion title="上下文面板" note="本页的上下文来源、检索质量与预算面板仍为演示数据；真实的“声明 vs 实际读取”对账在「Agent Runs」页每个 Run 的「上下文对账」里。">
 
         <div className="context-status-grid">

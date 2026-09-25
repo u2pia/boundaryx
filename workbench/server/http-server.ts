@@ -10,6 +10,7 @@ import type { LocalEvidenceStore } from './local-evidence-store.ts'
 import { LocalGitAuthority } from './local-git-authority.ts'
 import { LocalReleaseAuthority } from './local-release-authority.ts'
 import { requestContext, type RequestContext } from './request-context.ts'
+import { projectContext, projectContextFile } from './project-context.ts'
 import { projectProductType } from './project-product-type.ts'
 import { probeAgentProvider } from './provider-probe.ts'
 import { agentRunProgress } from './run-progress.ts'
@@ -432,6 +433,19 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
       if (method === 'GET' && productTypeRoute) {
         requireIn(productTypeRoute.projectId)
         return sendJson(response, 200, { productType: projectProductType(database, productTypeRoute.projectId) ?? null })
+      }
+
+      // The context a Run started now would bind, read from the manifest on the default branch. Read-only: the files
+      // change in the repository through review, so this cannot drift from what a Run is given.
+      const projectContextRoute = routeMatch(path, /^\/api\/projects\/(?<projectId>[^/]+)\/context$/u)
+      if (method === 'GET' && projectContextRoute) {
+        requireIn(projectContextRoute.projectId)
+        return sendJson(response, 200, { context: projectContext(database, projectContextRoute.projectId) ?? null })
+      }
+      const projectContextFileRoute = routeMatch(path, /^\/api\/projects\/(?<projectId>[^/]+)\/context\/file$/u)
+      if (method === 'GET' && projectContextFileRoute) {
+        requireIn(projectContextFileRoute.projectId)
+        return sendJson(response, 200, { file: projectContextFile(database, projectContextFileRoute.projectId, url.searchParams.get('path') ?? '') })
       }
 
       if (method === 'POST' && path === '/api/work-items') {

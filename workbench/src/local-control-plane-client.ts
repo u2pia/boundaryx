@@ -49,6 +49,10 @@ export type LocalProject = {
   updatedAt: string
 }
 
+/** The context a Run started now would be given, from the manifest on the project's default branch. */
+export type LocalProjectContextFile = { path: string; required: boolean; exists: boolean; sizeBytes?: number; lastCommit?: { sha: string; author: string; committedAt: string; subject: string }; editUrl?: string }
+export type LocalProjectContext = { projectId: string; branch: string; baseSha: string; manifestPath: string; manifestFound: boolean; manifestError?: string; files: LocalProjectContextFile[]; requiredBytes: number; budgetBytes: number; issues: { severity: 'error' | 'warning'; code: string; message: string; path?: string }[] }
+
 export type LocalProjectMember = { projectId: string; actorId: string; username: string; displayName: string; role: LocalProjectRole; addedByActorId?: string; addedAt: string }
 
 /** How a proposal appears on its code host. Written only by the server's syncer; the token never reaches the browser. */
@@ -387,6 +391,8 @@ export const localControlPlaneClient = {
   listProjects: () => request<{ projects: LocalProject[]; roles: Record<string, LocalActor['role'] | undefined> }>('/api/projects'),
   /** What the project builds, from .aperture/project.json on its default branch; null while it has no repository. */
   getProjectProductType: (projectId: string) => request<{ productType: LocalWorkItem['productType'] | null }>(`/api/projects/${encodeURIComponent(projectId)}/product-type`),
+  getProjectContext: (projectId: string) => request<{ context: LocalProjectContext | null }>(`/api/projects/${encodeURIComponent(projectId)}/context`),
+  getProjectContextFile: (projectId: string, path: string) => request<{ file: { path: string; baseSha: string; sizeBytes: number; truncated: boolean; content: string } }>(`/api/projects/${encodeURIComponent(projectId)}/context/file?path=${encodeURIComponent(path)}`),
   getProject: (projectId: string) => request<{ project: LocalProject; role: LocalActor['role']; members: LocalProjectMember[]; lastSync: LocalCodeHostSyncReport | null }>(`/api/projects/${encodeURIComponent(projectId)}`),
   createProject: (input: LocalProjectInput & { slug: string; name: string }) => post<{ project: LocalProject }>('/api/projects', input as Record<string, unknown>),
   updateProject: (projectId: string, input: LocalProjectInput) => post<{ project: LocalProject }>(`/api/projects/${encodeURIComponent(projectId)}/settings`, input as Record<string, unknown>),
