@@ -20,7 +20,7 @@ export type CriterionCoverage = {
   /**
    * At least one mapped result does not depend on anything the run authored: a test run on the base revision's test
    * files (`pre_existing`, including `@baseline` re-runs), a build, or a check reported externally (the author is
-   * forbidden from reporting checks on their own proposal). Never an evaluation: see `isIndependent`.
+   * forbidden from reporting checks on their own proposal), or an isolated holdout evaluation: see `isIndependent`.
    * DOMAIN_MODEL.md §5.6: `added_by_run` evidence alone cannot prove a critical criterion.
    */
   independent?: boolean
@@ -35,14 +35,15 @@ export type CriterionStatus = 'passed' | 'self_graded' | 'failed' | 'pending' | 
 const kindsFor = { deterministic: ['test', 'build', 'evaluation'], model: ['evaluation'] } as const
 
 export function mapCriteriaToChecks(intent: IntentVersion, checks: Array<{ name: string; kind: CheckKind; provenance?: string; conclusion?: string }>): CriterionCoverage[] {
-  // No evaluation is independent in the local runtime: the grader imports the code under evaluation into its own
-  // process, so that code can read the hidden dataset (it is in the worktree) and answer from it. The leakage check only
-  // sees answers copied into the change. Until an isolated evaluator exists, a passing evaluation is self-graded and a
-  // critical model criterion needs an override. The dataset guards still count: a dataset the run touched or copied
-  // fails the criterion outright.
-  const evaluationGuards = checks.filter((check) => ['evaluation-dataset-integrity', 'evaluation-dataset-leakage', 'evaluation-dataset-untouched'].includes(check.name)).map((check) => check.name)
+  // An in-worktree evaluation is never independent: the grader imports the code under evaluation into its own process,
+  // so that code can read the hidden dataset (it is in the worktree) and answer from it, and the leakage check only sees
+  // answers copied into the change. A passing one is self-graded and a critical model criterion needs an override. Only
+  // the isolated evaluator's result (`evaluation-isolated` with provenance `isolated`: holdout outside the repository,
+  // subject sandboxed, Builder confined) is independent. The dataset guards still count: a dataset the run touched or
+  // copied, or a holdout that could not be read, fails the criterion outright.
+  const evaluationGuards = checks.filter((check) => ['evaluation-dataset-integrity', 'evaluation-dataset-leakage', 'evaluation-dataset-untouched', 'evaluation-holdout-integrity'].includes(check.name)).map((check) => check.name)
   const withGuards = (names: string[]) => checks.some((check) => check.kind === 'evaluation' && names.includes(check.name)) ? [...names, ...evaluationGuards] : names
-  const isIndependent = (check: { kind: CheckKind; provenance?: string }) => check.kind !== 'evaluation' && (check.kind === 'build' || check.provenance === 'pre_existing' || check.provenance === 'external')
+  const isIndependent = (check: { kind: CheckKind; provenance?: string }) => check.kind === 'evaluation' ? check.provenance === 'isolated' : check.kind === 'build' || check.provenance === 'pre_existing' || check.provenance === 'external'
   return intent.acceptanceCriteria.map((criterion) => {
     const base = { criterionId: criterion.id, label: `AC-${criterion.ordinal}`, statement: criterion.statement, criticality: criterion.criticality, verificationType: criterion.verificationType, mapping: 'rule' as const }
     if (criterion.verificationType === 'human') return { ...base, checkNames: [] }

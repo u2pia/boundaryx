@@ -410,9 +410,23 @@ Dataset 必须存在于 Base Revision，且不能列入 Builder Context。Contro
 - 同一指标在 stdout 里出现两个不同的值（被测代码在评分器之后自己打印一个满分）→ 该 Check 失败，而不是"最后一个算数"；
 - Dataset 里长度 ≥ 12 的字符串值（JSON 叶子，非 JSON 则整行）原样或 JSON 转义后出现在 Run 新增的行里（Dataset 文件本身除外）→ `evaluation-dataset-leakage` 失败。它和 `evaluation-dataset-integrity` 一起并入该标准的映射检查，任一失败即标准"证据失败"（推翻不了成"自评"）。Builder 读了 worktree 里的 Dataset 并把答案写成查表，评分器再诚实也只是在考它抄的答案。Check 输出只记录命中值的 Digest 与文件，不外泄 Dataset。
 
-**本地 Runtime 下没有任何 Evaluation 结论是独立证据。** 评分器把被测代码导入自己的进程，Dataset 就在 worktree 里：被测代码可以在运行时读取 Dataset 直接答题（不留任何拷贝，泄漏检测看不见），也可以篡改评分器的输出。所以即便评分器取自 Base、Dataset 完好、没有泄漏，关键 `[模型]` 标准也只是 `self_graded`（界面显示"评测未隔离"），阻塞批准，需要 Owner 看过变更后带理由推翻（`decision.override_recorded`）。上面这些检查的作用是把能自动识别的作弊变成"证据失败"，而不是证明分数可信。要让 Evaluation 成为独立证据，需要隔离的评估器：被测代码在拿不到 Dataset 的沙箱里运行，由外部评分；目前没有。泄漏检测只认原样拷贝，改写、拆分、编码后的答案或短答案识别不出来。契约见 `../docs/AGENT_SYSTEM_EVALUATION_CONTRACT.md`。
+**仓库内 Dataset 的 Evaluation 结论不是独立证据。** 评分器把被测代码导入自己的进程，Dataset 就在 worktree 里：被测代码可以在运行时读取 Dataset 直接答题（不留任何拷贝，泄漏检测看不见），也可以篡改评分器的输出。所以即便评分器取自 Base、Dataset 完好、没有泄漏，关键 `[模型]` 标准也只是 `self_graded`（界面显示"评测未隔离"），阻塞批准，需要 Owner 看过变更后带理由推翻（`decision.override_recorded`）。上面这些检查的作用是把能自动识别的作弊变成"证据失败"，而不是证明分数可信。泄漏检测只认原样拷贝，改写、拆分、编码后的答案或短答案识别不出来。
 
-Change Proposal 获得独立批准后，只有 Owner 或 Maintainer 可以显式执行本地 fast-forward 合并。Control Plane 会复验 Base、Approved Head、Check、Evidence 和 Approval，要求实际目标分支 SHA 精确等于 Approved Head SHA，再生成不可更新、不可删除并带 Digest 的 Merge Evidence。合并前还会重算该 Proposal 以及产出其证据的每个 Run 的事件哈希链；有一条对不上（例如绕过平台直接 INSERT 进来的伪造批准事件）就拒绝合并（`event_chain_broken`），且在目标分支移动之前拒绝。整条链从 genesis 重算一遍也能自洽，所以还要求每个 Evidence Package 生成时记录的链头（`eventChainHeads`，写入证据摘要和 `evidence.recorded` 事件，外部附加的证据取自包文件）仍在当前链上；Merge Evidence 读取时同样核对其 `proposalEventChainHead`（`merge_evidence_chain_mismatch`）。`host_protected` 模式下合并已经发生，链校验失败会作为绕过门禁的原因记录。契约见 `../docs/MERGE_EVIDENCE_CONTRACT.md`。该能力不是自动合并，也不代表发布授权。
+**隔离评估（`evaluation.holdout`）** 能让 Evaluation 成为独立证据。
+
+- **Holdout 不进仓库。** Owner 或 Maintainer 通过 `POST /api/projects/:id/evaluation-holdouts` 登记，文件存到数据目录，Manifest 按 Digest 引用；未登记或内容不符时 Run 被拒（`evaluation_holdout_missing`）。
+- **评分器与被测代码分开取出。** 评分器（`harnessPaths`）取自 Base，被测代码取自 Head，都从 Git 对象库取出，放到数据目录 `evaluations/` 下各自的目录里，不在 worktree 里。
+- **三步运行。** 评分器出题，被测代码从 stdin 读题、在 stdout 作答，评分器再给作答打分。macOS 上被测代码运行在 Seatbelt 里：读不到 Holdout、评分器、仓库和数据目录，只能写自己的 scratch，没有网络。
+- **产出。** 结果是 Check `evaluation-isolated`。
+
+它的 provenance 为 `isolated`、关键 `[模型]` 标准直接 `passed`，还需要 Builder 本身读不到 Holdout。满足这一点的有两种 Runtime：
+
+- 容器 Runtime；
+- 设置了 `CONTROL_PLANE_BUILDER_SANDBOX=seatbelt` 的进程 Runtime：Builder 被拒于数据目录与封印密钥之外，只放开自己的 Run 目录与仓库 Git 目录，Attestation 记为 `holdoutReadable: false`。
+
+否则为 `isolated_partial`，仍是 `self_graded`。自带沙箱的 Codex CLI 无法再套 Seatbelt，所以这个开关默认关闭。声明了 Holdout 时，其余 Check 也在 Seatbelt 中运行，读不到数据目录。`test:isolated-evaluation` 覆盖以下情形：诚实、偷看、自报满分、联网、改评分器、抄答案、未隔离 Builder、Holdout 被改。契约见 `../docs/AGENT_SYSTEM_EVALUATION_CONTRACT.md`。
+
+Change Proposal 获得独立批准后，只有 Owner 或 Maintainer 可以显式执行本地 fast-forward 合并。Control Plane 会复验 Base、Approved Head、Check、Evidence 和 Approval，要求实际目标分支 SHA 精确等于 Approved Head SHA，再生成不可更新、不可删除并带 Digest 的 Merge Evidence。合并前还会重算该 Proposal 以及产出其证据的每个 Run 的事件哈希链；有一条对不上（例如绕过平台直接 INSERT 进来的伪造批准事件）就拒绝合并（`event_chain_broken`），且在目标分支移动之前拒绝。整条链从 genesis 重算一遍也能自洽，所以还要求每个 Evidence Package 生成时记录的链头（`eventChainHeads`，写入证据摘要和 `evidence.recorded` 事件，外部附加的证据取自包文件）仍在当前链上；Merge Evidence 读取时同样核对其 `proposalEventChainHead`（`merge_evidence_chain_mismatch`）。事件 Digest 不带密钥，谁都能算，所以每个事件另有一枚封印（`event_seals`，迁移 025）：对事件 ID 与 Digest 做 HMAC-SHA256，密钥不在数据库里。只拿到数据库文件的人可以追加一个 Digest 正确的伪造事件，但造不出封印，合并、GitHub 门禁与 Merge Evidence 读取都会拒绝（`has no seal` / `seal does not verify`）。密钥依次取自 `APERTURE_EVENT_SEAL_KEY`、`APERTURE_EVENT_SEAL_KEY_FILE`，都没有时在数据目录生成 `event-seal.key`（0600）。放在数据目录里只防「单独拷走数据库文件」，不防拿到整个数据目录的人；同一操作系统用户下的本地 Builder 也读得到它，正式部署要把密钥文件放到数据目录之外、Builder 读不到的地方。启动日志与 `/api/health` 的 `eventSeal` 报告密钥来源、未封印事件数与旧密钥封印数，不输出密钥。迁移 025 执行时已存在的事件一次性补封（`backfilled = 1`），补封只是为当时的历史背书，之后没有封印的事件一律视为平台外写入。换密钥时把旧密钥文件列进 `APERTURE_EVENT_SEAL_RETIRED_KEY_FILES`（冒号分隔），旧封印仍可验证；密钥丢失或被替换而没有列出旧密钥时，所有旧事件都会报「sealed with key … which this Control Plane does not hold」，合并全部被拒，这是有意的失败方式。链头尚未外部锚定：持有密钥的人仍可重写。`host_protected` 模式下合并已经发生，链校验失败会作为绕过门禁的原因记录。契约见 `../docs/MERGE_EVIDENCE_CONTRACT.md`。该能力不是自动合并，也不代表发布授权。
 
 Reviewer 请求修改后，Proposal 作者或 Owner/Maintainer 可以启动 Agent Revision Run。新 Run 从被审查 Head SHA 开始，绑定当前 Reviewer Feedback，沿用原始基线 Manifest；完成后更新同一个 Proposal，并使旧 Review、Check、Evidence 失效。契约见 `../docs/AGENT_REVISION_RUN_CONTRACT.md`。
 

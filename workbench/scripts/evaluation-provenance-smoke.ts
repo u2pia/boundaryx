@@ -97,7 +97,7 @@ try {
   assert.equal(honest.criterion.independent, false)
   assert.equal(honest.criterion.status, 'self_graded')
   assert.equal(honest.readiness.status, 'blocked')
-  assert.ok(honest.readiness.blockers.some((blocker) => blocker.includes('no isolated evaluator')), honest.readiness.blockers.join(' | '))
+  assert.ok(honest.readiness.blockers.some((blocker) => blocker.includes('Declare evaluation.holdout')), honest.readiness.blockers.join(' | '))
   const honestProvenance = (honest.evidence as unknown as { evaluationProvenance: { independent: boolean; graderFromBase: boolean } }).evaluationProvenance
   assert.deepEqual([honestProvenance.graderFromBase, honestProvenance.independent], [true, false])
   database.recordOverride({ proposalId: honest.proposal.id, headSha: honest.proposal.headSha, criterionId: honest.criterion.criterionId, reason: '看过 agent.mjs 的改动，没有读取数据集，分数可信。' }, owner.id)

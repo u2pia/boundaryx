@@ -96,6 +96,13 @@ try {
 
   const authorLogin = await request<{ actor: { id: string } }>('/api/auth/login', { body: { username: 'author', password: 'author-password-2026' } })
   const authorCookie = authorLogin.cookie!
+  // Evaluation holdouts: an owner registers one, a developer cannot, and nobody reads the content back.
+  assert.equal((await request('/api/projects/PRJ-DEFAULT/evaluation-holdouts', { cookie: authorCookie, body: { content: '{"input":"a","expected":"b"}\n' } })).status, 403)
+  const holdoutResponse = await request<{ holdout: { digest: string } }>('/api/projects/PRJ-DEFAULT/evaluation-holdouts', { cookie: ownerCookie, body: { content: '{"input":"a","expected":"b"}\n' } })
+  assert.equal(holdoutResponse.status, 201)
+  const holdoutList = await request<{ holdouts: Array<{ digest: string }> }>('/api/projects/PRJ-DEFAULT/evaluation-holdouts', { cookie: authorCookie })
+  assert.deepEqual(holdoutList.body!.holdouts.map((holdout) => holdout.digest), [holdoutResponse.body!.holdout.digest])
+  assert.ok(!JSON.stringify(holdoutList.body).includes('expected'), 'the holdout content is never returned')
   const proposalResponse = await request<{ changeProposal: { id: string; headSha: string } }>('/api/change-proposals', { cookie: authorCookie, body: { workItemId, intentVersionId, runId: 'RUN-HTTP-001', baseRef: 'main', headRef: 'agent/http-authority' } })
   assert.equal(proposalResponse.status, 201)
   const proposal = proposalResponse.body!.changeProposal

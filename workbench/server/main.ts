@@ -36,6 +36,8 @@ server.listen(port, '127.0.0.1', () => {
   console.log(`Identity: ${database.getIdentityMode()} mode · GitHub sign-in ${githubOAuth ? `configured · callback ${githubOAuth.redirectUri}` : 'not configured'}`)
   const hosted = database.listProjects().filter((project) => project.codeHost === 'github' && project.status === 'active').length
   console.log(`Projects: ${database.listProjects().length} · ${hosted} on GitHub · code host sync ${codeHostSyncSeconds > 0 ? `every ${codeHostSyncSeconds}s` : 'manual only'}`)
+  const seal = database.getEventSealStatus()
+  console.log(`Event seal: key ${seal.keyId} from ${seal.keySource}${seal.keySource === 'colocated' ? ' (next to the database; set APERTURE_EVENT_SEAL_KEY_FILE to a path outside the data directory)' : ''}${seal.unsealed || seal.sealedByOtherKeys ? ` · ${seal.unsealed} unsealed event(s), ${seal.sealedByOtherKeys} sealed by other keys` : ''}`)
   if (agentRunQueue) console.log(`Agent Run queue: ${agentRunQueue.snapshot().concurrency} concurrent worker(s)${orphaned.length ? ` · failed ${orphaned.length} orphaned run(s): ${orphaned.join(', ')}` : ''}`)
 })
 

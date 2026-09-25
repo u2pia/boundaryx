@@ -1,9 +1,10 @@
 import { resolve } from 'node:path'
 import type { ControlPlaneDatabase } from './database.ts'
 import { ContainerAgentRunner, probeContainerEngine } from './container-agent-runner.ts'
-import { LocalCommandAgentRunner } from './local-command-agent-runner.ts'
+import { LocalCommandAgentRunner, type BuilderConfinement } from './local-command-agent-runner.ts'
 import { LocalEvidenceStore } from './local-evidence-store.ts'
 import { LocalRunPostprocessor } from './local-run-postprocessor.ts'
+import { seatbeltAvailable } from './seatbelt.ts'
 import type { AgentRunner, AgentRunnerDescriptor } from './types.ts'
 
 function parseStringArray(value: string | undefined, name: string) {
@@ -19,6 +20,20 @@ function parseTimeout(value: string | undefined) {
   const timeoutMs = Number(value)
   if (!Number.isInteger(timeoutMs) || timeoutMs < 10_000 || timeoutMs > 2 * 60 * 60 * 1000) throw new Error('CONTROL_PLANE_AGENT_TIMEOUT_MS must be an integer between 10000 and 7200000')
   return timeoutMs
+}
+
+/**
+ * CONTROL_PLANE_BUILDER_SANDBOX=seatbelt confines a process Builder away from the data directory (and a seal key kept
+ * elsewhere), which is what lets a holdout evaluation count as independent without a container. Opt-in, because a
+ * Builder that sandboxes its own commands (the Codex CLI) cannot run inside a sandbox.
+ */
+function builderConfinement(input: { database: ControlPlaneDatabase; dataDirectory: string }, env: NodeJS.ProcessEnv): BuilderConfinement | undefined {
+  const setting = env.CONTROL_PLANE_BUILDER_SANDBOX
+  if (!setting || setting === 'off') return undefined
+  if (setting !== 'seatbelt') throw new Error('CONTROL_PLANE_BUILDER_SANDBOX must be seatbelt or off')
+  if (!seatbeltAvailable(env)) throw new Error('CONTROL_PLANE_BUILDER_SANDBOX=seatbelt needs macOS /usr/bin/sandbox-exec')
+  const keyPath = input.database.eventSeals.keyPath
+  return { kind: 'seatbelt', denied: [...new Set([resolve(input.dataDirectory), resolve(input.database.dataDirectory), ...(keyPath ? [keyPath] : [])])] }
 }
 
 export function createConfiguredAgentRunner(input: { database: ControlPlaneDatabase; dataDirectory: string; env?: NodeJS.ProcessEnv }) {
@@ -49,7 +64,7 @@ export function createConfiguredAgentRunner(input: { database: ControlPlaneDatab
     // startup and the worker executes them with a fresh one, so a provider saved in between must reach both or the
     // two attestations disagree and the run fails.
     const provider = input.database.getAgentProviderSettings()
-    const runner = new LocalCommandAgentRunner({ database: input.database, executable: processExecutable, args: processArgs, environmentAllowlist: processEnvironmentAllowlist, provider: () => input.database.getAgentProviderSettings(), worktreeRoot, timeoutMs, postprocessor })
+    const runner = new LocalCommandAgentRunner({ database: input.database, executable: processExecutable, args: processArgs, environmentAllowlist: processEnvironmentAllowlist, provider: () => input.database.getAgentProviderSettings(), worktreeRoot, timeoutMs, postprocessor, confinement: builderConfinement(input, env) })
     return { runner, descriptor: { ...runner.descriptor, reason: engineExecutable ? 'Container unavailable; explicit process fallback is active.' : runner.descriptor.reason, model: provider?.model, modelProvider: provider?.providerId }, evidenceStore }
   }
 

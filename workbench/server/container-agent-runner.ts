@@ -39,7 +39,7 @@ class ContainerExecutionRuntime implements AgentExecutionRuntime {
     if (!version.available) throw new AppError(503, `Container engine unavailable: ${version.reason}`, 'container_engine_unavailable')
     const image = engineCommand(this.input.engineExecutable, ['image', 'inspect', '--format', '{{.Id}}', this.input.imageRef])
     if (image.error || image.status !== 0 || !image.stdout.trim()) throw new AppError(503, `Container image unavailable locally: ${image.error?.message ?? image.stderr.trim()}`, 'container_image_unavailable')
-    const canonical = { runtimeId: this.descriptor.id, isolation: 'container' as const, imageRef: this.input.imageRef, imageDigest: image.stdout.trim(), engineVersion: version.version, networkEgress: 'denied' as const, readonlyRoot: true, capDropAll: true, noNewPrivileges: true, ephemeral: true, cpuLimit: this.input.cpuLimit, memoryLimit: this.input.memoryLimit, pidsLimit: this.input.pidsLimit, user: this.input.user, tmpfsSize: this.input.tmpfsSize, secretMounts: [], productionEligible: true }
+    const canonical = { runtimeId: this.descriptor.id, isolation: 'container' as const, imageRef: this.input.imageRef, imageDigest: image.stdout.trim(), engineVersion: version.version, networkEgress: 'denied' as const, readonlyRoot: true, capDropAll: true, noNewPrivileges: true, ephemeral: true, cpuLimit: this.input.cpuLimit, memoryLimit: this.input.memoryLimit, pidsLimit: this.input.pidsLimit, user: this.input.user, tmpfsSize: this.input.tmpfsSize, secretMounts: [], productionEligible: true, holdoutReadable: false }
     return { ...canonical, attestationDigest: `sha256:${sha256(JSON.stringify(canonical))}` }
   }
 

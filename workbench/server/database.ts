@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
-import { readFileSync, readdirSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createSessionToken, hashPassword, hashSessionToken, sha256, verifyPassword } from './security.ts'
 import { criterionStatus, isSubstantiveHumanCriterion, mapCriteriaToChecks, mentionsCriterion, type CriterionCoverage } from './criteria-coverage.ts'
 import { requestContext } from './request-context.ts'
+import { loadEventSealKeyring, type EventSealKeyring } from './event-seal.ts'
 import { normalizeProjectHost, type ProjectHostInput } from './code-host/index.ts'
 import type { AcceptanceCriterionInput, BuilderStopReason, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentVersion, MergeEvidence, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
 import { AppError } from './types.ts'
@@ -42,10 +43,14 @@ export class ControlPlaneDatabase {
   readonly databasePath: string
   /** Where the control plane keeps its own files; a project repository may not live in its managed subdirectories. */
   readonly dataDirectory: string
+  readonly eventSeals: EventSealKeyring
+  /** Events are sealed once the seal table exists; the events migrations before it write are backfilled with it. */
+  private sealsReady = false
 
   constructor(databasePath: string, migrationDirectory: string) {
     this.databasePath = databasePath
     this.dataDirectory = dirname(databasePath)
+    this.eventSeals = loadEventSealKeyring(this.dataDirectory)
     this.db = new DatabaseSync(databasePath)
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;')
     this.migrate(migrationDirectory)
@@ -58,6 +63,7 @@ export class ControlPlaneDatabase {
   private migrate(directory: string) {
     this.db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)')
     const applied = new Set((this.db.prepare('SELECT version FROM schema_migrations').all() as Array<{ version: number }>).map((row) => row.version))
+    this.sealsReady = applied.has(25)
     const files = readdirSync(directory).filter((file) => /^\d+_.*\.sql$/u.test(file)).sort()
     for (const file of files) {
       const version = Number(file.split('_')[0])
@@ -72,6 +78,7 @@ export class ControlPlaneDatabase {
         this.inTransaction(() => {
           this.db.exec(sql)
           if (version === 19) this.backfillProjects()
+          if (version === 25) this.backfillEventSeals()
           if (rebuildsTables && (this.db.prepare('PRAGMA foreign_key_check').all() as unknown[]).length) throw new Error(`Migration ${file} left foreign key violations`)
           this.db.prepare('INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)').run(version, basename(file), nowIso())
         })
@@ -79,6 +86,23 @@ export class ControlPlaneDatabase {
         if (rebuildsTables) this.db.exec('PRAGMA foreign_keys = ON')
       }
     }
+  }
+
+  /** Migration 025: the events that exist when sealing starts are sealed once, and marked as such. */
+  private backfillEventSeals() {
+    const insert = this.db.prepare('INSERT INTO event_seals(event_id, key_id, seal, backfilled, sealed_at) VALUES (?, ?, ?, 1, ?)')
+    const timestamp = nowIso()
+    for (const event of this.db.prepare('SELECT id, event_digest FROM domain_events').all() as Array<{ id: string; event_digest: string }>) {
+      insert.run(event.id, this.eventSeals.keyId, this.eventSeals.seal(event.id, event.event_digest), timestamp)
+    }
+    this.sealsReady = true
+  }
+
+  /** What an operator needs to know about the seal key; never the key itself. */
+  getEventSealStatus() {
+    const counts = this.db.prepare('SELECT key_id, COUNT(*) AS count, SUM(backfilled) AS backfilled FROM event_seals GROUP BY key_id').all() as Array<{ key_id: string; count: number; backfilled: number }>
+    const unsealed = (this.db.prepare('SELECT COUNT(*) AS count FROM domain_events WHERE id NOT IN (SELECT event_id FROM event_seals)').get() as { count: number }).count
+    return { keyId: this.eventSeals.keyId, keySource: this.eventSeals.source, sealedByOtherKeys: counts.filter((row) => row.key_id !== this.eventSeals.keyId).reduce((sum, row) => sum + row.count, 0), backfilled: counts.reduce((sum, row) => sum + Number(row.backfilled ?? 0), 0), unsealed }
   }
 
   /**
@@ -263,6 +287,50 @@ export class ControlPlaneDatabase {
     if (!role) throw new AppError(404, `Project ${projectId} not found`, 'project_not_found')
     if (!roles.includes(role)) throw new AppError(403, `Only ${roles.join(' or ')} members of this project may do this`, code)
     return role
+  }
+
+  /** Where registered evaluation holdouts are kept: outside every repository, so no Builder checkout contains them. */
+  get holdoutDirectory() {
+    return join(this.dataDirectory, 'holdouts')
+  }
+
+  /**
+   * An evaluation holdout is the hidden dataset of an isolated evaluation (`evaluation.holdout` in the manifest). It is
+   * registered with the Control Plane instead of committed, because anything in the repository is readable by the
+   * Builder that is being evaluated. Only the digest is recorded in the event log; the manifest names that digest, so
+   * which holdout scores a project is still decided by a reviewed commit.
+   */
+  registerEvaluationHoldout(projectId: string, content: string, actorId: string) {
+    this.requireProjectRole(actorId, projectId, ['owner', 'maintainer'], 'evaluation_holdout_forbidden')
+    if (!content.trim()) throw new AppError(400, 'An evaluation holdout must not be empty', 'invalid_evaluation_holdout')
+    const hex = sha256(content)
+    const digest = `sha256:${hex}`
+    const directory = join(this.holdoutDirectory, projectId)
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    chmodSync(this.holdoutDirectory, 0o700)
+    const path = join(directory, `${hex}.holdout`)
+    if (!existsSync(path)) writeFileSync(path, content, { mode: 0o600 })
+    const sizeBytes = Buffer.byteLength(content)
+    const identity = this.decisionIdentity(actorId)
+    if (!this.listEvaluationHoldouts(projectId).some((holdout) => holdout.digest === digest)) {
+      this.inTransaction(() => this.appendEvent({ aggregateType: 'project', aggregateId: projectId, eventType: 'project.evaluation_holdout_registered', actorId, payload: { digest, sizeBytes, lineCount: content.trim().split('\n').length, identity } }))
+    }
+    return { digest, sizeBytes }
+  }
+
+  listEvaluationHoldouts(projectId: string) {
+    return this.listAggregateEvents('project', projectId).filter((event) => event.eventType === 'project.evaluation_holdout_registered').map((event) => ({ digest: String(event.payload.digest), sizeBytes: Number(event.payload.sizeBytes), registeredByActorId: event.actorId, registeredAt: event.occurredAt }))
+  }
+
+  /** The holdout's content, only when it was registered through the Control Plane and still has its digest. */
+  readEvaluationHoldout(projectId: string, digest: string) {
+    if (!/^sha256:[0-9a-f]{64}$/u.test(digest) || !this.listEvaluationHoldouts(projectId).some((holdout) => holdout.digest === digest)) return undefined
+    try {
+      const content = readFileSync(join(this.holdoutDirectory, projectId, `${digest.slice(7)}.holdout`), 'utf8')
+      return `sha256:${sha256(content)}` === digest ? content : undefined
+    } catch {
+      return undefined
+    }
   }
 
   /** Configuring where a project's code lives decides what every later run edits, so only a platform owner does it. */
@@ -1453,7 +1521,7 @@ export class ControlPlaneDatabase {
       ...criticalCriteria.filter((item) => item.status === 'unmapped').map((item) => `${item.label} is critical but no check maps to it: ${item.unmappedReason ?? 'no check of its verification type was run.'}`),
       ...criticalCriteria.filter((item) => item.status === 'failed').map((item) => `${item.label} is critical and its evidence failed (${item.checkNames.join(', ')}).`),
       ...criticalCriteria.filter((item) => item.status === 'self_graded').map((item) => item.verificationType === 'model'
-        ? `${item.label} is critical and rests on an evaluation (${item.checkNames.join(', ')}) whose code under test can read the hidden dataset; the local runtime has no isolated evaluator, so a reviewer must override it and say why the score is trusted.`
+        ? `${item.label} is critical and rests on an evaluation (${item.checkNames.join(', ')}) whose code under test could read the hidden dataset: it ran in the worktree, or the holdout evaluation lacked a sandboxed subject or a confined Builder. Declare evaluation.holdout and run a confined Builder (CONTROL_PLANE_BUILDER_SANDBOX=seatbelt or a container) for an independent score; until then a reviewer must override it and say why the score is trusted.`
         : `${item.label} is critical but only passed tests the run could have authored or evaluations, which are never independent locally (${item.checkNames.join(', ')}); declare testPaths so the tests are re-run from the base revision, or add a build check.`),
       // DOMAIN_MODEL.md §5.6: a model evaluation must not be the only critical evidence for a high risk change.
       ...(intent.riskLevel === 'high' && criticalCriteria.length > 0 && criticalCriteria.every((item) => item.verificationType === 'model') ? ['High risk changes cannot rest on model evaluation alone; add a critical deterministic or human criterion.'] : []),
@@ -1516,13 +1584,17 @@ export class ControlPlaneDatabase {
    * verifies proves nothing about rows written beside it. Each row the merge rests on must therefore be the one its
    * event describes, and the proposal must be the one its creation and revision events describe. A chain rewritten
    * consistently from genesis still verifies, so each evidence event's recorded chain heads must be on the chains too.
-   * Events are digested without a key: someone who computes the digests can still append a matching forgery.
+   * Digests are unkeyed, so each event must also carry a seal under the key kept outside the database; someone who
+   * holds only the database file can compute digests but not seals.
    */
   assertMergeEventChainsIntact(proposalId: string) {
     const proposal = this.getChangeProposal(proposalId)
     const rows = this.db.prepare('SELECT id, run_id, summary_json FROM evidence_packages WHERE change_proposal_id = ?').all(proposalId) as Array<{ id: string; run_id: string; summary_json: string }>
     const runIds = [...new Set(rows.map((row) => row.run_id))]
-    const broken = [['change_proposal', proposalId], ...runIds.map((runId) => ['agent_run', runId])].filter(([type, aggregateId]) => !this.verifyAggregateEventChain(type, aggregateId)).map(([type, aggregateId]) => `${type} ${aggregateId}`)
+    const broken = [['change_proposal', proposalId], ...runIds.map((runId) => ['agent_run', runId])].flatMap(([type, aggregateId]) => {
+      const faults = this.eventChainFaults(type, aggregateId)
+      return faults.length ? [`${type} ${aggregateId} (${faults.slice(0, 3).join('; ')}${faults.length > 3 ? `; ${faults.length - 3} more` : ''})`] : []
+    })
     const events = this.listAggregateEvents('change_proposal', proposalId)
     // The latest event for a row: an external check is updated in place and records an event each time.
     const eventFor = (eventType: string, key: string, value: string) => events.findLast((event) => event.eventType === eventType && event.payload[key] === value)
@@ -1564,14 +1636,30 @@ export class ControlPlaneDatabase {
   }
 
   verifyAggregateEventChain(aggregateType: string, aggregateId: string) {
+    return this.eventChainFaults(aggregateType, aggregateId).length === 0
+  }
+
+  /**
+   * Why a chain does not verify, one entry per event: a digest that does not recompute, or a seal that is missing,
+   * wrong, or made with a key this Control Plane does not hold. Recomputing digests is open to anyone; the seal is what
+   * someone holding only the database file cannot produce.
+   */
+  eventChainFaults(aggregateType: string, aggregateId: string) {
     const events = this.listAggregateEvents(aggregateType, aggregateId)
+    const seals = new Map((this.db.prepare('SELECT s.event_id, s.key_id, s.seal FROM event_seals s JOIN domain_events e ON e.id = s.event_id WHERE e.aggregate_type = ? AND e.aggregate_id = ?').all(aggregateType, aggregateId) as Array<{ event_id: string; key_id: string; seal: string }>).map((row) => [row.event_id, row]))
+    const faults: string[] = []
     let previousDigest = 'genesis'
     for (const event of events) {
       const canonical = { aggregateType: event.aggregateType, aggregateId: event.aggregateId, aggregateVersion: event.aggregateVersion, eventType: event.eventType, actorId: event.actorId ?? null, payload: event.payload, previousEventDigest: previousDigest, occurredAt: event.occurredAt }
-      if (event.previousEventDigest !== previousDigest || event.eventDigest !== `sha256:${sha256(JSON.stringify(canonical))}`) return false
+      if (event.previousEventDigest !== previousDigest || event.eventDigest !== `sha256:${sha256(JSON.stringify(canonical))}`) faults.push(`event ${event.id} digest`)
+      const seal = seals.get(event.id)
+      const verdict = seal ? this.eventSeals.verify(seal.key_id, event.id, event.eventDigest, seal.seal) : 'missing'
+      if (verdict === 'missing') faults.push(`event ${event.id} has no seal`)
+      else if (verdict === 'mismatch') faults.push(`event ${event.id} seal does not verify`)
+      else if (verdict === 'unknown_key') faults.push(`event ${event.id} is sealed with key ${seal!.key_id}, which this Control Plane does not hold (was the seal key replaced without APERTURE_EVENT_SEAL_RETIRED_KEY_FILES?)`)
       previousDigest = event.eventDigest
     }
-    return true
+    return faults
   }
 
   private eventProjectId(aggregateType: string, aggregateId: string): string | null {
@@ -1589,6 +1677,7 @@ export class ControlPlaneDatabase {
     const canonical = { aggregateType: input.aggregateType, aggregateId: input.aggregateId, aggregateVersion, eventType: input.eventType, actorId: input.actorId ?? null, payload: input.payload, previousEventDigest, occurredAt }
     const event: DomainEvent = { id: id('EVT'), ...canonical, actorId: input.actorId, eventDigest: `sha256:${sha256(JSON.stringify(canonical))}`, correlationId: input.correlationId, causationId: input.causationId, recordedAt: nowIso() }
     this.db.prepare('INSERT INTO domain_events(id, project_id, aggregate_type, aggregate_id, aggregate_version, event_type, actor_id, payload_json, previous_event_digest, event_digest, correlation_id, causation_id, occurred_at, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(event.id, this.eventProjectId(input.aggregateType, input.aggregateId), event.aggregateType, event.aggregateId, event.aggregateVersion, event.eventType, event.actorId ?? null, JSON.stringify(event.payload), event.previousEventDigest, event.eventDigest, event.correlationId ?? null, event.causationId ?? null, event.occurredAt, event.recordedAt)
+    if (this.sealsReady) this.db.prepare('INSERT INTO event_seals(event_id, key_id, seal, backfilled, sealed_at) VALUES (?, ?, ?, 0, ?)').run(event.id, this.eventSeals.keyId, this.eventSeals.seal(event.id, event.eventDigest), event.recordedAt)
     return event
   }
 
@@ -1633,6 +1722,8 @@ export class ControlPlaneDatabase {
     const canonical = { changeProposalId: evidence.changeProposalId, baseRef: evidence.baseRef, baseShaBefore: evidence.baseShaBefore, approvedHeadSha: evidence.approvedHeadSha, mergedSha: evidence.mergedSha, strategy: evidence.strategy, approvalReviewIds: evidence.approvalReviewIds, checkIds: evidence.checkIds, evidenceIds: evidence.evidenceIds, proposalEventChainHead: evidence.proposalEventChainHead, mergedByActorId: evidence.mergedByActorId, mergedAt: evidence.mergedAt, ...(evidence.hostMerge ? { hostMerge: evidence.hostMerge } : {}) }
     if (evidence.evidenceDigest !== `sha256:${sha256(JSON.stringify(canonical))}`) throw new AppError(409, 'Merge evidence digest verification failed', 'merge_evidence_digest_mismatch')
     if (!this.isOnEventChain('change_proposal', evidence.changeProposalId, evidence.proposalEventChainHead)) throw new AppError(409, 'Merge evidence names a proposal event chain head that is no longer on the chain', 'merge_evidence_chain_mismatch')
+    const faults = this.eventChainFaults('change_proposal', evidence.changeProposalId)
+    if (faults.length) throw new AppError(409, `The proposal event chain behind this merge evidence does not verify: ${faults.slice(0, 3).join('; ')}`, 'merge_evidence_chain_mismatch')
     return evidence
   }
 

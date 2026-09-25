@@ -12,6 +12,11 @@ export type ProjectManifestCheck = {
   timeoutMs: number
 }
 
+export type ProjectEvaluationProcess = {
+  command: string[]
+  timeoutMs: number
+}
+
 export type ProjectEvaluationThreshold = {
   metric: string
   operator: 'gte' | 'lte'
@@ -43,6 +48,15 @@ export type ProjectManifest = {
      * not. Undeclared means no evaluation result in the package is independent.
      */
     harnessPaths?: string[]
+    /**
+     * A dataset registered with the Control Plane instead of committed to the repository, so the Builder never sees it.
+     * The grader (`harnessPaths` at the base revision) and the code under evaluation (the head revision) run in
+     * separate directories outside the worktree; the subject runs sandboxed, reading the grader's inputs on stdin and
+     * answering on stdout, and only the grader reads the dataset and prints `evaluation_metrics`.
+     */
+    holdout?: { digest: string }
+    grader?: ProjectEvaluationProcess
+    subject?: ProjectEvaluationProcess
     thresholds: ProjectEvaluationThreshold[]
   }
   artifact?: {
@@ -80,6 +94,14 @@ function normalizeRepositoryPath(value: unknown, path: string) {
 function stringArray(value: unknown, path: string) {
   if (!Array.isArray(value)) throw new AppError(422, `${path} must be an array`, 'invalid_project_manifest')
   return [...new Set(value.map((item, index) => normalizeRepositoryPath(item, `${path}[${index}]`)))]
+}
+
+function evaluationProcess(value: unknown, path: string): ProjectEvaluationProcess {
+  const configured = requireObject(value, path)
+  if (!Array.isArray(configured.command) || configured.command.length === 0 || configured.command.some((item) => typeof item !== 'string' || !item)) throw new AppError(422, `${path}.command must be a non-empty string array`, 'invalid_project_manifest')
+  const timeoutMs = configured.timeoutMs === undefined ? 5 * 60 * 1000 : Number(configured.timeoutMs)
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 30 * 60 * 1000) throw new AppError(422, `${path}.timeoutMs must be between 1000 and 1800000`, 'invalid_project_manifest')
+  return { command: configured.command as string[], timeoutMs }
 }
 
 function parseManifest(raw: string): ProjectManifest {
@@ -123,8 +145,17 @@ function parseManifest(raw: string): ProjectManifest {
   if (root.productType === 'agent_system') {
     const configured = requireObject(root.evaluation, 'evaluation')
     if (configured.profile !== 'agent_dataset') throw new AppError(422, 'Agent systems require evaluation.profile agent_dataset', 'invalid_project_manifest')
-    const datasetPath = normalizeRepositoryPath(configured.datasetPath, 'evaluation.datasetPath')
-    if (required.includes(datasetPath) || allowed.includes(datasetPath)) throw new AppError(422, 'Evaluation dataset must not be exposed through Builder Context', 'evaluation_dataset_context_exposed')
+    if ((configured.datasetPath === undefined) === (configured.holdout === undefined)) throw new AppError(422, 'Agent systems declare exactly one of evaluation.datasetPath and evaluation.holdout', 'invalid_project_manifest')
+    let datasetPath: string | undefined
+    let holdout: { digest: string } | undefined
+    if (configured.holdout !== undefined) {
+      const declared = requireObject(configured.holdout, 'evaluation.holdout')
+      if (typeof declared.digest !== 'string' || !/^sha256:[0-9a-f]{64}$/u.test(declared.digest)) throw new AppError(422, 'evaluation.holdout.digest must be sha256:<64 hex>', 'invalid_project_manifest')
+      holdout = { digest: declared.digest }
+    } else {
+      datasetPath = normalizeRepositoryPath(configured.datasetPath, 'evaluation.datasetPath')
+      if (required.includes(datasetPath) || allowed.includes(datasetPath)) throw new AppError(422, 'Evaluation dataset must not be exposed through Builder Context', 'evaluation_dataset_context_exposed')
+    }
     if (!Array.isArray(configured.thresholds) || !configured.thresholds.length) throw new AppError(422, 'Agent systems require at least one evaluation threshold', 'invalid_project_manifest')
     const thresholds = configured.thresholds.map((item, index) => {
       const threshold = requireObject(item, `evaluation.thresholds[${index}]`)
@@ -133,10 +164,20 @@ function parseManifest(raw: string): ProjectManifest {
       if (typeof threshold.threshold !== 'number' || !Number.isFinite(threshold.threshold)) throw new AppError(422, `evaluation.thresholds[${index}].threshold must be finite`, 'invalid_project_manifest')
       return { metric: threshold.metric.trim(), operator: threshold.operator, threshold: threshold.threshold }
     })
-    if (!checks.some((check) => check.kind === 'evaluation')) throw new AppError(422, 'Agent systems require at least one evaluation check', 'invalid_project_manifest')
     const harnessPaths = configured.harnessPaths === undefined ? undefined : stringArray(configured.harnessPaths, 'evaluation.harnessPaths')
     if (harnessPaths && !harnessPaths.length) throw new AppError(422, 'evaluation.harnessPaths must contain at least one path when declared', 'invalid_project_manifest')
-    evaluation = { profile: 'agent_dataset', datasetPath, ...(harnessPaths ? { harnessPaths } : {}), thresholds }
+    if (holdout) {
+      // The holdout run is the evaluation: an in-worktree evaluation check would need the dataset beside the code under test.
+      if (checks.some((check) => check.kind === 'evaluation')) throw new AppError(422, 'An evaluation.holdout replaces evaluation checks; remove checks of kind evaluation', 'invalid_project_manifest')
+      if (!harnessPaths) throw new AppError(422, 'evaluation.holdout requires evaluation.harnessPaths: the grader is taken from them at the base revision', 'invalid_project_manifest')
+      const grader = evaluationProcess(configured.grader, 'evaluation.grader')
+      const subject = evaluationProcess(configured.subject, 'evaluation.subject')
+      evaluation = { profile: 'agent_dataset', holdout, harnessPaths, grader, subject, thresholds }
+    } else {
+      if (configured.grader !== undefined || configured.subject !== undefined) throw new AppError(422, 'evaluation.grader and evaluation.subject apply only to evaluation.holdout', 'invalid_project_manifest')
+      if (!checks.some((check) => check.kind === 'evaluation')) throw new AppError(422, 'Agent systems require at least one evaluation check', 'invalid_project_manifest')
+      evaluation = { profile: 'agent_dataset', datasetPath, ...(harnessPaths ? { harnessPaths } : {}), thresholds }
+    }
   } else {
     if (root.evaluation !== undefined) {
       const configured = requireObject(root.evaluation, 'evaluation')
@@ -180,7 +221,7 @@ export function loadProjectManifest(repositoryPath: string, baseSha: string): Pr
     throw new AppError(422, `Base revision must contain ${PROJECT_MANIFEST_PATH}`, 'project_manifest_missing')
   }
   const manifest = parseManifest(raw)
-  let evaluationDatasetDigest: string | undefined
+  let evaluationDatasetDigest: string | undefined = manifest.evaluation.holdout?.digest
   if (manifest.evaluation.datasetPath) {
     try {
       const dataset = execFileSync('git', ['-C', repositoryPath, 'show', `${baseSha}:${manifest.evaluation.datasetPath}`], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 })

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -145,11 +145,11 @@ try {
   // Undoing the forgery takes dropping a trigger, which only someone with the database file can do.
   const deleteTrigger = forger.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'domain_events' AND sql LIKE '%DELETE%'").get() as { name: string; sql: string }
   forger.exec(`DROP TRIGGER ${deleteTrigger.name}; DELETE FROM domain_events WHERE id = 'EVT-FORGED'; ${deleteTrigger.sql};`)
-  // A chain rewritten from genesis with every digest recomputed verifies on its own; the head the evidence package
-  // recorded is what no longer matches.
+  // A chain rewritten from genesis with every digest recomputed is self-consistent, but its seals no longer verify, and
+  // the head the evidence package recorded is no longer on it.
   const restoreChain = rewriteProposalChain(database, forger, proposal.id)
-  assert.equal(database.verifyAggregateEventChain('change_proposal', proposal.id), true, 'the rewritten chain is self-consistent')
-  assert.throws(() => authority.mergeChangeProposal(proposal.id, owner.id), (error) => error instanceof AppError && error.code === 'event_chain_broken' && /head recorded by/u.test(error.message))
+  assert.ok(database.eventChainFaults('change_proposal', proposal.id).every((fault) => /seal does not verify/u.test(fault)), 'the rewritten digests recompute; only the seals give it away')
+  assert.throws(() => authority.mergeChangeProposal(proposal.id, owner.id), (error) => error instanceof AppError && error.code === 'event_chain_broken' && /head recorded by/u.test(error.message) && /seal does not verify/u.test(error.message))
   assert.equal(git('rev-parse', 'main'), mainBefore)
   restoreChain()
   // The rows the merge reads are append-only too: a decision cannot be rewritten or a check deleted in place.
@@ -189,7 +189,36 @@ try {
   const restoreAfterMerge = rewriteProposalChain(database, postMergeForger, proposal.id)
   assert.throws(() => database.getMergeEvidence(proposal.id), (error) => error instanceof AppError && error.code === 'merge_evidence_chain_mismatch')
   restoreAfterMerge()
+  // C-H2: an event appended with a correct digest (anyone can compute one) still has no seal, and a seal made up
+  // without the key does not verify.
+  const tail = database.listAggregateEvents('change_proposal', proposal.id).at(-1)!
+  const forgedCanonical = { aggregateType: 'change_proposal', aggregateId: proposal.id, aggregateVersion: tail.aggregateVersion + 1, eventType: 'review.approved', actorId: reviewer.id, payload: { forged: true }, previousEventDigest: tail.eventDigest, occurredAt: tail.occurredAt }
+  const forgedDigest = `sha256:${createHash('sha256').update(JSON.stringify(forgedCanonical)).digest('hex')}`
+  postMergeForger.prepare("INSERT INTO domain_events(id, project_id, aggregate_type, aggregate_id, aggregate_version, event_type, actor_id, payload_json, previous_event_digest, event_digest, occurred_at, recorded_at) VALUES ('EVT-CHAINED-FORGERY', ?, 'change_proposal', ?, ?, 'review.approved', ?, ?, ?, ?, ?, ?)").run(proposal.projectId, proposal.id, forgedCanonical.aggregateVersion, reviewer.id, JSON.stringify(forgedCanonical.payload), tail.eventDigest, forgedDigest, tail.occurredAt, tail.recordedAt)
+  assert.deepEqual(database.eventChainFaults('change_proposal', proposal.id), ['event EVT-CHAINED-FORGERY has no seal'])
+  assert.throws(() => database.getMergeEvidence(proposal.id), (error) => error instanceof AppError && error.code === 'merge_evidence_chain_mismatch' && /no seal/u.test(error.message))
+  postMergeForger.prepare("INSERT INTO event_seals(event_id, key_id, seal, backfilled, sealed_at) VALUES ('EVT-CHAINED-FORGERY', ?, ?, 0, ?)").run(database.eventSeals.keyId, createHash('sha256').update(forgedDigest).digest('hex'), tail.recordedAt)
+  assert.deepEqual(database.eventChainFaults('change_proposal', proposal.id), ['event EVT-CHAINED-FORGERY seal does not verify'])
+  postMergeForger.exec("DROP TRIGGER event_seals_no_delete; DELETE FROM event_seals WHERE event_id = 'EVT-CHAINED-FORGERY'; CREATE TRIGGER event_seals_no_delete BEFORE DELETE ON event_seals BEGIN SELECT RAISE(ABORT, 'event_seals are append-only'); END;")
+  const eventsDeleteTrigger = postMergeForger.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'domain_events' AND sql LIKE '%DELETE%'").get() as { name: string; sql: string }
+  postMergeForger.exec(`DROP TRIGGER ${eventsDeleteTrigger.name}; DELETE FROM domain_events WHERE id = 'EVT-CHAINED-FORGERY'; ${eventsDeleteTrigger.sql};`)
+  assert.throws(() => postMergeForger.prepare('UPDATE event_seals SET seal = ? WHERE event_id = ?').run('0', tail.id), /append-only/u)
   postMergeForger.close()
+  // The key lives next to the database here (no key configured). A Control Plane holding a different key refuses
+  // every seal until the old key is named as retired.
+  assert.equal(database.eventSeals.source, 'colocated')
+  assert.equal(statSync(join(root, 'event-seal.key')).mode & 0o777, 0o600)
+  assert.equal(database.getEventSealStatus().unsealed, 0)
+  process.env.APERTURE_EVENT_SEAL_KEY = 'b'.repeat(64)
+  const rekeyed = new ControlPlaneDatabase(databasePath, migrationDirectory)
+  assert.match(rekeyed.eventChainFaults('change_proposal', proposal.id)[0] ?? '', /does not hold/u)
+  rekeyed.close()
+  process.env.APERTURE_EVENT_SEAL_RETIRED_KEY_FILES = join(root, 'event-seal.key')
+  const rotated = new ControlPlaneDatabase(databasePath, migrationDirectory)
+  assert.equal(rotated.verifyAggregateEventChain('change_proposal', proposal.id), true, 'a retired key still verifies the seals it made')
+  rotated.close()
+  delete process.env.APERTURE_EVENT_SEAL_KEY
+  delete process.env.APERTURE_EVENT_SEAL_RETIRED_KEY_FILES
 
   assert.equal(database.verifyAggregateEventChain('work_item', workItem.id), true)
   assert.equal(database.verifyAggregateEventChain('change_proposal', proposal.id), true)

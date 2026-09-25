@@ -28,6 +28,10 @@ export type AgentRuntimeAttestation = {
   environmentKeys?: string[]
   secretEnvironmentKeys?: string[]
   productionEligible: boolean
+  /** How the Builder process itself was confined beyond its worktree, when it was; recorded so a reviewer can see what it could read. */
+  confinement?: { kind: 'seatbelt'; deniedPaths: string[]; allowedPaths: string[]; profileDigest: string }
+  /** Whether the Builder could read registered evaluation holdouts. A holdout evaluation is independent only when it could not. */
+  holdoutReadable?: boolean
   attestationDigest: string
 }
 
@@ -144,6 +148,8 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     const reviewFeedback = revisionProposal ? this.input.database.listCurrentChangeRequests(revisionProposal.id) : []
     if (revisionProposal && !reviewFeedback.length) throw new AppError(409, 'Revision run requires current changes_requested feedback', 'revision_feedback_missing')
     const projectManifest = loadProjectManifest(repositoryPath, baseSha)
+    const holdout = projectManifest.manifest.evaluation.holdout
+    if (holdout && this.input.database.readEvaluationHoldout(workItem.projectId, holdout.digest) === undefined) throw new AppError(422, `The evaluation holdout ${holdout.digest} named by the project manifest is not registered with this Control Plane, or no longer has that digest`, 'evaluation_holdout_missing')
     const declaredContextPaths = applyProjectManifest({ binding: projectManifest, workItem, intent, runtime: this.descriptor, declaredContextPaths: request.declaredContextPaths })
     const runId = `RUN-${randomUUID().slice(0, 8).toUpperCase()}`
     const branchRef = revisionProposal ? `agent/revision-${runId.toLowerCase()}` : `agent/${runId.toLowerCase()}`
@@ -155,14 +161,14 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     git(repositoryPath, ['worktree', 'add', '-b', branchRef, worktreePath, startSha])
     git(worktreePath, ['config', 'user.name', 'BoundaryX Local Agent'])
     git(worktreePath, ['config', 'user.email', 'local-agent@aperture.invalid'])
-    writeFileSync(requestPath, JSON.stringify({ runId, workItem, intent, workspace: worktreePath, projectManifest: { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, evaluation: { profile: projectManifest.manifest.evaluation.profile, datasetPath: projectManifest.manifest.evaluation.datasetPath, datasetDigest: projectManifest.evaluationDatasetDigest, thresholds: projectManifest.manifest.evaluation.thresholds }, artifact: projectManifest.manifest.artifact ?? null }, declaredContextPaths, revision: revisionProposal ? { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedback: reviewFeedback } : null }, null, 2))
+    writeFileSync(requestPath, JSON.stringify({ runId, workItem, intent, workspace: worktreePath, projectManifest: { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, evaluation: { profile: projectManifest.manifest.evaluation.profile, datasetPath: projectManifest.manifest.evaluation.datasetPath, holdout: Boolean(holdout), datasetDigest: projectManifest.evaluationDatasetDigest, thresholds: projectManifest.manifest.evaluation.thresholds }, artifact: projectManifest.manifest.artifact ?? null }, declaredContextPaths, revision: revisionProposal ? { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedback: reviewFeedback } : null }, null, 2))
     const runtimeContext = { runId, worktreePath, requestPath, timeoutMs }
     const attestation = this.input.runtime.attest(runtimeContext)
     const run = this.input.database.createAgentRun({ id: runId, workItemId: workItem.id, intentVersionId: intent.id, repositoryPath, baseRef: request.baseRef, baseSha, startSha, revisionOfProposalId: revisionProposal?.id, branchRef, worktreePath, adapterId: this.id, isolation: attestation.isolation, runtimeImageRef: attestation.imageRef, runtimeAttestationDigest: attestation.attestationDigest, networkEgress: attestation.networkEgress, productionEligible: attestation.productionEligible, startedByActorId: actorId, status: 'queued' })
     this.input.database.saveAgentRunPlan({ runId, declaredContextPaths, requestPath, timeoutMs })
     this.input.database.recordAgentRunEvent(runId, 'agent_run.runtime_attested', attestation, actorId)
     if (revisionProposal) this.input.database.recordAgentRunEvent(runId, 'agent_run.revision_feedback_bound', { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedbackReviewIds: reviewFeedback.map((feedback) => feedback.reviewId), feedbackDigest: `sha256:${sha256(JSON.stringify(reviewFeedback))}` }, actorId)
-    this.input.database.recordAgentRunEvent(runId, 'agent_run.project_manifest_bound', { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, schemaVersion: projectManifest.manifest.schemaVersion, productType: projectManifest.manifest.productType, requiredContextCount: projectManifest.manifest.context.required.length, allowedContextCount: projectManifest.manifest.context.allowed.length, checks: projectManifest.manifest.checks.map((check) => ({ name: check.name, kind: check.kind })), evaluationProfile: projectManifest.manifest.evaluation.profile, evaluationDatasetPath: projectManifest.manifest.evaluation.datasetPath ?? null, evaluationDatasetDigest: projectManifest.evaluationDatasetDigest ?? null, artifact: projectManifest.manifest.artifact ?? null, policy: projectManifest.manifest.policy }, actorId)
+    this.input.database.recordAgentRunEvent(runId, 'agent_run.project_manifest_bound', { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, schemaVersion: projectManifest.manifest.schemaVersion, productType: projectManifest.manifest.productType, requiredContextCount: projectManifest.manifest.context.required.length, allowedContextCount: projectManifest.manifest.context.allowed.length, checks: projectManifest.manifest.checks.map((check) => ({ name: check.name, kind: check.kind })), evaluationProfile: projectManifest.manifest.evaluation.profile, evaluationDatasetPath: projectManifest.manifest.evaluation.datasetPath ?? null, evaluationHoldout: Boolean(holdout), evaluationDatasetDigest: projectManifest.evaluationDatasetDigest ?? null, artifact: projectManifest.manifest.artifact ?? null, policy: projectManifest.manifest.policy }, actorId)
     this.input.database.recordAgentRunEvent(runId, 'agent_run.workspace_prepared', { worktreePath, branchRef, requestDigest: `sha256:${sha256(readFileSync(requestPath))}`, isolation: attestation.isolation, productionEligible: attestation.productionEligible }, actorId)
     return run
   }

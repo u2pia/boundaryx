@@ -161,7 +161,7 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         // takes effect on the next run, so the model is read live rather than reported from the snapshot.
         const provider = database.getAgentProviderSettings()
         const agentRuntime = agentRuntimeDescriptor ? { ...agentRuntimeDescriptor, model: provider?.model, modelProvider: provider?.providerId } : null
-        return sendJson(response, 200, { status: 'ok', provider: authority.id, storage: 'sqlite', agentRunner: agentRunner?.id ?? null, agentRuntime, agentRunQueue: agentRunQueue?.snapshot() ?? null, time: new Date().toISOString() })
+        return sendJson(response, 200, { status: 'ok', provider: authority.id, storage: 'sqlite', agentRunner: agentRunner?.id ?? null, agentRuntime, agentRunQueue: agentRunQueue?.snapshot() ?? null, eventSeal: database.getEventSealStatus(), time: new Date().toISOString() })
       }
       if (method === 'GET' && path === '/api/setup/status') return sendJson(response, 200, { required: !database.hasActors() })
 
@@ -299,6 +299,18 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         requireIn(projectConnectionRoute.projectId, ['owner', 'maintainer'])
         const project = database.getProject(projectConnectionRoute.projectId)
         return sendJson(response, 200, { connection: await codeHostFor(project, { dataDirectory: database.dataDirectory, env: process.env }).testConnection() })
+      }
+
+      // A holdout's content goes in and never comes back out: members see digests, and the manifest names one by digest.
+      const projectHoldoutRoute = routeMatch(path, /^\/api\/projects\/(?<projectId>[^/]+)\/evaluation-holdouts$/u)
+      if (method === 'GET' && projectHoldoutRoute) {
+        requireIn(projectHoldoutRoute.projectId)
+        return sendJson(response, 200, { holdouts: database.listEvaluationHoldouts(projectHoldoutRoute.projectId) })
+      }
+      if (method === 'POST' && projectHoldoutRoute) {
+        const body = await readJson(request)
+        if (typeof body.content !== 'string') throw new AppError(400, 'content must be the holdout text (JSON lines)', 'invalid_evaluation_holdout')
+        return sendJson(response, 201, { holdout: database.registerEvaluationHoldout(projectHoldoutRoute.projectId, body.content, actor.id) })
       }
 
       const projectSyncRoute = routeMatch(path, /^\/api\/projects\/(?<projectId>[^/]+)\/sync$/u)

@@ -52,9 +52,12 @@ Approved Change Proposal
 
 Merge Evidence 表具有禁止更新和删除的 SQLite Trigger；读取时重新计算 Digest。最终合并事件继续进入 Change Proposal 的追加式摘要链。
 
+读取时还会逐个校验 Proposal 链上事件的封印（`event_seals`，对事件 ID 与 Digest 的 HMAC-SHA256，密钥在数据库之外）。缺封印、封印不符、或封印所用密钥既不是当前密钥也不在 `APERTURE_EVENT_SEAL_RETIRED_KEY_FILES` 之中，都报 `merge_evidence_chain_mismatch`。
+
 ## 当前边界
 
 - 仅支持本地分支的 fast-forward，不创建额外 Merge Commit。
 - 不处理远程 Push、GitHub/GitLab PR 合并或受保护分支 API。
 - 不代表发布授权；Release、Artifact 与 Deployment Evidence 仍是后续独立阶段。
 - Process Runtime 仍然是非生产隔离，Merge Evidence 不能改变 Runtime 的生产资格。
+- 事件封印防的是只持有数据库文件的人；持有封印密钥的人仍可重写整条链，链头尚未外部锚定。未配置密钥时，密钥与数据库同在数据目录。

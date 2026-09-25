@@ -1,11 +1,12 @@
 import { spawnSync } from 'node:child_process'
 import { execFileSync } from 'node:child_process'
-import { readFileSync, rmSync, statSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import type { ControlPlaneDatabase } from './database.ts'
 import type { AgentRunPostprocessor, AgentRunPostprocessorInput } from './git-worktree-agent-runner.ts'
 import type { LocalEvidenceStore } from './local-evidence-store.ts'
-import type { ProjectEvaluationThreshold } from './project-manifest.ts'
+import type { ProjectEvaluationProcess, ProjectEvaluationThreshold } from './project-manifest.ts'
+import { seatbeltAvailable, seatbeltCommand } from './seatbelt.ts'
 import { mapCriteriaToChecks } from './criteria-coverage.ts'
 import { POLICY_PATH_PREFIX } from './local-git-authority.ts'
 import { sha256 } from './security.ts'
@@ -24,8 +25,11 @@ export type LocalCheckDefinition = {
  * - `pre_existing`: run against test files taken from the proposal's base revision, so the agent
  *   could not influence the questions. This is the only conclusion that is independent evidence.
  * - `unverified`: the project manifest declares no `testPaths`, so no independent signal exists.
+ * - `isolated`: a holdout evaluation whose grader came from the base revision, whose subject ran sandboxed away from
+ *   the holdout, and whose Builder could not read the holdout either. The only independent evaluation result.
+ * - `isolated_partial`: a holdout evaluation missing one of those, so the subject or the Builder could have seen it.
  */
-export type CheckProvenance = 'all_tests' | 'pre_existing' | 'unverified'
+export type CheckProvenance = 'all_tests' | 'pre_existing' | 'unverified' | 'isolated' | 'isolated_partial'
 
 type ExecutedCheck = {
   id: string
@@ -96,6 +100,12 @@ function evaluationMetrics(stdout: string) {
   return { metrics, conflicts: [...conflicts] }
 }
 
+function thresholdResultsFor(thresholds: ProjectEvaluationThreshold[], metrics: Record<string, number> | undefined) {
+  return thresholds.map((threshold) => { const actual = metrics?.[threshold.metric]; return { ...threshold, actual, passed: actual !== undefined && (threshold.operator === 'gte' ? actual >= threshold.threshold : actual <= threshold.threshold) } })
+}
+
+type EvaluationPhase = { phase: 'inputs' | 'subject' | 'score'; exitCode: number | null; durationMs: number; timedOut: boolean; stdoutDigest: string; stderrDigest: string; error?: string }
+
 export class LocalRunPostprocessor implements AgentRunPostprocessor {
   private readonly input: { database: ControlPlaneDatabase; evidenceStore: LocalEvidenceStore }
 
@@ -113,8 +123,20 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const harnessPaths = input.projectManifest.manifest.evaluation.harnessPaths ?? []
     const agentModifiedHarnessFiles = harnessPaths.length ? this.diffFiles(input.worktreePath, input.proposal.baseSha, input.proposal.headSha, harnessPaths) : []
     const harnessProvenance: CheckProvenance = !harnessPaths.length ? 'unverified' : agentModifiedHarnessFiles.length ? 'all_tests' : 'pre_existing'
-    const datasetBeforeChecks = input.projectManifest.manifest.evaluation.profile === 'agent_dataset' ? this.datasetState(input) : undefined
-    if (datasetBeforeChecks) checks.push(this.recordEvaluationDatasetIntegrity(input), this.recordEvaluationDatasetLeakage(input))
+    const holdout = input.projectManifest.manifest.evaluation.holdout
+    const datasetBeforeChecks = input.projectManifest.manifest.evaluation.profile === 'agent_dataset' && !holdout ? this.datasetState(input) : undefined
+    if (datasetBeforeChecks) checks.push(this.recordEvaluationDatasetIntegrity(input), this.recordEvaluationDatasetLeakage(input, this.baseDataset(input), input.projectManifest.manifest.evaluation.datasetPath!))
+    // A holdout evaluation runs first, before any check has executed code from the head revision that could linger.
+    let isolated: ReturnType<LocalRunPostprocessor['executeIsolatedEvaluation']> | undefined
+    if (holdout) {
+      const content = this.input.database.readEvaluationHoldout(input.proposal.projectId, holdout.digest)
+      checks.push(this.recordEvaluationHoldoutIntegrity(input, content !== undefined))
+      if (content !== undefined) {
+        checks.push(this.recordEvaluationDatasetLeakage(input, content, `holdout:${holdout.digest}`))
+        isolated = this.executeIsolatedEvaluation(input, content, harnessProvenance)
+        checks.push(isolated.check)
+      }
+    }
     checks.push(...manifestChecks.map((check) => this.executeCheck({ name: check.name, kind: check.kind, executable: check.command[0], args: check.command.slice(1), timeoutMs: check.timeoutMs }, input, check.kind === 'test' ? { provenance: headProvenance, testTreeSha: input.proposal.headSha, agentModifiedTestFiles } : check.kind === 'evaluation' ? { provenance: harnessProvenance, testTreeSha: input.proposal.headSha, agentModifiedTestFiles: agentModifiedHarnessFiles } : undefined)))
     if (agentModifiedTestFiles.length) checks.push(...this.executeBaselineChecks(input, 'test', testPaths, agentModifiedTestFiles))
     if (agentModifiedHarnessFiles.length) checks.push(...this.executeBaselineChecks(input, 'evaluation', harnessPaths, agentModifiedHarnessFiles))
@@ -140,7 +162,22 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
       // but also any helper or fixture outside testPaths. Listed so the reviewer can see where the baseline ends.
       filesAtHeadDuringBaseline: agentModifiedTestFiles.length ? this.diffFiles(input.worktreePath, input.proposal.baseSha, input.proposal.headSha, ['.']).filter((file) => !agentModifiedTestFiles.includes(file)) : [],
     }
-    const evaluationProvenance = input.projectManifest.manifest.evaluation.profile === 'agent_dataset' ? {
+    const evaluationProvenance = holdout ? {
+      mode: 'holdout' as const,
+      holdoutDigest: holdout.digest,
+      declaredHarnessPaths: harnessPaths,
+      agentModifiedHarnessFiles,
+      graderFromBase: true,
+      subjectConfinement: isolated?.subjectConfinement ?? null,
+      builderHoldoutReadable: isolated?.builderHoldoutReadable ?? input.attestation.holdoutReadable !== false,
+      independent: isolated?.check.provenance === 'isolated',
+      note: isolated?.check.provenance === 'isolated'
+        ? 'The grader ran from the base revision, in its own directory with the holdout; the code under evaluation ran from the head revision under Seatbelt, with the holdout, the grader, the repository and the Control Plane data unreadable and no network; and the Builder was confined away from the holdout. The evaluation result is independent of the change under review.'
+        : !isolated
+          ? 'The holdout named by the manifest could not be read, so no evaluation ran.'
+          : `The evaluation is not independent: ${[!isolated.subjectConfinement ? 'the code under evaluation ran unconfined and could read the holdout' : '', isolated.builderHoldoutReadable ? 'the Builder ran without confinement and could read the holdout' : ''].filter(Boolean).join('; ')}. A critical model criterion needs a reviewer override.`,
+    } : input.projectManifest.manifest.evaluation.profile === 'agent_dataset' ? {
+      mode: 'in_worktree' as const,
       declaredHarnessPaths: harnessPaths,
       agentModifiedHarnessFiles,
       graderFromBase: harnessProvenance !== 'unverified',
@@ -245,7 +282,8 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
 
   private executeCheck(definition: LocalCheckDefinition, input: AgentRunPostprocessorInput, testOrigin?: { provenance: CheckProvenance; testTreeSha: string; agentModifiedTestFiles: string[] }): ExecutedCheck {
     const started = Date.now()
-    const result = spawnSync(definition.executable, definition.args, { cwd: input.worktreePath, encoding: 'utf8', timeout: definition.timeoutMs, maxBuffer: 10 * 1024 * 1024, env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', CI: 'true', NO_COLOR: '1', ...(definition.kind === 'evaluation' && input.projectManifest.manifest.evaluation.datasetPath ? { APERTURE_EVALUATION_DATASET: input.projectManifest.manifest.evaluation.datasetPath, APERTURE_EVALUATION_DATASET_DIGEST: input.projectManifest.evaluationDatasetDigest ?? '' } : {}) } })
+    const command = this.checkCommand(input, definition)
+    const result = spawnSync(command.executable, command.args, { cwd: input.worktreePath, encoding: 'utf8', timeout: definition.timeoutMs, maxBuffer: 10 * 1024 * 1024, env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', CI: 'true', NO_COLOR: '1', ...(definition.kind === 'evaluation' && input.projectManifest.manifest.evaluation.datasetPath ? { APERTURE_EVALUATION_DATASET: input.projectManifest.manifest.evaluation.datasetPath, APERTURE_EVALUATION_DATASET_DIGEST: input.projectManifest.evaluationDatasetDigest ?? '' } : {}) } })
     const stdout = result.stdout ?? ''
     const stderr = result.stderr ?? ''
     const durationMs = Date.now() - started
@@ -253,7 +291,7 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const reported = definition.kind === 'evaluation' ? evaluationMetrics(stdout) : undefined
     const metrics = reported?.metrics
     const metricConflicts = reported?.conflicts.length ? reported.conflicts : undefined
-    const thresholdResults = definition.kind === 'evaluation' && input.projectManifest.manifest.evaluation.profile === 'agent_dataset' ? input.projectManifest.manifest.evaluation.thresholds.map((threshold) => { const actual = metrics?.[threshold.metric]; return { ...threshold, actual, passed: actual !== undefined && (threshold.operator === 'gte' ? actual >= threshold.threshold : actual <= threshold.threshold) } }) : undefined
+    const thresholdResults = definition.kind === 'evaluation' && input.projectManifest.manifest.evaluation.profile === 'agent_dataset' ? thresholdResultsFor(input.projectManifest.manifest.evaluation.thresholds, metrics) : undefined
     const thresholdFailed = thresholdResults?.some((threshold) => !threshold.passed) ?? false
     const conclusion = timedOut ? 'cancelled' : result.status === 0 && !thresholdFailed && !metricConflicts ? 'success' : 'failure'
     const stdoutDigest = `sha256:${sha256(stdout)}`
@@ -261,6 +299,18 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const check = this.input.database.recordCheck({ proposalId: input.proposal.id, headSha: input.proposal.headSha, name: definition.name, status: 'completed', conclusion, exitCode: result.status ?? undefined, durationMs, stdoutDigest, stderrDigest, source: 'run', runId: input.runId }, input.actorId)
     this.input.database.recordAgentRunEvent(input.runId, 'agent_run.check_completed', { checkId: check.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, name: definition.name, kind: definition.kind, conclusion, exitCode: result.status ?? null, durationMs, stdoutDigest, stderrDigest, provenance: testOrigin?.provenance ?? null, testTreeSha: testOrigin?.testTreeSha ?? null, metrics: metrics ?? null, metricConflicts: metricConflicts ?? null, thresholdResults: thresholdResults ?? null }, input.actorId)
     return { id: check.id, name: definition.name, kind: definition.kind, conclusion, exitCode: result.status ?? undefined, durationMs, stdoutDigest, stderrDigest, stdoutExcerpt: excerpt(stdout), stderrExcerpt: excerpt(stderr || result.error?.message || ''), provenance: testOrigin?.provenance, testTreeSha: testOrigin?.testTreeSha, agentModifiedTestFiles: testOrigin?.agentModifiedTestFiles, metrics, metricConflicts, thresholdResults }
+  }
+
+  /**
+   * With a holdout configured, the checks run head code on the host too, and could read the holdout from the data
+   * directory and print it into the evidence package. Where Seatbelt is available they run denied the data directory
+   * (their own run directory and the repository's Git directory excepted) and a seal key kept elsewhere.
+   */
+  private checkCommand(input: AgentRunPostprocessorInput, definition: LocalCheckDefinition) {
+    if (!input.projectManifest.manifest.evaluation.holdout || !seatbeltAvailable()) return { executable: definition.executable, args: definition.args }
+    const gitCommonDirectory = resolve(input.worktreePath, execFileSync('git', ['-C', input.worktreePath, 'rev-parse', '--git-common-dir'], { encoding: 'utf8' }).trim())
+    const keyPath = this.input.database.eventSeals.keyPath
+    return seatbeltCommand({ denied: [this.input.database.dataDirectory, ...(keyPath ? [keyPath] : [])], allowed: [dirname(input.worktreePath), gitCommonDirectory] }, definition.executable, definition.args)
   }
 
   private collectBuildArtifacts(input: AgentRunPostprocessorInput, checks: ExecutedCheck[]) {
@@ -338,13 +388,17 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
    * long enough to be specific is looked for in the lines the run added. Only digests of the matches are recorded,
    * so the check does not itself spread the holdout.
    */
-  private recordEvaluationDatasetLeakage(input: AgentRunPostprocessorInput): ExecutedCheck {
-    const datasetPath = input.projectManifest.manifest.evaluation.datasetPath!
-    let candidates: string[] = []
-    try { candidates = datasetLeakCandidates(execFileSync('git', ['-C', input.worktreePath, 'show', `${input.proposal.baseSha}:${datasetPath}`], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 })) } catch {}
+  private baseDataset(input: AgentRunPostprocessorInput) {
+    try { return execFileSync('git', ['-C', input.worktreePath, 'show', `${input.proposal.baseSha}:${input.projectManifest.manifest.evaluation.datasetPath!}`], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 }) } catch { return '' }
+  }
+
+  /** `datasetPath` is the repository path of an in-worktree dataset (excluded from the diff), or `holdout:<digest>`. */
+  private recordEvaluationDatasetLeakage(input: AgentRunPostprocessorInput, content: string, datasetPath: string): ExecutedCheck {
+    const candidates = datasetLeakCandidates(content)
+    const excluded = input.projectManifest.manifest.evaluation.datasetPath ? [`:(exclude)${input.projectManifest.manifest.evaluation.datasetPath}`] : []
     const added = new Map<string, string[]>()
     let file = ''
-    for (const line of execFileSync('git', ['-C', input.worktreePath, 'diff', '--unified=0', '--no-color', '--no-ext-diff', input.proposal.baseSha, input.proposal.headSha, '--', '.', `:(exclude)${datasetPath}`], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 }).split('\n')) {
+    for (const line of execFileSync('git', ['-C', input.worktreePath, 'diff', '--unified=0', '--no-color', '--no-ext-diff', input.proposal.baseSha, input.proposal.headSha, '--', '.', ...excluded], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 }).split('\n')) {
       if (line.startsWith('+++ ')) file = line.slice(4).replace(/^b\//u, '')
       else if (line.startsWith('+')) added.set(file, [...(added.get(file) ?? []), line.slice(1)])
     }
@@ -360,6 +414,113 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const check = this.input.database.recordCheck({ proposalId: input.proposal.id, headSha: input.proposal.headSha, name: 'evaluation-dataset-leakage', status: 'completed', conclusion: passed ? 'success' : 'failure', exitCode: passed ? 0 : 1, durationMs: 0, stdoutDigest, stderrDigest, source: 'run', runId: input.runId }, input.actorId)
     this.input.database.recordAgentRunEvent(input.runId, 'agent_run.evaluation_dataset_leakage_checked', { checkId: check.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, datasetPath, candidateCount: candidates.length, leakedValueCount: leaks.length, leakedFiles: [...new Set(leaks.flatMap((leak) => leak.files))], passed }, input.actorId)
     return { id: check.id, name: 'evaluation-dataset-leakage', kind: 'integrity', conclusion: passed ? 'success' : 'failure', exitCode: passed ? 0 : 1, durationMs: 0, stdoutDigest, stderrDigest, stdoutExcerpt: stdout, stderrExcerpt: '' }
+  }
+
+  private recordEvaluationHoldoutIntegrity(input: AgentRunPostprocessorInput, passed: boolean): ExecutedCheck {
+    const digest = input.projectManifest.manifest.evaluation.holdout!.digest
+    const stdout = JSON.stringify({ holdoutDigest: digest, registered: passed, passed })
+    const stdoutDigest = `sha256:${sha256(stdout)}`
+    const stderrDigest = `sha256:${sha256('')}`
+    const check = this.input.database.recordCheck({ proposalId: input.proposal.id, headSha: input.proposal.headSha, name: 'evaluation-holdout-integrity', status: 'completed', conclusion: passed ? 'success' : 'failure', exitCode: passed ? 0 : 1, durationMs: 0, stdoutDigest, stderrDigest, source: 'run', runId: input.runId }, input.actorId)
+    this.input.database.recordAgentRunEvent(input.runId, 'agent_run.evaluation_holdout_verified', { checkId: check.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, holdoutDigest: digest, passed }, input.actorId)
+    return { id: check.id, name: 'evaluation-holdout-integrity', kind: 'integrity', conclusion: passed ? 'success' : 'failure', exitCode: passed ? 0 : 1, durationMs: 0, stdoutDigest, stderrDigest, stdoutExcerpt: stdout, stderrExcerpt: '' }
+  }
+
+  /** Extracts `paths` (everything when empty) of a revision into `target`, from the object store rather than the worktree. */
+  private extractRevision(input: AgentRunPostprocessorInput, sha: string, paths: string[], target: string) {
+    const archive = spawnSync('git', ['-C', input.worktreePath, 'archive', '--format=tar', sha, ...(paths.length ? ['--', ...paths] : [])], { maxBuffer: 512 * 1024 * 1024 })
+    if (archive.status !== 0) throw new Error(`git archive ${sha.slice(0, 12)} failed: ${archive.stderr?.toString().trim() || archive.error?.message}`)
+    const unpacked = spawnSync('tar', ['-x', '-f', '-', '-C', target], { input: archive.stdout, maxBuffer: 16 * 1024 * 1024 })
+    if (unpacked.status !== 0) throw new Error(`tar failed: ${unpacked.stderr?.toString().trim() || unpacked.error?.message}`)
+  }
+
+  private runPhase(phase: EvaluationPhase['phase'], definition: ProjectEvaluationProcess, cwd: string, env: Record<string, string>, stdin: string, wrap?: (executable: string, args: string[]) => { executable: string; args: string[] }) {
+    const started = Date.now()
+    const command = wrap ? wrap(definition.command[0], definition.command.slice(1)) : { executable: definition.command[0], args: definition.command.slice(1) }
+    const result = spawnSync(command.executable, command.args, { cwd, input: stdin, encoding: 'utf8', timeout: definition.timeoutMs, maxBuffer: 20 * 1024 * 1024, env })
+    const stdout = result.stdout ?? ''
+    const stderr = result.stderr ?? ''
+    const summary: EvaluationPhase = { phase, exitCode: result.status, durationMs: Date.now() - started, timedOut: (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT', stdoutDigest: `sha256:${sha256(stdout)}`, stderrDigest: `sha256:${sha256(stderr)}`, ...(result.error ? { error: result.error.message } : {}) }
+    return { stdout, stderr, summary }
+  }
+
+  /**
+   * The isolated evaluator. The grader (the manifest's harnessPaths at the base revision) and the code under evaluation
+   * (the head revision) are extracted into separate directories under the data directory, never the worktree. The
+   * grader turns the holdout into inputs; the subject answers them on stdout, sandboxed so that it cannot read the
+   * holdout, the grader, the repository or the Control Plane's data, cannot write outside its scratch directory and
+   * has no network; the grader then scores the answers. Only the grader's final stdout is parsed for metrics.
+   */
+  private executeIsolatedEvaluation(input: AgentRunPostprocessorInput, holdout: string, harnessProvenance: CheckProvenance) {
+    const evaluation = input.projectManifest.manifest.evaluation
+    const started = Date.now()
+    const confine = seatbeltAvailable()
+    const builderHoldoutReadable = input.attestation.holdoutReadable !== false
+    const evaluationRoot = join(this.input.database.dataDirectory, 'evaluations')
+    mkdirSync(evaluationRoot, { recursive: true, mode: 0o700 })
+    chmodSync(evaluationRoot, 0o700)
+    const root = mkdtempSync(join(evaluationRoot, `${input.runId}-`))
+    const [graderDirectory, subjectDirectory, scratchDirectory] = ['grader', 'subject', 'scratch'].map((name) => join(root, name))
+    const holdoutPath = join(root, 'holdout.jsonl')
+    const outputsPath = join(root, 'outputs.jsonl')
+    const phases: EvaluationPhase[] = []
+    let graderStdout = ''
+    let stderrExcerpt = ''
+    let setupError: string | undefined
+    let subjectConfinement: { kind: 'seatbelt'; profileDigest: string } | undefined
+    try {
+      for (const directory of [graderDirectory, subjectDirectory, scratchDirectory]) mkdirSync(directory, { mode: 0o700 })
+      writeFileSync(holdoutPath, holdout, { mode: 0o600 })
+      this.extractRevision(input, input.proposal.baseSha, evaluation.harnessPaths!, graderDirectory)
+      this.extractRevision(input, input.proposal.headSha, [], subjectDirectory)
+      const base = { PATH: process.env.PATH ?? '', CI: 'true', NO_COLOR: '1' }
+      const graderEnv = { ...base, HOME: scratchDirectory, TMPDIR: scratchDirectory, APERTURE_EVALUATION_DATASET: holdoutPath, APERTURE_EVALUATION_DATASET_DIGEST: evaluation.holdout!.digest }
+      const inputs = this.runPhase('inputs', evaluation.grader!, graderDirectory, { ...graderEnv, APERTURE_EVALUATION_PHASE: 'inputs' }, '')
+      phases.push(inputs.summary)
+      stderrExcerpt += inputs.stderr
+      if (inputs.summary.exitCode === 0) {
+        const policy = { denied: [this.input.database.dataDirectory, input.proposal.repositoryPath, dirname(input.worktreePath), root, ...(this.input.database.eventSeals.keyPath ? [this.input.database.eventSeals.keyPath] : [])], allowed: [subjectDirectory, scratchDirectory], writableOnly: [scratchDirectory], denyNetwork: true }
+        const subject = this.runPhase('subject', evaluation.subject!, subjectDirectory, { ...base, HOME: scratchDirectory, TMPDIR: scratchDirectory }, inputs.stdout, confine ? (executable, args) => {
+          const command = seatbeltCommand(policy, executable, args)
+          subjectConfinement = { kind: 'seatbelt', profileDigest: command.profileDigest }
+          return command
+        } : undefined)
+        // The subject's output is the grader's input, never parsed here: a metrics line it prints scores nothing.
+        phases.push(subject.summary)
+        if (subject.summary.exitCode === 0) {
+          writeFileSync(outputsPath, subject.stdout, { mode: 0o600 })
+          const score = this.runPhase('score', evaluation.grader!, graderDirectory, { ...graderEnv, APERTURE_EVALUATION_PHASE: 'score', APERTURE_EVALUATION_OUTPUTS: outputsPath }, '')
+          phases.push(score.summary)
+          graderStdout = score.stdout
+          stderrExcerpt += score.stderr
+        }
+      }
+    } catch (error) {
+      setupError = error instanceof Error ? error.message : String(error)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+    const reported = phases.some((phase) => phase.phase === 'score') ? evaluationMetrics(graderStdout) : undefined
+    const metrics = reported?.metrics
+    const metricConflicts = reported?.conflicts.length ? reported.conflicts : undefined
+    const thresholdResults = thresholdResultsFor(evaluation.thresholds, metrics)
+    const timedOut = phases.some((phase) => phase.timedOut)
+    const completed = !setupError && phases.length === 3 && phases.every((phase) => phase.exitCode === 0)
+    const conclusion = timedOut ? 'cancelled' : completed && !metricConflicts && thresholdResults.every((threshold) => threshold.passed) ? 'success' : 'failure'
+    const provenance: CheckProvenance = harnessProvenance !== 'unverified' && subjectConfinement && !builderHoldoutReadable ? 'isolated' : 'isolated_partial'
+    const durationMs = Date.now() - started
+    const failedPhase = phases.find((phase) => phase.exitCode !== 0)
+    const stderr = [setupError, failedPhase ? `phase ${failedPhase.phase} exited ${failedPhase.exitCode ?? 'without status'}${failedPhase.error ? `: ${failedPhase.error}` : ''}` : '', stderrExcerpt].filter(Boolean).join('\n')
+    const stdoutDigest = `sha256:${sha256(graderStdout)}`
+    const stderrDigest = `sha256:${sha256(stderr)}`
+    const check = this.input.database.recordCheck({ proposalId: input.proposal.id, headSha: input.proposal.headSha, name: 'evaluation-isolated', status: 'completed', conclusion, exitCode: completed ? 0 : 1, durationMs, stdoutDigest, stderrDigest, source: 'run', runId: input.runId }, input.actorId)
+    this.input.database.recordAgentRunEvent(input.runId, 'agent_run.check_completed', { checkId: check.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, name: 'evaluation-isolated', kind: 'evaluation', conclusion, exitCode: completed ? 0 : 1, durationMs, stdoutDigest, stderrDigest, provenance, testTreeSha: input.proposal.baseSha, holdoutDigest: evaluation.holdout!.digest, phases, subjectConfinement: subjectConfinement ?? null, builderHoldoutReadable, setupError: setupError ?? null, metrics: metrics ?? null, metricConflicts: metricConflicts ?? null, thresholdResults }, input.actorId)
+    // Only the grader's output is excerpted: the subject's streams carry the holdout's inputs and would spread them.
+    return {
+      check: { id: check.id, name: 'evaluation-isolated', kind: 'evaluation', conclusion, exitCode: completed ? 0 : 1, durationMs, stdoutDigest, stderrDigest, stdoutExcerpt: excerpt(graderStdout), stderrExcerpt: excerpt(stderr), provenance, testTreeSha: input.proposal.baseSha, metrics, metricConflicts, thresholdResults } satisfies ExecutedCheck,
+      subjectConfinement,
+      builderHoldoutReadable,
+    }
   }
 
   private recordDirtyWorkspace(input: AgentRunPostprocessorInput, dirty: string): ExecutedCheck {
