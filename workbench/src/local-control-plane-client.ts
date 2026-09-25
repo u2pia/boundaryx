@@ -385,6 +385,8 @@ export const localControlPlaneClient = {
   createActor: (input: { username: string; displayName: string; role: LocalActor['role']; password: string; projectIds?: string[] }) => post<{ actor: LocalActor }>('/api/actors', input),
   updateActor: (actorId: string, input: LocalActorUpdate) => post<{ actor: LocalActor }>(`/api/actors/${encodeURIComponent(actorId)}`, input),
   listProjects: () => request<{ projects: LocalProject[]; roles: Record<string, LocalActor['role'] | undefined> }>('/api/projects'),
+  /** What the project builds, from .aperture/project.json on its default branch; null while it has no repository. */
+  getProjectProductType: (projectId: string) => request<{ productType: LocalWorkItem['productType'] | null }>(`/api/projects/${encodeURIComponent(projectId)}/product-type`),
   getProject: (projectId: string) => request<{ project: LocalProject; role: LocalActor['role']; members: LocalProjectMember[]; lastSync: LocalCodeHostSyncReport | null }>(`/api/projects/${encodeURIComponent(projectId)}`),
   createProject: (input: LocalProjectInput & { slug: string; name: string }) => post<{ project: LocalProject }>('/api/projects', input as Record<string, unknown>),
   updateProject: (projectId: string, input: LocalProjectInput) => post<{ project: LocalProject }>(`/api/projects/${encodeURIComponent(projectId)}/settings`, input as Record<string, unknown>),

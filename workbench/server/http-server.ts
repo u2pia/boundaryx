@@ -10,6 +10,7 @@ import type { LocalEvidenceStore } from './local-evidence-store.ts'
 import { LocalGitAuthority } from './local-git-authority.ts'
 import { LocalReleaseAuthority } from './local-release-authority.ts'
 import { requestContext, type RequestContext } from './request-context.ts'
+import { projectProductType } from './project-product-type.ts'
 import { probeAgentProvider } from './provider-probe.ts'
 import { agentRunProgress } from './run-progress.ts'
 import { createSessionToken } from './security.ts'
@@ -425,11 +426,24 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
       if (method === 'GET' && agentRunRoute) requireIn(database.getAgentRun(agentRunRoute.runId).projectId)
       if (method === 'GET' && agentRunRoute) return sendJson(response, 200, { agentRun: database.getAgentRun(agentRunRoute.runId), events: database.listAggregateEvents('agent_run', agentRunRoute.runId), declaredContextPaths: database.getDeclaredContextPaths(agentRunRoute.runId) })
 
+      // What a project builds is declared once, in its manifest; a work item takes it from there. A caller that names
+      // the other type is refused here, instead of at the first Run after the Intent has been approved.
+      const productTypeRoute = routeMatch(path, /^\/api\/projects\/(?<projectId>[^/]+)\/product-type$/u)
+      if (method === 'GET' && productTypeRoute) {
+        requireIn(productTypeRoute.projectId)
+        return sendJson(response, 200, { productType: projectProductType(database, productTypeRoute.projectId) ?? null })
+      }
+
       if (method === 'POST' && path === '/api/work-items') {
         const body = await readJson(request)
-        const productType = optionalString(body, 'productType') ?? 'application'
-        if (!['application', 'agent_system'].includes(productType)) throw new AppError(400, 'productType must be application or agent_system', 'invalid_product_type')
-        const workItem = database.createWorkItem({ title: requireString(body, 'title'), description: typeof body.description === 'string' ? body.description : '', productType: productType as 'application' | 'agent_system', ownerActorId: optionalString(body, 'ownerActorId') ?? actor.id, projectId: requireString(body, 'projectId') }, actor.id)
+        const projectId = requireString(body, 'projectId')
+        const requested = optionalString(body, 'productType')
+        if (requested && !['application', 'agent_system'].includes(requested)) throw new AppError(400, 'productType must be application or agent_system', 'invalid_product_type')
+        requireIn(projectId, ALL_ROLES, 'work_item_forbidden')
+        const declared = projectProductType(database, projectId)
+        if (declared && requested && requested !== declared) throw new AppError(409, `The project's .aperture/project.json declares ${declared}; a work item in it cannot be ${requested}`, 'work_item_product_type_mismatch')
+        const productType = (declared ?? requested ?? 'application') as 'application' | 'agent_system'
+        const workItem = database.createWorkItem({ title: requireString(body, 'title'), description: typeof body.description === 'string' ? body.description : '', productType, ownerActorId: optionalString(body, 'ownerActorId') ?? actor.id, projectId }, actor.id)
         return sendJson(response, 201, { workItem })
       }
 

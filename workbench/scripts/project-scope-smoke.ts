@@ -193,8 +193,19 @@ try {
   assert.equal(betaAsReviewer.status, 403, 'Alice only reviews in beta, so she cannot author there')
   const missingProject = await call('/api/work-items', { cookie: aliceCookie, body: { title: 'x', description: 'x' } })
   assert.equal(missingProject.status, 400, 'a work item names its project')
-  const created = await call<{ workItem: { projectId: string } }>('/api/work-items', { cookie: aliceCookie, body: { title: 'x', description: 'x', projectId: beta.id } })
-  assert.equal(created.body.workItem.projectId, beta.id)
+  // A work item's product type is the project's, read from the manifest on its default branch.
+  const unconfigured = await call('/api/work-items', { cookie: aliceCookie, body: { title: 'x', description: 'x', projectId: beta.id } })
+  assert.deepEqual([unconfigured.status, unconfigured.body.error.code], [422, 'project_manifest_missing'], 'no Intent before the project says what it builds')
+  mkdirSync(join(betaRepository, '.aperture'))
+  writeFileSync(join(betaRepository, '.aperture/project.json'), JSON.stringify({ schemaVersion: 'aperture.project.v1', productType: 'application', context: { required: ['README.md'], allowed: ['README.md'] }, checks: [{ name: 'beta', kind: 'test', command: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 10_000 }], policy: { maximumRisk: 'high', allowUnisolatedRuntime: true } }))
+  execFileSync('git', ['-C', betaRepository, 'add', '.aperture'])
+  execFileSync('git', ['-C', betaRepository, 'commit', '--quiet', '-m', 'manifest'])
+  assert.deepEqual((await call(`/api/projects/${beta.id}/product-type`, { cookie: aliceCookie })).body, { productType: 'application' })
+  assert.equal((await call(`/api/projects/${beta.id}/product-type`, { cookie: bobCookie })).status, 404, 'a non-member cannot read it')
+  const mismatched = await call('/api/work-items', { cookie: aliceCookie, body: { title: 'x', description: 'x', projectId: beta.id, productType: 'agent_system' } })
+  assert.deepEqual([mismatched.status, mismatched.body.error.code], [409, 'work_item_product_type_mismatch'])
+  const created = await call<{ workItem: { projectId: string; productType: string } }>('/api/work-items', { cookie: aliceCookie, body: { title: 'x', description: 'x', projectId: beta.id } })
+  assert.deepEqual([created.body.workItem.projectId, created.body.workItem.productType], [beta.id, 'application'])
 
   const merge = await call(`/api/change-proposals/${betaWork.proposal.id}/merge`, { cookie: aliceCookie, body: { headSha: betaWork.proposal.headSha } })
   assert.equal(merge.status, 403, 'a project reviewer cannot merge')
@@ -255,7 +266,7 @@ try {
   assert.throws(() => upgraded.db.prepare("UPDATE domain_events SET event_type = 'x' WHERE id = 'EVT-L'").run(), /append-only/u, 'the append-only guard is back after the backfill')
   upgraded.close()
 
-  console.log('project scope smoke passed · non-members see nothing · roles per project · reviewers picked from members · repository from the project · local paths validated · 019 backfill splits by repository · everyone sees the default project · work items numbered per project')
+  console.log('project scope smoke passed · non-members see nothing · roles per project · reviewers picked from members · repository from the project · local paths validated · 019 backfill splits by repository · everyone sees the default project · work items numbered per project · product type taken from the project manifest')
 } finally {
   database.close()
   rmSync(root, { recursive: true, force: true })

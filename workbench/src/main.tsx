@@ -738,6 +738,18 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
   const [approvingId, setApprovingId] = useState<string>()
   const [approvalError, setApprovalError] = useState<string>()
   const [openWorkItemId, setOpenWorkItemId] = useState<string>()
+  // A work item takes its product type from the project's manifest, so the form shows it instead of asking.
+  const [projectType, setProjectType] = useState<{ type?: ProductType | null; error?: string }>({})
+  const projectId = local.currentProjectId
+  useEffect(() => {
+    if (local.status !== 'ready' || !projectId) return
+    let active = true
+    setProjectType({})
+    localControlPlaneClient.getProjectProductType(projectId)
+      .then(({ productType: declared }) => { if (!active) return; setProjectType({ type: declared }); if (declared) setProductType(declared) })
+      .catch((caught: unknown) => { if (active) setProjectType({ error: caught instanceof Error ? caught.message : String(caught) }) })
+    return () => { active = false }
+  }, [local.status, projectId])
   const allIntents = useMemo(() => [...derivedIntents, ...intents], [derivedIntents])
   const filtered = useMemo(() => allIntents.filter((item) => `${item.id}${item.title}`.toLowerCase().includes(query.toLowerCase())), [allIntents, query])
   const template = intentTemplates[productType]
@@ -750,7 +762,7 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
     setConstraints(template.constraints)
     setCriteria(template.criteria)
   }
-  const submitBlocked = creating || !title.trim() || !goal.trim() || parsedCriteria.length === 0 || draftLint.blockers.length > 0
+  const submitBlocked = creating || Boolean(projectType.error) || !title.trim() || !goal.trim() || parsedCriteria.length === 0 || draftLint.blockers.length > 0
   const latestIntentFor = (workItemId: string) => local.intentVersions.filter((intent) => intent.workItemId === workItemId).sort((left, right) => right.version - left.version)[0]
   const actorName = (actorId?: string) => local.actors.find((candidate) => candidate.id === actorId)?.displayName ?? actorId ?? '—'
   const intentStatusLabel = (intent: LocalIntentVersion) => intent.status === 'draft' ? '待批准' : intent.status === 'superseded' ? '已被新版本取代' : intent.approval?.basis === 'low_risk_rule' ? '低风险 · 规则批准' : `已批准 · ${actorName(intent.approval?.actorId)}`
@@ -781,7 +793,9 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
         </div>
         <div className="local-intent-form">
           <label className="local-intent-title"><span>Work Item 标题</span><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="一句话说清要交付什么" /></label>
-          <label className="local-intent-type"><span>被开发对象</span><select value={productType} onChange={(event) => setProductType(event.target.value as ProductType)}><option value="application">开发 App</option><option value="agent_system">开发 Agent System</option></select></label>
+          {projectType.type
+            ? <label className="local-intent-type"><span>被开发对象</span><input value={productType === 'agent_system' ? '开发 Agent System' : '开发 App'} readOnly title="由项目仓库的 .aperture/project.json 决定，同一项目的 Intent 类型一致" /></label>
+            : <label className="local-intent-type"><span>被开发对象</span><select value={productType} disabled={projectType.type === undefined && !projectType.error} onChange={(event) => setProductType(event.target.value as ProductType)}><option value="application">开发 App</option><option value="agent_system">开发 Agent System</option></select></label>}
           <label className="local-intent-goal"><span>业务目标</span><input value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="改完之后系统的可观察行为是什么" /></label>
           <label className="local-intent-risk"><span>风险等级</span><select value={riskLevel} onChange={(event) => setRiskLevel(event.target.value as RiskLevel)}><option value="low">低风险</option><option value="medium">中风险</option><option value="high">高风险</option></select></label>
           <label className="local-intent-constraints"><span>约束 · 每行一条</span><textarea value={constraints} onChange={(event) => setConstraints(event.target.value)} placeholder={'Agent 不得做什么\n例：不得删除或弱化既有测试'} /></label>
@@ -804,6 +818,9 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
           <div className="local-intent-actions">
             <button className="primary-button" disabled={submitBlocked} onClick={() => void (async () => { setCreating(true); setCreateError(undefined); try { await local.createIntentBundle({ title: title.trim(), description: goal.trim(), productType, goal: goal.trim(), constraints: splitLines(constraints), riskLevel, acceptanceCriteria: parsedCriteria.map(({ statement, criticality, verificationType, verifiedBy }) => ({ statement, criticality, verificationType, ...(verifiedBy?.length ? { verifiedBy } : {}) })) }); setTitle(''); setGoal(''); setConstraints(''); setCriteria('') } catch (error) { setCreateError(error instanceof Error ? error.message : String(error)) } finally { setCreating(false) } })()}><Plus size={15} />{creating ? '创建中…' : '创建本地 Intent'}</button>
             <small>提示只是建议，不阻塞提交；红色项会被服务端拒绝，必须改。{riskLevel === 'low' ? '低风险 Intent 创建即按规则批准。' : '中、高风险 Intent 创建后需由另一位成员批准，才能启动 Run。'}</small>
+            {projectType.type && <small>被开发对象由项目 .aperture/project.json 决定（{projectType.type === 'agent_system' ? 'agent_system' : 'application'}）。</small>}
+            {projectType.type === null && <small>这个项目还没接入仓库，类型暂按你的选择；接入后以仓库的 .aperture/project.json 为准。</small>}
+            {projectType.error && <small className="local-form-error" role="alert">读不到项目类型：{projectType.error}</small>}
             {createError && <small className="local-form-error" role="alert">{createError}</small>}
           </div>
         </div>
@@ -813,7 +830,7 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
           const runInFlight = local.agentRuns.find((run) => run.workItemId === item.id && (run.status === 'queued' || run.status === 'running'))
           return <article key={item.id} className={`local-work-item-row${runInFlight ? ' has-run' : ''}`} onClick={() => setOpenWorkItemId(item.id)}><span className={`local-product-type ${item.productType}`}>{item.productType === 'agent_system' ? 'AGENT' : 'APP'}</span><div><button className="local-work-item-open" onClick={(event) => { event.stopPropagation(); setOpenWorkItemId(item.id) }} title="查看 Intent 详情"><strong>{workItemLabel(item)}</strong></button><small>{item.id} · {intent ? `v${intent.version} · ${riskLabels[intent.riskLevel]} · ${intent.contentDigest.slice(7, 19)}` : item.authorityRef}</small></div>{intent && <div className="local-intent-approval"><span className={`local-status ${intent.status}`}>{intentStatusLabel(intent)}</span>{intent.status === 'draft' && <button className="secondary-button" disabled={approvingId === intent.id || !canApproveIntent(intent)} title={approveIntentTitle(intent)} onClick={(event) => { event.stopPropagation(); void approveIntent(intent.id) }}><ShieldCheck size={13} />{approvingId === intent.id ? '批准中' : '批准 Intent'}</button>}</div>}<code>{item.updatedAt.slice(0, 16).replace('T', ' ')}<span className="local-work-item-more">详情<ChevronRight size={13} /></span></code>{runInFlight && <LocalRunProgress run={runInFlight} />}</article>
         })}</div>}
-        {openWorkItemId && local.workItems.some((item) => item.id === openWorkItemId) && <LocalIntentDrawer workItemId={openWorkItemId} onClose={() => setOpenWorkItemId(undefined)} approval={{ can: canApproveIntent, title: approveIntentTitle, approvingId, error: approvalError, approve: approveIntent }} />}
+        {openWorkItemId && local.workItems.some((item) => item.id === openWorkItemId) && <LocalIntentDrawer workItemId={openWorkItemId} projectType={projectType.type ?? undefined} onClose={() => setOpenWorkItemId(undefined)} approval={{ can: canApproveIntent, title: approveIntentTitle, approvingId, error: approvalError, approve: approveIntent }} />}
       </section>}
       <DemoRegion title="Intent 列表" note="以下列表仍用于展示既有 UI，不作为本地权威状态。">
         <div className="table-toolbar"><div className="inline-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 Intent..." aria-label="搜索 Intent" type="search" /></div><button className="secondary-button" disabled title="原型控件：尚未接入本地 Control Plane，点击不会产生任何状态变更"><ListFilter size={15} />筛选</button><button className="secondary-button" disabled title="原型控件：尚未接入本地 Control Plane，点击不会产生任何状态变更"><Boxes size={15} />视图</button></div>
@@ -2718,9 +2735,11 @@ function localIntentStage(intent: LocalIntentVersion | undefined, runs: Array<{ 
 type LocalIntentApproval = { can: (intent: LocalIntentVersion) => boolean; title: (intent: LocalIntentVersion) => string; approvingId?: string; error?: string; approve: (intentVersionId: string) => Promise<void> }
 
 /** A real Intent in the demo drawer's layout. Every number and list comes from the local Control Plane or the draft checker. */
-function LocalIntentDrawer({ workItemId, onClose, approval }: { workItemId: string; onClose: () => void; approval: LocalIntentApproval }) {
+function LocalIntentDrawer({ workItemId, projectType, onClose, approval }: { workItemId: string; projectType?: ProductType; onClose: () => void; approval: LocalIntentApproval }) {
   const local = useLocalControlPlane()
   const [tab, setTab] = useState<'意图' | '验收标准' | '关系'>('意图')
+  const [rebuilding, setRebuilding] = useState(false)
+  const [rebuildError, setRebuildError] = useState<string>()
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
@@ -2770,6 +2789,21 @@ function LocalIntentDrawer({ workItemId, onClose, approval }: { workItemId: stri
             <section className="intent-section"><span className="intent-label">成功结果 · 关键验收标准</span>{criteria.some((criterion) => criterion.criticality === 'critical') ? <div className="outcome-list">{criteria.filter((criterion) => criterion.criticality === 'critical').map((criterion) => <div key={criterion.id}><Check size={13} /><span>{criterion.statement}</span></div>)}</div> : <p className="local-intent-empty">没有关键验收标准，这个 Intent 不会阻塞任何审批。</p>}</section>
             <section className="intent-section"><span className="intent-label">约束</span>{intent?.constraints.length ? <div className="constraint-tags">{intent.constraints.map((constraint) => <span key={constraint}>{constraint}</span>)}</div> : <p className="local-intent-empty">未声明约束</p>}</section>
             <section className="intent-section"><div className="section-heading"><h3>未决问题</h3><span>{unknowns.length}</span></div>{unknowns.length ? <div className="unknown-list">{unknowns.map((unknown) => <div key={unknown}><span>?</span><p>{unknown}</p></div>)}</div> : <p className="local-intent-empty">起草检查没有发现问题。</p>}</section>
+            {intent && projectType && workItem.productType !== projectType && <section className="intent-readiness local-intent-type-mismatch"><div><ShieldAlert size={16} /><span><strong>类型和项目不一致，无法启动 Run</strong><small>这个 Intent 是{workItem.productType === 'agent_system' ? ' Agent System' : ' App'}，项目的 .aperture/project.json 声明的是{projectType === 'agent_system' ? ' Agent System' : ' App'}。重建会按项目类型复制目标、约束和验收标准，生成一个新的 Intent；{intent.riskLevel === 'low' ? '低风险会自动批准' : '新 Intent 需要重新批准'}，原 Intent 保留不动。</small></span></div>
+              <button className="secondary-button" disabled={rebuilding} onClick={() => void (async () => {
+                setRebuilding(true)
+                setRebuildError(undefined)
+                try {
+                  await local.createIntentBundle({ title: workItem.title, description: workItem.description, productType: projectType, goal: intent.goal, constraints: intent.constraints, riskLevel: intent.riskLevel, acceptanceCriteria: intent.acceptanceCriteria.map(({ statement, criticality, verificationType, verifiedBy }) => ({ statement, criticality, verificationType, ...(verifiedBy?.length ? { verifiedBy } : {}) })) })
+                  onClose()
+                } catch (caught) {
+                  setRebuildError(caught instanceof Error ? caught.message : String(caught))
+                } finally {
+                  setRebuilding(false)
+                }
+              })()}><RefreshCw size={13} />{rebuilding ? '重建中…' : '按项目类型重建'}</button>
+              {rebuildError && <small className="local-form-error" role="alert">{rebuildError}</small>}
+            </section>}
             <section className="intent-readiness"><div><Sparkles size={16} /><span><strong>{readinessView.title}</strong><small>{readinessView.detail}</small></span></div></section>
             {versions.length > 1 && <section className="intent-section"><div className="section-heading"><h3>版本历史</h3><span>{versions.length}</span></div><div className="local-intent-rows">{versions.map((version) => <div key={version.id}><span className={`local-status ${version.status}`}>v{version.version}</span><div><strong>{intentVersionStatusLabels[version.status]} · {riskLabels[version.riskLevel]} · {version.acceptanceCriteria.length} 条标准</strong><small>{version.contentDigest.slice(0, 19)} · {actorName(version.createdBy)} · {version.createdAt.slice(0, 16).replace('T', ' ')}</small></div></div>)}</div></section>}
           </>}

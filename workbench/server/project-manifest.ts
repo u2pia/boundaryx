@@ -235,7 +235,7 @@ export function loadProjectManifest(repositoryPath: string, baseSha: string): Pr
 
 export function applyProjectManifest(input: { binding: ProjectManifestBinding; workItem: WorkItem; intent: IntentVersion; runtime: AgentRunnerDescriptor; declaredContextPaths: string[] }) {
   const { manifest } = input.binding
-  if (manifest.productType !== input.workItem.productType) throw new AppError(409, `Work item product type does not match the project manifest: the work item is ${input.workItem.productType}, .aperture/project.json declares ${manifest.productType}`, 'project_manifest_product_mismatch')
+  if (manifest.productType !== input.workItem.productType) throw new AppError(409, `Work item product type does not match the project manifest: the work item is ${input.workItem.productType}, .aperture/project.json declares ${manifest.productType}. Rebuild the Intent with the project's type (Intents → 详情 → 按项目类型重建).`, 'project_manifest_product_mismatch')
   const riskRank = { low: 0, medium: 1, high: 2 }
   if (riskRank[input.intent.riskLevel] > riskRank[manifest.policy.maximumRisk]) throw new AppError(409, `Intent risk ${input.intent.riskLevel} exceeds project maximum ${manifest.policy.maximumRisk}`, 'project_manifest_risk_exceeded')
   if (input.runtime.isolation === 'unisolated_process' && !manifest.policy.allowUnisolatedRuntime) throw new AppError(409, 'Project policy forbids the configured unisolated process runtime', 'project_manifest_runtime_forbidden')

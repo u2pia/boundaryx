@@ -97,6 +97,6 @@
 1. 服务机器设为不休眠，并固定局域网 IP。启动服务时加上 `CONTROL_PLANE_HOST=0.0.0.0`，否则服务只接受本机访问，同事连不上。这时是明文 HTTP，只在可信内网使用。
 2. 在「团队」页为每个人创建账号。
 3. 在「项目」页新建 **试用项目**，接入要试用的仓库（本地 Git 或 GitHub），并把成员加进项目、分好角色。审查人至少两位。
-4. 在仓库里提交 `.aperture/project.json`，写明测试命令。如果有现成测试，用 `testPaths` 声明测试目录，这样能避开「仅自带测试」的卡点。格式见 `workbench/README.md` 的「Project Manifest」一节。
+4. 在仓库里提交 `.aperture/project.json`，写明 `productType`（`application` 或 `agent_system`）和测试命令。项目下所有 Intent 的类型都取自这里；没提交它之前，项目里建不了 Intent。如果有现成测试，用 `testPaths` 声明测试目录，这样能避开「仅自带测试」的卡点。格式见 `workbench/README.md` 的「Project Manifest」一节。
 5. 在「集成」页确认 LLM Provider 可用，先自己跑通一条低风险需求。
 6. 每天备份一次数据目录 `workbench/.aperture-live/`，备份前先停服务，或者用 `sqlite3 .backup` 备份数据库。
