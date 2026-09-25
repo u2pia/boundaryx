@@ -14,6 +14,7 @@ import { CodeHostSyncer } from '../server/code-host/syncer.ts'
 import { ControlPlaneDatabase, SYSTEM_CODE_HOST_ACTOR_ID } from '../server/database.ts'
 import { createControlPlaneRequestHandler } from '../server/http-server.ts'
 import { LocalCommandAgentRunner } from '../server/local-command-agent-runner.ts'
+import { LocalReleaseAuthority } from '../server/local-release-authority.ts'
 import { LocalGitAuthority } from '../server/local-git-authority.ts'
 import { AppError, type Project } from '../server/types.ts'
 
@@ -226,10 +227,10 @@ try {
     const intent = database.createIntentVersion({ workItemId: workItem.id, goal: `Deliver ${branch}`, constraints: [], riskLevel: 'low', acceptanceCriteria: intentCriteria }, owner.id)
     return authority.createChangeProposal({ workItemId: workItem.id, intentVersionId: intent.id, runId: `RUN-${branch}`, baseRef: 'main', headRef: branch, authorActorId: alice.id }, alice.id)
   }
-  function makeReady(proposalId: string) {
+  function makeReady(proposalId: string, summary: Record<string, unknown> = {}) {
     const proposal = database.getChangeProposal(proposalId)
     database.recordCheck({ proposalId, headSha: proposal.headSha, name: 'unit', status: 'completed', conclusion: 'success' }, owner.id)
-    const evidence = database.recordEvidence({ proposalId, runId: proposal.runId!, headSha: proposal.headSha, uri: `local://evidence/${proposalId}.json`, sha256: `sha256:${proposalId}`, summary: {} }, owner.id)
+    const evidence = database.recordEvidence({ proposalId, runId: proposal.runId!, headSha: proposal.headSha, uri: `local://evidence/${proposalId}.json`, sha256: `sha256:${proposalId}`, summary }, owner.id)
     database.recordEvidenceView(evidence.id, bob.id, evidence.sha256)
   }
   const approve = (proposalId: string) => database.recordReview({ proposalId, headSha: database.getChangeProposal(proposalId).headSha, reviewerActorId: bob.id, decision: 'approved', comment: 'checked' })
@@ -389,7 +390,7 @@ try {
   await syncer.syncProject(project.id)
   const hostMergePath = `/api/change-proposals/${fourth.id}/host-merge`
   assert.deepEqual((await call(hostMergePath, { cookie: ownerCookie, body: {} })).body.error.code, 'merge_not_approved')
-  makeReady(fourth.id)
+  makeReady(fourth.id, { artifactCount: 1 })
   approve(fourth.id)
   assert.equal((await call(hostMergePath, { cookie: bobCookie, body: {} })).status, 403, 'a reviewer cannot merge')
   mergeRefusal = 'Required status check "ci" is expected.'
@@ -410,6 +411,12 @@ try {
   assert.equal((await syncer.syncProject(project.id)).merged, 0, 'the next sync does not record it again')
   assert.equal((await call(hostMergePath, { cookie: ownerCookie, body: {} })).status, 200, 'asking again is a no-op')
   allowedMergeMethods = ['merge', 'squash', 'rebase']
+  // A host merge is released from the commit the host made, not the approved head; one outside the gate is not.
+  const releases = new LocalReleaseAuthority(database)
+  const candidate = releases.createReleaseCandidate(fourth.id, owner.id)
+  assert.deepEqual([candidate.commitSha, candidate.artifactClass], [viaApi.body.evidence.mergedSha, 'source_with_build_attestation'])
+  assert.notEqual(candidate.commitSha, fourth.headSha)
+  assert.throws(() => releases.createReleaseCandidate(third.id, owner.id), failsWith('release_merge_outside_gate'))
 
   // --- A proposal opened by hand from a branch pushed to GitHub, then closed there. ---
   branchOnSeed('feature/manual', 'manual.txt')

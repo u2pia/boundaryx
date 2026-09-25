@@ -23,7 +23,13 @@ export class LocalReleaseAuthority {
     const proposal = this.database.getChangeProposal(proposalId)
     if (proposal.status !== 'merged') throw new AppError(409, 'Release Candidate requires a merged change proposal', 'release_requires_merge')
     const mergeEvidence = this.database.getMergeEvidence(proposalId)
-    if (mergeEvidence.mergedSha !== proposal.headSha) throw new AppError(409, 'Merge Evidence does not match the proposal Head SHA', 'release_merge_evidence_mismatch')
+    if (mergeEvidence.strategy === 'host_merge') {
+      // The host made its own merge or squash commit, so the merged revision is never the approved head itself. It is
+      // releasable when the platform checked, at merge time, that it carries the approved change behind a green gate.
+      const hostMerge = mergeEvidence.hostMerge
+      if (!hostMerge || hostMerge.contentCheck === 'mismatch') throw new AppError(409, 'The revision merged on the host does not contain the approved change', 'release_merge_evidence_mismatch')
+      if (hostMerge.outsideGate) throw new AppError(409, `The host merged this proposal outside the gate (${hostMerge.outsideGateReasons.join('; ')}); it cannot be released`, 'release_merge_outside_gate')
+    } else if (mergeEvidence.mergedSha !== proposal.headSha) throw new AppError(409, 'Merge Evidence does not match the proposal Head SHA', 'release_merge_evidence_mismatch')
     const commitSha = git(proposal.repositoryPath, ['rev-parse', '--verify', `${mergeEvidence.mergedSha}^{commit}`])
     const tree = git(proposal.repositoryPath, ['ls-tree', '-r', '--full-tree', commitSha])
     const sourceTreeDigest = `sha256:${sha256(tree)}`
