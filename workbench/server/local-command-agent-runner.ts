@@ -48,7 +48,9 @@ class LocalProcessRuntime implements AgentExecutionRuntime {
   }
 
   execute(context: AgentRuntimeContext) {
-    const result = spawnSync(this.input.executable, this.input.args, { cwd: context.worktreePath, encoding: 'utf8', timeout: context.timeoutMs, maxBuffer: 20 * 1024 * 1024, env: { ...this.buildEnvironment(), APERTURE_RUN_REQUEST: context.requestPath, APERTURE_WORKTREE: context.worktreePath } })
+    // The agent is told when it will be killed, so it can stop and hand over what it has before that happens.
+    const deadline = String(Date.now() + context.timeoutMs)
+    const result = spawnSync(this.input.executable, this.input.args, { cwd: context.worktreePath, encoding: 'utf8', timeout: context.timeoutMs, maxBuffer: 20 * 1024 * 1024, env: { ...this.buildEnvironment(), APERTURE_RUN_REQUEST: context.requestPath, APERTURE_WORKTREE: context.worktreePath, APERTURE_RUN_DEADLINE: deadline } })
     return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', error: result.error, diagnostic: this.diagnostic(result.stderr ?? '') }
   }
 

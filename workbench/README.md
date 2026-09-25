@@ -124,6 +124,13 @@ npm run server:start
 
 内置引擎的文件工具限定在 Worktree 内（拒绝 `..`、符号链接逃逸和 `.git`），拒绝会改写历史或分支的 git 命令，运行命令时不注入 Provider 密钥与 `APERTURE_AGENT_*` 变量；需要代理时沿用服务进程的 `HTTPS_PROXY`。它同样是 `degraded / unisolated_process`。
 
+内置引擎有两道预算，用完都会先交出阶段性结果，而不是被直接杀掉、连同改动一起丢弃：
+
+- **步数**：`APERTURE_BUILDER_MAX_STEPS`，默认 120 步。
+- **时间**：Runner 在启动 Agent 时通过 `APERTURE_RUN_DEADLINE`（epoch 毫秒）告诉它自己何时会被杀，默认是 10 分钟后。
+
+从截止时间往回留出三段，按 10 分钟计：约 15 秒用于退出，约 90 秒用于最后一次写总结的模型调用，再往前约 2 分钟会提醒模型收尾。之后只提供 `finish`；`run_command` 和模型调用都会被截断，占不到这段预留时间。因时间停下的总结以 `Stopped at the time budget` 开头，标明改动可能不完整；连总结都来不及写时，引擎会代写一条。无论哪种情况，改动都会照常提交并跑完全部检查，再交给评审。`codex-builder` 和 `claude-builder` 目前还不读取这个截止时间。
+
 也可以直接指定单个包装器：
 `scripts/agents/*.mjs` 是 Builder Agent 包装器，不是可执行文件：它们没有 shebang 也没有执行位，必须由 `node` 调用，包装器的第一个参数才是真实 Agent CLI。因此 Codex 的启动形式是 `node <wrapper> <codex>`：
 

@@ -28,6 +28,7 @@ const script = [
 ]
 const requests: ChatRequest[] = []
 const budgetRequests: ChatRequest[] = []
+const clockRequests: ChatRequest[] = []
 const headers: IncomingMessage['headers'][] = []
 const server = createServer((request, response) => {
   let body = ''
@@ -42,6 +43,18 @@ const server = createServer((request, response) => {
       const forced = JSON.stringify(parsed.tool_choice) === JSON.stringify({ type: 'function', function: { name: 'finish' } })
       const reply = forced ? { tool_calls: [call('b-last', 'run_command', { command: 'touch ignored-command' }), call('b-finish', 'finish', { summary: 'Stopped at the step budget; README reviewed.' })] } : { tool_calls: [call(`b${budgetRequests.length}`, 'list_files', {})] }
       return response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: null, ...reply } }] }))
+    }
+    // A slow model that never finishes on its own, to exercise the time budget. `stall` never answers the forced
+    // finish at all, so not even the summary fits in the time that is left.
+    if (request.url === '/clock/chat/completions' || request.url === '/stall/chat/completions') {
+      const parsed = JSON.parse(body) as ChatRequest
+      clockRequests.push(parsed)
+      const forced = JSON.stringify(parsed.tool_choice) === JSON.stringify({ type: 'function', function: { name: 'finish' } })
+      if (forced && request.url === '/stall/chat/completions') return
+      const warned = /seconds of working time are left/u.test(JSON.stringify(parsed.messages))
+      // Once warned, it still starts a command that would outlast the deadline.
+      const reply = forced ? { tool_calls: [call('t-finish', 'finish', { summary: 'README reviewed.' })] } : warned && !JSON.stringify(parsed.messages).includes('t-slow') ? { tool_calls: [call('t-slow', 'run_command', { command: `${JSON.stringify(process.execPath)} -e "setTimeout(() => require('node:fs').writeFileSync('late-command', ''), 10000)"` })] } : { tool_calls: [call(`t${clockRequests.length}`, 'list_files', {})] }
+      return setTimeout(() => response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: null, ...reply } }] })), 150)
     }
     if (request.url !== '/v1/chat/completions') return response.writeHead(404).end()
     requests.push(JSON.parse(body) as ChatRequest)
@@ -107,6 +120,27 @@ try {
   assert.match(budget.stderr, /step 12 run_command touch ignored-command → rejected/u)
   assert.match(budget.stdout, /"type":"message","summary":"Stopped at the step budget; README reviewed\."/u)
 
+  // Before the runner's deadline the model is warned, a command is cut short so it cannot eat into the time kept for the
+  // summary, and then only finish is offered; the run exits in time with a summary marked as partial.
+  const clockStartedAt = Date.now()
+  const clock = await run([join(agents, 'chat-builder.mjs')], { ...provider, APERTURE_AGENT_PROVIDER_BASE_URL: `http://127.0.0.1:${port}/clock`, APERTURE_AGENT_PROVIDER_WIRE_API: 'chat', APERTURE_RUN_DEADLINE: String(clockStartedAt + 4_000) })
+  assert.equal(clock.status, 0, clock.stderr)
+  assert.ok(Date.now() - clockStartedAt < 4_000, 'the builder exits before the runner would kill it')
+  assert.match(JSON.stringify(clockRequests.at(-1)?.messages), /Time is up: this is your last step/u)
+  assert.deepEqual(clockRequests.at(-1)?.tools.map((tool) => tool.function.name), ['finish'])
+  const slowCommand = clockRequests.at(-1)?.messages.find((message) => message.tool_call_id === 't-slow')
+  assert.match(String(slowCommand?.content), /ETIMEDOUT/u, clock.stderr)
+  assert.equal(existsSync(join(workspace, 'late-command')), false)
+  assert.match(clock.stderr, /asking for finish/u)
+  assert.match(clock.stdout, /"type":"message","summary":"Stopped at the time budget; the change may be partial\. README reviewed\."/u)
+
+  clockRequests.length = 0
+  const stallStartedAt = Date.now()
+  const stall = await run([join(agents, 'chat-builder.mjs')], { ...provider, APERTURE_AGENT_PROVIDER_BASE_URL: `http://127.0.0.1:${port}/stall`, APERTURE_AGENT_PROVIDER_WIRE_API: 'chat', APERTURE_RUN_DEADLINE: String(stallStartedAt + 4_000) })
+  assert.equal(stall.status, 0, stall.stderr)
+  assert.ok(Date.now() - stallStartedAt < 4_000, 'a model that never answers the last step does not hold the builder past the deadline')
+  assert.match(stall.stdout, /"type":"message","summary":"Stopped at the time budget before the Builder could summarise its work\. The change is partial/u)
+
   // "responses" needs Codex, Anthropic needs Claude Code; each is routed only when configured.
   const fakeCodex = join(root, 'fake-codex')
   writeFileSync(fakeCodex, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync('codex-ran', process.argv.slice(2).join(' '))\n`)
@@ -124,8 +158,9 @@ try {
   assert.equal(unconfigured.status, 2)
   assert.match(unconfigured.stdout, /No LLM provider is configured/u)
 
-  console.log('chat builder smoke passed · 3 model turns · worktree-confined tools · key kept from commands · engine routed by provider · step budget ends in finish')
+  console.log('chat builder smoke passed · 3 model turns · worktree-confined tools · key kept from commands · engine routed by provider · step budget ends in finish · time budget ends in finish before the deadline')
 } finally {
+  server.closeAllConnections()
   server.close()
   rmSync(root, { recursive: true, force: true })
 }

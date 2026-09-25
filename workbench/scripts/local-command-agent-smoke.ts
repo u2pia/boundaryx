@@ -40,7 +40,7 @@ git('add', '.aperture/project.json')
 git('commit', '-m', 'invalid exposed evaluation dataset')
 assert.throws(() => loadProjectManifest(repositoryPath, git('rev-parse', 'HEAD')), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'evaluation_dataset_context_exposed')
 git('reset', '--hard', initialSha)
-writeFileSync(agentScript, `import { readFileSync, writeFileSync } from 'node:fs'\nconst request = JSON.parse(readFileSync(process.env.APERTURE_RUN_REQUEST, 'utf8'))\nreadFileSync('README.md', 'utf8')\nconsole.log(JSON.stringify({ type: 'context_consumed', path: 'README.md' }))\nconsole.log(JSON.stringify({ type: 'context_consumed', path: '../outside.txt' }))\nconsole.log(JSON.stringify({ type: 'message', summary: 'Implemented the requested local change.' }))\nconst goal = request.intent.goal\nconst mode = goal.includes('缺失指标') ? 'missing' : goal.includes('低于阈值') ? 'below' : goal.includes('篡改数据集') ? 'tamper' : 'pass'\nif (mode !== 'pass') writeFileSync('evaluation-mode.txt', mode + '\\n')\nif (mode === 'tamper') writeFileSync('evals/dataset.jsonl', '{"id":"tampered"}\\n')\nwriteFileSync('feature.ts', 'export const generatedByAgent = ' + JSON.stringify(request.runId) + '\\n')\n`)
+writeFileSync(agentScript, `import { readFileSync, writeFileSync } from 'node:fs'\nconst request = JSON.parse(readFileSync(process.env.APERTURE_RUN_REQUEST, 'utf8'))\nreadFileSync('README.md', 'utf8')\nconsole.log(JSON.stringify({ type: 'context_consumed', path: 'README.md' }))\nconsole.log(JSON.stringify({ type: 'context_consumed', path: '../outside.txt' }))\nconsole.log(JSON.stringify({ type: 'message', summary: 'Implemented the requested local change.' }))\nconst untilDeadline = Number(process.env.APERTURE_RUN_DEADLINE) - Date.now()\nconsole.log(JSON.stringify({ type: 'message', summary: untilDeadline > 0 && untilDeadline <= 10000 ? 'deadline ahead' : 'deadline missing' }))\nconst goal = request.intent.goal\nconst mode = goal.includes('缺失指标') ? 'missing' : goal.includes('低于阈值') ? 'below' : goal.includes('篡改数据集') ? 'tamper' : 'pass'\nif (mode !== 'pass') writeFileSync('evaluation-mode.txt', mode + '\\n')\nif (mode === 'tamper') writeFileSync('evals/dataset.jsonl', '{"id":"tampered"}\\n')\nwriteFileSync('feature.ts', 'export const generatedByAgent = ' + JSON.stringify(request.runId) + '\\n')\n`)
 writeFileSync(checkScript, `import { existsSync, readFileSync } from 'node:fs'\nif (!readFileSync('feature.ts', 'utf8').includes('generatedByAgent')) process.exit(1)\nconst mode = existsSync('evaluation-mode.txt') ? readFileSync('evaluation-mode.txt', 'utf8').trim() : 'pass'\nif (mode !== 'missing') console.log(JSON.stringify({ type: 'evaluation_metrics', metrics: { task_success_rate: mode === 'below' ? 0.5 : 1, tool_call_accuracy: 1 } }))\nconsole.log('feature evaluation completed')\n`)
 
 try {
@@ -70,6 +70,8 @@ try {
   assert.equal(proposal.runId, run.id)
   assert.equal(proposal.changedFiles, 1)
   const events = database.listAggregateEvents('agent_run', run.id)
+  // The agent is told when the runner will kill it, within the run's timeout.
+  assert.ok(events.some((event) => event.eventType === 'agent_run.message' && event.payload.summary === 'deadline ahead'))
   assert.equal(events.some((event) => event.eventType === 'agent_run.project_manifest_bound'), true)
   assert.equal(events.some((event) => event.eventType === 'agent_run.context_consumed' && event.payload.declared === true), true)
   assert.equal(events.some((event) => event.eventType === 'agent_run.context_rejected'), true)

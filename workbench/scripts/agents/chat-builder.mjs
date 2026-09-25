@@ -13,6 +13,18 @@ const apiKeyVariable = process.env.APERTURE_AGENT_PROVIDER_API_KEY_ENV
 const apiKey = apiKeyVariable ? process.env[apiKeyVariable] : undefined
 const maxSteps = Number(process.env.APERTURE_BUILDER_MAX_STEPS) || 120
 
+// The runner kills this process at APERTURE_RUN_DEADLINE (epoch ms), and a killed run throws away everything the
+// model wrote. Working back from that moment: a margin to print the summary and exit, a reserve for the one model
+// call that writes the summary, and before that a window in which the model is told to wrap up. Without a deadline
+// the time budget is unbounded and only the step budget applies.
+const startedAt = Date.now()
+const deadline = Number(process.env.APERTURE_RUN_DEADLINE) > startedAt ? Number(process.env.APERTURE_RUN_DEADLINE) : undefined
+const budgetMs = deadline ? deadline - startedAt : 0
+const exitAt = deadline ? deadline - Math.min(15_000, Math.floor(budgetMs * 0.05)) : Infinity
+const finishAt = deadline ? exitAt - Math.min(90_000, Math.floor(budgetMs * 0.15)) : Infinity
+const wrapUpAt = deadline ? finishAt - Math.min(120_000, Math.floor(budgetMs * 0.2)) : Infinity
+class OutOfTime extends Error {}
+
 if (!requestPath || !worktreePath || !baseUrl || !model) {
   console.error('chat-builder requires APERTURE_RUN_REQUEST, APERTURE_WORKTREE, and a provider with a base URL and model configured in the Control Plane')
   process.exit(2)
@@ -129,31 +141,39 @@ const handlers = {
   run_command({ command }) {
     if (typeof command !== 'string' || !command.trim()) throw new Error('command is required')
     if (forbiddenGit.test(command)) throw new Error('Git history and branches are managed by the Control Plane; only read-only git commands are allowed')
-    const result = spawnSync('/bin/sh', ['-c', command], { cwd: root, encoding: 'utf8', timeout: 180_000, maxBuffer: 20 * 1024 * 1024, env: commandEnvironment })
+    // A command may not run into the time reserved for the summary.
+    const timeout = Math.min(180_000, finishAt - Date.now())
+    if (timeout < 250) return 'not run: the time budget is spent; call finish'
+    const result = spawnSync('/bin/sh', ['-c', command], { cwd: root, encoding: 'utf8', timeout, maxBuffer: 20 * 1024 * 1024, env: commandEnvironment })
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`
     const status = result.error ? `failed to run: ${result.error.message}` : `exit ${result.status}`
     return `${status}\n${output.length > 12_000 ? `… ${output.length - 12_000} characters omitted …\n${output.slice(-12_000)}` : output}`
   },
 }
 
-async function complete(messages, offered = tools, toolChoice = 'auto') {
+/** One model turn, retried on transient failures; throws OutOfTime instead of running past `callDeadline`. */
+async function complete(messages, offered = tools, toolChoice = 'auto', callDeadline = Infinity) {
   const body = { model, messages, tools: offered, tool_choice: toolChoice, ...(process.env.APERTURE_AGENT_REASONING_EFFORT ? { reasoning_effort: process.env.APERTURE_AGENT_REASONING_EFFORT } : {}) }
   for (let attempt = 1; ; attempt += 1) {
+    const remaining = Math.min(300_000, callDeadline - Date.now())
+    if (remaining < 250) throw new OutOfTime('no time left for another model call')
     let response
+    let text
     try {
-      response = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(300_000) })
+      response = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(remaining) })
+      text = await response.text()
     } catch (error) {
+      if (Date.now() >= callDeadline - 250) throw new OutOfTime('the model call ran into the time budget')
       if (attempt < 3) continue
       throw new Error(`${baseUrl}/chat/completions is unreachable: ${error instanceof Error ? error.message : String(error)}`)
     }
-    const text = await response.text()
     // Not every OpenAI-compatible server accepts a named tool_choice; the finish-only tool list still applies.
     if (response.status === 400 && body.tool_choice !== 'auto') {
       body.tool_choice = 'auto'
       continue
     }
     if ((response.status === 429 || response.status >= 500) && attempt < 3) {
-      await new Promise((done) => setTimeout(done, attempt * 5_000))
+      await new Promise((done) => setTimeout(done, Math.max(0, Math.min(attempt * 5_000, callDeadline - Date.now()))))
       continue
     }
     // The provider's message only, never the request: the request carries the key in a header.
@@ -167,21 +187,49 @@ async function complete(messages, offered = tools, toolChoice = 'auto') {
 
 const messages = [{ role: 'system', content: prompt }, { role: 'user', content: 'Implement the change described above, then call finish.' }]
 let summary
+// Set once the working time is spent; from then on every step is a last step.
+let timeUp = false
+let wrapUpSent = false
 try {
   for (let step = 1; step <= maxSteps && summary === undefined; step += 1) {
-    // Near the end of the budget the model is told to wrap up; on the last step finish is the only tool it has,
+    // Near the end of either budget the model is told to wrap up; on the last step finish is the only tool it has,
     // so a long run ends with a summary and its changes reach the checks instead of being thrown away.
     if (step === maxSteps - 10) messages.push({ role: 'user', content: 'You have 10 steps left. Wrap up: make sure your changes are complete and consistent, then call finish.' })
-    const last = step === maxSteps
-    if (last) messages.push({ role: 'user', content: 'This is your last step. Call finish now with a summary of what you changed and what is left undone.' })
+    const now = Date.now()
+    if (!wrapUpSent && now >= wrapUpAt && now < finishAt) {
+      wrapUpSent = true
+      messages.push({ role: 'user', content: `About ${Math.round((finishAt - now) / 1000)} seconds of working time are left. Wrap up: make sure your changes are complete and consistent, skip long test runs, then call finish.` })
+    }
+    if (!timeUp && now >= finishAt) {
+      timeUp = true
+      console.error(`[chat-builder] step ${step} time budget spent; asking for finish`)
+    }
+    const last = step === maxSteps || timeUp
+    if (last) messages.push({ role: 'user', content: timeUp ? 'Time is up: this is your last step. Call finish now with a summary of what you changed and what is left undone.' : 'This is your last step. Call finish now with a summary of what you changed and what is left undone.' })
     // Models do not all honour a narrowed tool list, so the last step also forces finish and runs nothing else.
-    const message = await complete(messages, last ? tools.filter((tool) => tool.function.name === 'finish') : tools, last ? { type: 'function', function: { name: 'finish' } } : 'auto')
+    let message
+    try {
+      message = await complete(messages, last ? tools.filter((tool) => tool.function.name === 'finish') : tools, last ? { type: 'function', function: { name: 'finish' } } : 'auto', last ? exitAt : finishAt)
+    } catch (error) {
+      if (!(error instanceof OutOfTime)) throw error
+      // A working step that ran out of time is not answered; the next step asks for finish instead.
+      if (!last) {
+        timeUp = true
+        console.error(`[chat-builder] step ${step} ${error.message}; asking for finish`)
+        continue
+      }
+      // Not even the summary fits: the changes are handed over as they are, marked as partial.
+      console.error(`[chat-builder] step ${step} ${error.message}; handing over the change without a model summary`)
+      summary = 'Stopped at the time budget before the Builder could summarise its work. The change is partial: review it against every acceptance criterion.'
+      break
+    }
     const calls = message.tool_calls ?? []
     // reasoning_content is not echoed back: some providers reject it in the request.
     messages.push({ role: 'assistant', content: message.content ?? null, ...(calls.length ? { tool_calls: calls } : {}) })
     if (calls.length === 0) {
       // A model that answers in prose instead of calling finish has finished all the same.
       summary = message.content?.trim() || 'Builder finished without a summary.'
+      if (timeUp) summary = `Stopped at the time budget; the change may be partial. ${summary}`
       break
     }
     for (const call of calls) {
@@ -192,6 +240,8 @@ try {
         args = JSON.parse(call.function?.arguments || '{}')
         if (name === 'finish') {
           summary = String(args.summary ?? '').trim() || 'Builder finished without a summary.'
+          // A reviewer must be able to tell a change the model considered done from one it was stopped in.
+          if (timeUp) summary = `Stopped at the time budget; the change may be partial. ${summary}`
           output = 'ok'
         } else if (last) output = 'not run: the step budget is spent; call finish'
         else if (handlers[name]) output = handlers[name](args)
