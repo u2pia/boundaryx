@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { mapCriteriaToChecks } from '../server/criteria-coverage.ts'
+import { criterionStatus, mapCriteriaToChecks } from '../server/criteria-coverage.ts'
 import { ControlPlaneDatabase } from '../server/database.ts'
 import { useProjectRepository } from './fixtures.ts'
 import { LocalGitAuthority } from '../server/local-git-authority.ts'
@@ -119,12 +119,18 @@ try {
     assert.deepEqual(unverified.map((item) => item.independent), [false, false], 'no testPaths and no verified dataset: nothing is independent')
     const withBaseline = mapCriteriaToChecks(intent, [{ name: 'unit', kind: 'test', provenance: 'all_tests' }, { name: 'unit@baseline', kind: 'test', provenance: 'pre_existing' }])
     assert.equal(withBaseline[0].independent, true, 'a re-run on the base test files is independent')
-    // An evaluation is independent only with both an untouched dataset and a grader the run did not write.
+    // No local evaluation is independent: the code under evaluation shares the grader's process and can read the
+    // holdout. The dataset guards join the evaluation's checks, so a touched or copied dataset fails the criterion.
     const integrity = { name: 'evaluation-dataset-integrity', kind: 'integrity' as const, conclusion: 'success' }
-    assert.equal(mapCriteriaToChecks(intent, [integrity, { name: 'grader', kind: 'evaluation', conclusion: 'success' }])[1].independent, false, 'a verified dataset alone does not make the evaluation independent: the run may have written the grader')
-    assert.equal(mapCriteriaToChecks(intent, [integrity, { name: 'grader', kind: 'evaluation', provenance: 'all_tests', conclusion: 'success' }])[1].independent, false, 'a grader the run modified is not independent')
-    assert.equal(mapCriteriaToChecks(intent, [{ name: 'grader', kind: 'evaluation', provenance: 'pre_existing', conclusion: 'success' }])[1].independent, false, 'an untouched grader on an unverified dataset is not independent')
-    assert.equal(mapCriteriaToChecks(intent, [integrity, { name: 'grader', kind: 'evaluation', provenance: 'pre_existing', conclusion: 'success' }])[1].independent, true, 'a verified dataset scored by the base grader is independent')
+    const leakage = { name: 'evaluation-dataset-leakage', kind: 'integrity' as const, conclusion: 'success' }
+    const baseGrader = { name: 'grader', kind: 'evaluation' as const, provenance: 'pre_existing', status: 'completed', conclusion: 'success' }
+    const honestEvaluation = mapCriteriaToChecks(intent, [integrity, leakage, baseGrader])[1]
+    assert.equal(honestEvaluation.independent, false, 'a verified dataset scored by the base grader is still self-graded')
+    assert.deepEqual(honestEvaluation.checkNames, ['grader', 'evaluation-dataset-integrity', 'evaluation-dataset-leakage'])
+    assert.equal(criterionStatus(honestEvaluation, [{ ...integrity, status: 'completed' }, { ...leakage, status: 'completed' }, baseGrader]), 'self_graded')
+    const leaked = mapCriteriaToChecks(intent, [integrity, { ...leakage, conclusion: 'failure' }, baseGrader])[1]
+    assert.equal(criterionStatus(leaked, [{ ...integrity, status: 'completed' }, { ...leakage, status: 'completed', conclusion: 'failure' }, baseGrader]), 'failed', 'a holdout copied into the change fails the criterion')
+    assert.deepEqual(mapCriteriaToChecks(intent, [integrity, { name: 'unit', kind: 'test', provenance: 'pre_existing' }])[0].checkNames, ['unit'], 'guards join only criteria an evaluation evidences')
 
     database.recordCheck({ proposalId: proposal.id, headSha: proposal.headSha, name: 'unit', status: 'completed', conclusion: 'success', source: 'run', runId: 'RUN-self-graded' }, owner.id)
     database.recordCheck({ proposalId: proposal.id, headSha: proposal.headSha, name: 'grader', status: 'completed', conclusion: 'success', source: 'run', runId: 'RUN-self-graded' }, owner.id)

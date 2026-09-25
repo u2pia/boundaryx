@@ -54,20 +54,44 @@ function excerpt(value: string) {
  * The metrics an evaluation printed. A metric reported twice with different values is a conflict, not "the last one
  * wins": the code under evaluation shares the grader's stdout and could otherwise print a better score after it.
  */
+/** Dataset strings shorter than this are too likely to appear in honest code to count as a leak. */
+const DATASET_LEAK_MINIMUM_LENGTH = 12
+
+/** The string values of a dataset that are specific enough to be recognised when copied: JSON leaves, else whole lines. */
+function datasetLeakCandidates(content: string) {
+  const values = new Set<string>()
+  const collect = (value: unknown): void => {
+    if (typeof value === 'string') { if (value.trim().length >= DATASET_LEAK_MINIMUM_LENGTH) values.add(value.trim()) }
+    else if (Array.isArray(value)) value.forEach(collect)
+    else if (value && typeof value === 'object') Object.values(value).forEach(collect)
+  }
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue
+    try { collect(JSON.parse(line)) } catch { collect(line) }
+  }
+  return [...values]
+}
+
+const UNREADABLE_METRICS_LINE = '(unreadable evaluation_metrics line)'
+
 function evaluationMetrics(stdout: string) {
   const metrics: Record<string, number> = {}
   const conflicts = new Set<string>()
   for (const line of stdout.split('\n')) {
-    if (!line.trim().startsWith('{')) continue
-    try {
-      const value = JSON.parse(line) as Record<string, unknown>
-      if (value.type !== 'evaluation_metrics' || !value.metrics || typeof value.metrics !== 'object' || Array.isArray(value.metrics)) continue
-      for (const [name, metric] of Object.entries(value.metrics as Record<string, unknown>)) {
-        if (typeof metric !== 'number' || !Number.isFinite(metric)) continue
-        if (name in metrics && metrics[name] !== metric) conflicts.add(name)
-        metrics[name] = metric
-      }
-    } catch {}
+    // A metrics record the parser cannot read is not skipped: output glued onto the grader's line (an unterminated
+    // write before it) would otherwise hide the grader's score and leave only a later, self-printed one.
+    const mentionsMetrics = line.includes('evaluation_metrics')
+    let value: Record<string, unknown> | undefined
+    try { value = line.trim().startsWith('{') ? JSON.parse(line) as Record<string, unknown> : undefined } catch {}
+    if (!value || value.type !== 'evaluation_metrics' || !value.metrics || typeof value.metrics !== 'object' || Array.isArray(value.metrics)) {
+      if (mentionsMetrics) conflicts.add(UNREADABLE_METRICS_LINE)
+      continue
+    }
+    for (const [name, metric] of Object.entries(value.metrics as Record<string, unknown>)) {
+      if (typeof metric !== 'number' || !Number.isFinite(metric)) continue
+      if (name in metrics && metrics[name] !== metric) conflicts.add(name)
+      metrics[name] = metric
+    }
   }
   return { metrics, conflicts: [...conflicts] }
 }
@@ -89,10 +113,12 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const harnessPaths = input.projectManifest.manifest.evaluation.harnessPaths ?? []
     const agentModifiedHarnessFiles = harnessPaths.length ? this.diffFiles(input.worktreePath, input.proposal.baseSha, input.proposal.headSha, harnessPaths) : []
     const harnessProvenance: CheckProvenance = !harnessPaths.length ? 'unverified' : agentModifiedHarnessFiles.length ? 'all_tests' : 'pre_existing'
-    if (input.projectManifest.manifest.evaluation.profile === 'agent_dataset') checks.push(this.recordEvaluationDatasetIntegrity(input))
+    const datasetBeforeChecks = input.projectManifest.manifest.evaluation.profile === 'agent_dataset' ? this.datasetState(input) : undefined
+    if (datasetBeforeChecks) checks.push(this.recordEvaluationDatasetIntegrity(input), this.recordEvaluationDatasetLeakage(input))
     checks.push(...manifestChecks.map((check) => this.executeCheck({ name: check.name, kind: check.kind, executable: check.command[0], args: check.command.slice(1), timeoutMs: check.timeoutMs }, input, check.kind === 'test' ? { provenance: headProvenance, testTreeSha: input.proposal.headSha, agentModifiedTestFiles } : check.kind === 'evaluation' ? { provenance: harnessProvenance, testTreeSha: input.proposal.headSha, agentModifiedTestFiles: agentModifiedHarnessFiles } : undefined)))
     if (agentModifiedTestFiles.length) checks.push(...this.executeBaselineChecks(input, 'test', testPaths, agentModifiedTestFiles))
     if (agentModifiedHarnessFiles.length) checks.push(...this.executeBaselineChecks(input, 'evaluation', harnessPaths, agentModifiedHarnessFiles))
+    if (datasetBeforeChecks) checks.push(this.recordEvaluationDatasetUntouched(input, datasetBeforeChecks))
     const artifacts = this.collectBuildArtifacts(input, checks)
     const allowedArtifactPaths = new Set(artifacts.map((artifact) => artifact.path))
     const dirty = execFileSync('git', ['-C', input.worktreePath, 'status', '--porcelain', '--untracked-files=all'], { encoding: 'utf8' }).trim().split('\n').filter((line) => line && !allowedArtifactPaths.has(line.slice(3))).join('\n')
@@ -117,12 +143,16 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const evaluationProvenance = input.projectManifest.manifest.evaluation.profile === 'agent_dataset' ? {
       declaredHarnessPaths: harnessPaths,
       agentModifiedHarnessFiles,
-      independent: harnessProvenance !== 'unverified',
-      note: harnessProvenance === 'unverified'
-        ? 'The project manifest declares no evaluation.harnessPaths, so the run could have edited the grader: no evaluation result in this package is independent of the change under review.'
+      graderFromBase: harnessProvenance !== 'unverified',
+      // The grader runs the code under evaluation in its own process, and the dataset sits in the worktree, so that code
+      // can read the answers at runtime. No local evaluation is independent, whoever wrote the grader.
+      independent: false,
+      note: (harnessProvenance === 'unverified'
+        ? 'The project manifest declares no evaluation.harnessPaths, so the run could have edited the grader.'
         : harnessProvenance === 'pre_existing'
           ? 'The run did not modify the declared grader; the evaluation results come from the base revision of it.'
-          : 'The run modified the declared grader, so the head evaluation results are not independent. The @baseline results were produced with the grader reset to the proposal base revision.',
+          : 'The run modified the declared grader, so the head evaluation results are not trustworthy. The @baseline results were produced with the grader reset to the proposal base revision.')
+        + ' The code under evaluation runs inside the grader process and can read the hidden dataset, so no evaluation result in this package is independent of the change under review; a critical model criterion needs a reviewer override.',
     } : undefined
     const criteriaCoverage = mapCriteriaToChecks(input.intent, checks)
     const runEvents = this.input.database.listAggregateEvents('agent_run', input.runId)
@@ -274,6 +304,62 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const check = this.input.database.recordCheck({ proposalId: input.proposal.id, headSha: input.proposal.headSha, name: 'evaluation-dataset-integrity', status: 'completed', conclusion: passed ? 'success' : 'failure', exitCode: passed ? 0 : 1, durationMs: 0, stdoutDigest, stderrDigest, source: 'run', runId: input.runId }, input.actorId)
     this.input.database.recordAgentRunEvent(input.runId, 'agent_run.evaluation_dataset_verified', { checkId: check.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, datasetPath, expectedDigest, actualDigest, passed }, input.actorId)
     return { id: check.id, name: 'evaluation-dataset-integrity', kind: 'integrity', conclusion: passed ? 'success' : 'failure', exitCode: passed ? 0 : 1, durationMs: 0, stdoutDigest, stderrDigest, stdoutExcerpt: stdout, stderrExcerpt: '' }
+  }
+
+  private datasetState(input: AgentRunPostprocessorInput) {
+    const path = resolve(input.worktreePath, input.projectManifest.manifest.evaluation.datasetPath!)
+    try {
+      const stat = statSync(path)
+      return { digest: `sha256:${sha256(readFileSync(path))}`, inode: stat.ino, changedAtMs: stat.ctimeMs }
+    } catch {
+      return { digest: 'missing', inode: 0, changedAtMs: 0 }
+    }
+  }
+
+  /**
+   * The integrity check runs before the checks, and the code they run can write the worktree: a dataset swapped for
+   * the evaluation and restored on exit has the right digest both times. Its inode change time cannot be set back
+   * without root, so any write or replacement while the checks ran fails this.
+   */
+  private recordEvaluationDatasetUntouched(input: AgentRunPostprocessorInput, before: { digest: string; inode: number; changedAtMs: number }): ExecutedCheck {
+    const after = this.datasetState(input)
+    const passed = after.digest === before.digest && after.inode === before.inode && after.changedAtMs === before.changedAtMs
+    const stdout = JSON.stringify({ datasetPath: input.projectManifest.manifest.evaluation.datasetPath, digestBefore: before.digest, digestAfter: after.digest, replaced: after.inode !== before.inode, written: after.changedAtMs !== before.changedAtMs, passed })
+    const stdoutDigest = `sha256:${sha256(stdout)}`
+    const stderrDigest = `sha256:${sha256('')}`
+    const check = this.input.database.recordCheck({ proposalId: input.proposal.id, headSha: input.proposal.headSha, name: 'evaluation-dataset-untouched', status: 'completed', conclusion: passed ? 'success' : 'failure', exitCode: passed ? 0 : 1, durationMs: 0, stdoutDigest, stderrDigest, source: 'run', runId: input.runId }, input.actorId)
+    this.input.database.recordAgentRunEvent(input.runId, 'agent_run.evaluation_dataset_rechecked', { checkId: check.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, passed, digestAfter: after.digest }, input.actorId)
+    return { id: check.id, name: 'evaluation-dataset-untouched', kind: 'integrity', conclusion: passed ? 'success' : 'failure', exitCode: passed ? 0 : 1, durationMs: 0, stdoutDigest, stderrDigest, stdoutExcerpt: stdout, stderrExcerpt: '' }
+  }
+
+  /**
+   * The Builder is not given the dataset, but a process runtime can still read it from the worktree. Its answers
+   * copied into the change (a lookup table, a hard-coded reply) make any score meaningless, so every dataset value
+   * long enough to be specific is looked for in the lines the run added. Only digests of the matches are recorded,
+   * so the check does not itself spread the holdout.
+   */
+  private recordEvaluationDatasetLeakage(input: AgentRunPostprocessorInput): ExecutedCheck {
+    const datasetPath = input.projectManifest.manifest.evaluation.datasetPath!
+    let candidates: string[] = []
+    try { candidates = datasetLeakCandidates(execFileSync('git', ['-C', input.worktreePath, 'show', `${input.proposal.baseSha}:${datasetPath}`], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 })) } catch {}
+    const added = new Map<string, string[]>()
+    let file = ''
+    for (const line of execFileSync('git', ['-C', input.worktreePath, 'diff', '--unified=0', '--no-color', '--no-ext-diff', input.proposal.baseSha, input.proposal.headSha, '--', '.', `:(exclude)${datasetPath}`], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 }).split('\n')) {
+      if (line.startsWith('+++ ')) file = line.slice(4).replace(/^b\//u, '')
+      else if (line.startsWith('+')) added.set(file, [...(added.get(file) ?? []), line.slice(1)])
+    }
+    const leaks = candidates.flatMap((value) => {
+      const forms = [value, JSON.stringify(value).slice(1, -1)]
+      const files = [...added].filter(([, lines]) => lines.some((line) => forms.some((form) => line.includes(form)))).map(([path]) => path)
+      return files.length ? [{ valueDigest: `sha256:${sha256(value)}`, files }] : []
+    })
+    const passed = leaks.length === 0
+    const stdout = JSON.stringify({ datasetPath, candidateCount: candidates.length, minimumLength: DATASET_LEAK_MINIMUM_LENGTH, leakedValueCount: leaks.length, leaks: leaks.slice(0, 20), passed })
+    const stdoutDigest = `sha256:${sha256(stdout)}`
+    const stderrDigest = `sha256:${sha256('')}`
+    const check = this.input.database.recordCheck({ proposalId: input.proposal.id, headSha: input.proposal.headSha, name: 'evaluation-dataset-leakage', status: 'completed', conclusion: passed ? 'success' : 'failure', exitCode: passed ? 0 : 1, durationMs: 0, stdoutDigest, stderrDigest, source: 'run', runId: input.runId }, input.actorId)
+    this.input.database.recordAgentRunEvent(input.runId, 'agent_run.evaluation_dataset_leakage_checked', { checkId: check.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, datasetPath, candidateCount: candidates.length, leakedValueCount: leaks.length, leakedFiles: [...new Set(leaks.flatMap((leak) => leak.files))], passed }, input.actorId)
+    return { id: check.id, name: 'evaluation-dataset-leakage', kind: 'integrity', conclusion: passed ? 'success' : 'failure', exitCode: passed ? 0 : 1, durationMs: 0, stdoutDigest, stderrDigest, stdoutExcerpt: stdout, stderrExcerpt: '' }
   }
 
   private recordDirtyWorkspace(input: AgentRunPostprocessorInput, dirty: string): ExecutedCheck {

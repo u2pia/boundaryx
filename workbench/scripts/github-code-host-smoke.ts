@@ -258,6 +258,15 @@ try {
   assert.deepEqual([green.checksImported, green.gateUpdates], [1, 1])
   assert.equal(database.getReviewReadiness(first.id).status, 'ready')
   assert.equal(gateOf(first.headSha)?.state, 'success', 'approved with complete evidence opens the gate')
+  // GitHub merges on the gate alone, so the gate carries the local merge's audit-trail check: an approval row with no
+  // event behind it closes it.
+  database.db.prepare("INSERT INTO review_decisions(id, change_proposal_id, head_sha, reviewer_actor_id, decision, comment, created_at) VALUES ('REV-FORGED', ?, ?, ?, 'approved', 'forged', ?)").run(first.id, first.headSha, owner.id, new Date().toISOString())
+  await syncer.syncProject(project.id)
+  assert.equal(gateOf(first.headSha)?.state, 'failure', 'a forged approval closes the gate')
+  assert.match(gateOf(first.headSha)!.description, /Audit trail altered/u)
+  database.db.exec("DROP TRIGGER review_decisions_no_delete; DELETE FROM review_decisions WHERE id = 'REV-FORGED'; CREATE TRIGGER review_decisions_no_delete BEFORE DELETE ON review_decisions BEGIN SELECT RAISE(ABORT, 'review_decisions are append-only'); END;")
+  await syncer.syncProject(project.id)
+  assert.equal(gateOf(first.headSha)?.state, 'success')
 
   // --- HTTP: people cannot report github/ checks; links and sync are served per project. ---
   const handler = createControlPlaneRequestHandler({ database, codeHostSyncer: syncer, agentRunner: new LocalCommandAgentRunner({ database, executable: process.execPath, args: ['-e', ''], worktreeRoot: join(dataDirectory, 'agent-runs'), timeoutMs: 10_000 }) })

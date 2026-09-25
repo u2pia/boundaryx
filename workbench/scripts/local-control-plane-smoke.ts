@@ -128,6 +128,8 @@ try {
 
   database.recordCheck({ proposalId: proposal.id, headSha: refresh.proposal.headSha, name: 'unit', status: 'completed', conclusion: 'success', evidenceRef: 'artifact://unit-v2.json' }, author.id)
   const recordedProposalHead = database.listAggregateEvents('change_proposal', proposal.id).at(-1)!.eventDigest
+  // A package sealed against history this proposal does not have is refused when it is attached, not at merge.
+  assert.throws(() => database.recordEvidence({ proposalId: proposal.id, runId: 'RUN-LOCAL-001', headSha: refresh.proposal.headSha, uri: 'local://evidence/other.json', sha256: 'sha256:other', summary: { eventChainHeads: { runEventChainHead: 'genesis', proposalEventChainHead: 'sha256:another-proposal-head' } } }, author.id), (error) => error instanceof AppError && error.code === 'evidence_chain_mismatch')
   const refreshedEvidence = database.recordEvidence({ proposalId: proposal.id, runId: 'RUN-LOCAL-001', headSha: refresh.proposal.headSha, uri: 'local://evidence/run-local-001-v2.json', sha256: 'sha256:test-evidence-v2', summary: { passed: 14, failed: 0, eventChainHeads: { runEventChainHead: 'genesis', proposalEventChainHead: recordedProposalHead } } }, author.id)
   database.recordEvidenceView(refreshedEvidence.id, reviewer.id, refreshedEvidence.sha256)
   database.recordReview({ proposalId: proposal.id, headSha: refresh.proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'follow-up evidence verified' })
@@ -150,6 +152,23 @@ try {
   assert.throws(() => authority.mergeChangeProposal(proposal.id, owner.id), (error) => error instanceof AppError && error.code === 'event_chain_broken' && /head recorded by/u.test(error.message))
   assert.equal(git('rev-parse', 'main'), mainBefore)
   restoreChain()
+  // The rows the merge reads are append-only too: a decision cannot be rewritten or a check deleted in place.
+  assert.throws(() => forger.prepare("UPDATE review_decisions SET comment = 'rewritten' WHERE change_proposal_id = ?").run(proposal.id), /append-only/u)
+  assert.throws(() => forger.prepare('UPDATE evidence_packages SET summary_json = ? WHERE id = ?').run('{}', refreshedEvidence.id), /append-only/u)
+  assert.throws(() => forger.prepare('DELETE FROM check_runs WHERE change_proposal_id = ?').run(proposal.id), /append-only/u)
+  // With the trigger dropped, the evidence summary no longer matches the digest its event recorded.
+  const evidenceTrigger = forger.prepare("SELECT sql FROM sqlite_master WHERE name = 'evidence_packages_only_invalidate'").get() as { sql: string }
+  const originalSummary = (forger.prepare('SELECT summary_json FROM evidence_packages WHERE id = ?').get(refreshedEvidence.id) as { summary_json: string }).summary_json
+  forger.exec('DROP TRIGGER evidence_packages_only_invalidate')
+  forger.prepare('UPDATE evidence_packages SET summary_json = ? WHERE id = ?').run(JSON.stringify({ passed: 14, failed: 0 }), refreshedEvidence.id)
+  assert.throws(() => authority.mergeChangeProposal(proposal.id, owner.id), (error) => error instanceof AppError && error.code === 'event_chain_broken' && /evidence/u.test(error.message))
+  forger.prepare('UPDATE evidence_packages SET summary_json = ? WHERE id = ?').run(originalSummary, refreshedEvidence.id)
+  forger.exec(evidenceTrigger.sql)
+  // An approval inserted as a row, with no event behind it, is not an approval the chain knows about.
+  forger.prepare("INSERT INTO review_decisions(id, change_proposal_id, head_sha, reviewer_actor_id, decision, comment, created_at) VALUES ('REV-FORGED', ?, ?, ?, 'approved', 'forged', ?)").run(proposal.id, refresh.proposal.headSha, owner.id, new Date().toISOString())
+  assert.throws(() => authority.mergeChangeProposal(proposal.id, owner.id), (error) => error instanceof AppError && error.code === 'event_chain_broken' && /REV-FORGED/u.test(error.message))
+  forger.exec("DROP TRIGGER review_decisions_no_delete; DELETE FROM review_decisions WHERE id = 'REV-FORGED'; CREATE TRIGGER review_decisions_no_delete BEFORE DELETE ON review_decisions BEGIN SELECT RAISE(ABORT, 'review_decisions are append-only'); END;")
+  assert.equal(git('rev-parse', 'main'), mainBefore)
   forger.close()
   assert.equal(database.verifyAggregateEventChain('change_proposal', proposal.id), true)
   const merged = authority.mergeChangeProposal(proposal.id, owner.id)

@@ -166,7 +166,16 @@ export class CodeHostSyncer {
     if (proposal.status === 'closed') return { state: 'failure', description: 'Rejected on the BoundaryX control plane' }
     if (proposal.status === 'changes_requested') return { state: 'failure', description: 'Changes requested on the BoundaryX control plane' }
     if (readiness.status === 'blocked') return { state: 'failure', description: `Blocked: ${readiness.blockers[0] ?? 'evidence gate failed'}` }
-    if (proposal.status === 'approved' && readiness.status === 'ready') return { state: 'success', description: 'Approved on the BoundaryX control plane; evidence complete' }
+    if (proposal.status === 'approved' && readiness.status === 'ready') {
+      // The host merges on this status alone, so it has to carry the same audit-trail check a local merge makes.
+      try {
+        this.database.assertMergeEventChainsIntact(proposalId)
+      } catch (error) {
+        if (error instanceof AppError && error.code === 'event_chain_broken') return { state: 'failure', description: 'Audit trail altered outside the BoundaryX control plane; merge refused' }
+        throw error
+      }
+      return { state: 'success', description: 'Approved on the BoundaryX control plane; evidence complete' }
+    }
     return { state: 'pending', description: proposal.status === 'approved' ? `Approved; waiting for evidence: ${readiness.blockers[0] ?? readiness.status}` : `Waiting for review on the BoundaryX control plane (evidence ${readiness.status})` }
   }
 

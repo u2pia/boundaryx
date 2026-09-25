@@ -19,8 +19,8 @@ export type CriterionCoverage = {
   checkNames: string[]
   /**
    * At least one mapped result does not depend on anything the run authored: a test run on the base revision's test
-   * files (`pre_existing`, including `@baseline` re-runs), a build, or an evaluation whose hidden dataset was verified
-   * unchanged and whose grader the run did not modify, or a check reported externally (the author is forbidden from reporting checks on their own proposal).
+   * files (`pre_existing`, including `@baseline` re-runs), a build, or a check reported externally (the author is
+   * forbidden from reporting checks on their own proposal). Never an evaluation: see `isIndependent`.
    * DOMAIN_MODEL.md §5.6: `added_by_run` evidence alone cannot prove a critical criterion.
    */
   independent?: boolean
@@ -35,10 +35,14 @@ export type CriterionStatus = 'passed' | 'self_graded' | 'failed' | 'pending' | 
 const kindsFor = { deterministic: ['test', 'build', 'evaluation'], model: ['evaluation'] } as const
 
 export function mapCriteriaToChecks(intent: IntentVersion, checks: Array<{ name: string; kind: CheckKind; provenance?: string; conclusion?: string }>): CriterionCoverage[] {
-  const datasetVerified = checks.some((check) => check.name === 'evaluation-dataset-integrity' && check.conclusion === 'success')
-  // An evaluation needs both: a dataset the run did not touch and a grader the run did not write (`pre_existing`,
-  // from evaluation.harnessPaths or its @baseline re-run). Either alone lets the run grade itself.
-  const isIndependent = (check: { kind: CheckKind; provenance?: string }) => check.kind === 'evaluation' ? datasetVerified && check.provenance === 'pre_existing' : check.kind === 'build' || check.provenance === 'pre_existing' || check.provenance === 'external'
+  // No evaluation is independent in the local runtime: the grader imports the code under evaluation into its own
+  // process, so that code can read the hidden dataset (it is in the worktree) and answer from it. The leakage check only
+  // sees answers copied into the change. Until an isolated evaluator exists, a passing evaluation is self-graded and a
+  // critical model criterion needs an override. The dataset guards still count: a dataset the run touched or copied
+  // fails the criterion outright.
+  const evaluationGuards = checks.filter((check) => ['evaluation-dataset-integrity', 'evaluation-dataset-leakage', 'evaluation-dataset-untouched'].includes(check.name)).map((check) => check.name)
+  const withGuards = (names: string[]) => checks.some((check) => check.kind === 'evaluation' && names.includes(check.name)) ? [...names, ...evaluationGuards] : names
+  const isIndependent = (check: { kind: CheckKind; provenance?: string }) => check.kind !== 'evaluation' && (check.kind === 'build' || check.provenance === 'pre_existing' || check.provenance === 'external')
   return intent.acceptanceCriteria.map((criterion) => {
     const base = { criterionId: criterion.id, label: `AC-${criterion.ordinal}`, statement: criterion.statement, criticality: criterion.criticality, verificationType: criterion.verificationType, mapping: 'rule' as const }
     if (criterion.verificationType === 'human') return { ...base, checkNames: [] }
@@ -48,11 +52,11 @@ export function mapCriteriaToChecks(intent: IntentVersion, checks: Array<{ name:
       const missing = criterion.verifiedBy.filter((name) => !checks.some((check) => check.name === name))
       if (missing.length) return { ...declared, checkNames: [], unmappedReason: `Declared check ${missing.join(', ')} did not run; the project manifest must declare it.` }
       const mapped = checks.filter((check) => criterion.verifiedBy!.some((name) => check.name === name || check.name === `${name}@baseline`))
-      return { ...declared, checkNames: mapped.map((check) => check.name), independent: mapped.some(isIndependent) }
+      return { ...declared, checkNames: withGuards(mapped.map((check) => check.name)), independent: mapped.some(isIndependent) }
     }
     const kinds: readonly CheckKind[] = kindsFor[criterion.verificationType]
     const mapped = checks.filter((check) => kinds.includes(check.kind))
-    const coverage: CriterionCoverage = { ...base, checkNames: mapped.map((check) => check.name) }
+    const coverage: CriterionCoverage = { ...base, checkNames: withGuards(mapped.map((check) => check.name)) }
     if (!mapped.length) coverage.unmappedReason = criterion.verificationType === 'model' ? 'The project manifest declares no evaluation check, so a model-verified criterion has nothing to run.' : 'The project manifest declares no test, build or evaluation check.'
     if (mapped.length) coverage.independent = mapped.some(isIndependent)
     return coverage

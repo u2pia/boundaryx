@@ -1043,11 +1043,14 @@ export class ControlPlaneDatabase {
     const proposal = this.getChangeProposal(input.proposalId)
     if (proposal.headSha !== input.headSha) throw new AppError(409, 'Evidence is bound to a stale head revision', 'stale_head')
     if (proposal.status === 'closed') throw new AppError(409, `Change proposal ${proposal.id} was rejected`, 'proposal_closed')
+    // A package sealed against another proposal's or run's history would only fail at merge; refuse it here instead.
+    const heads = input.summary.eventChainHeads as { runEventChainHead?: unknown; proposalEventChainHead?: unknown } | undefined
+    if (heads && (!this.isOnEventChain('change_proposal', input.proposalId, heads.proposalEventChainHead) || !this.isOnEventChain('agent_run', input.runId, heads.runEventChainHead))) throw new AppError(409, 'The evidence package was sealed against event history this proposal or run does not have', 'evidence_chain_mismatch')
     const timestamp = nowIso()
     const evidenceId = id('EVD')
     return this.inTransaction(() => {
       this.db.prepare('INSERT INTO evidence_packages(id, change_proposal_id, run_id, head_sha, uri, sha256, summary_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(evidenceId, input.proposalId, input.runId, input.headSha, input.uri, input.sha256, JSON.stringify(input.summary), timestamp)
-      this.appendEvent({ aggregateType: 'change_proposal', aggregateId: input.proposalId, eventType: 'evidence.recorded', actorId, payload: { evidenceId, runId: input.runId, headSha: input.headSha, uri: input.uri, sha256: input.sha256, ...(input.summary.eventChainHeads ? { eventChainHeads: input.summary.eventChainHeads } : {}) } })
+      this.appendEvent({ aggregateType: 'change_proposal', aggregateId: input.proposalId, eventType: 'evidence.recorded', actorId, payload: { evidenceId, runId: input.runId, headSha: input.headSha, uri: input.uri, sha256: input.sha256, summaryDigest: `sha256:${sha256(JSON.stringify(input.summary))}`, ...(input.summary.eventChainHeads ? { eventChainHeads: input.summary.eventChainHeads } : {}) } })
       return { id: evidenceId, ...input, createdAt: timestamp }
     })
   }
@@ -1449,7 +1452,9 @@ export class ControlPlaneDatabase {
     const criterionBlockers = [
       ...criticalCriteria.filter((item) => item.status === 'unmapped').map((item) => `${item.label} is critical but no check maps to it: ${item.unmappedReason ?? 'no check of its verification type was run.'}`),
       ...criticalCriteria.filter((item) => item.status === 'failed').map((item) => `${item.label} is critical and its evidence failed (${item.checkNames.join(', ')}).`),
-      ...criticalCriteria.filter((item) => item.status === 'self_graded').map((item) => `${item.label} is critical but only passed tests the run could have authored (${item.checkNames.join(', ')}); declare testPaths so the tests are re-run from the base revision, or add a build check.`),
+      ...criticalCriteria.filter((item) => item.status === 'self_graded').map((item) => item.verificationType === 'model'
+        ? `${item.label} is critical and rests on an evaluation (${item.checkNames.join(', ')}) whose code under test can read the hidden dataset; the local runtime has no isolated evaluator, so a reviewer must override it and say why the score is trusted.`
+        : `${item.label} is critical but only passed tests the run could have authored or evaluations, which are never independent locally (${item.checkNames.join(', ')}); declare testPaths so the tests are re-run from the base revision, or add a build check.`),
       // DOMAIN_MODEL.md §5.6: a model evaluation must not be the only critical evidence for a high risk change.
       ...(intent.riskLevel === 'high' && criticalCriteria.length > 0 && criticalCriteria.every((item) => item.verificationType === 'model') ? ['High risk changes cannot rest on model evaluation alone; add a critical deterministic or human criterion.'] : []),
     ]
@@ -1505,21 +1510,53 @@ export class ControlPlaneDatabase {
   /**
    * Merging is the last moment the audit trail can still refuse something, so it re-verifies the hash chains the
    * decision rests on: the proposal's own events and those of every run that produced its evidence. Append-only
-   * triggers stop UPDATE and DELETE; this catches a row inserted around them (a forged approval, say). A chain
-   * rewritten consistently from genesis still verifies, so each evidence package's recorded chain heads must also be
-   * events of the chains as they are now.
+   * triggers stop UPDATE and DELETE on the events; this catches a row inserted around them (a forged approval, say).
+   *
+   * Readiness is computed from state rows (reviews, checks, evidence, overrides), not from the events, so a chain that
+   * verifies proves nothing about rows written beside it. Each row the merge rests on must therefore be the one its
+   * event describes, and the proposal must be the one its creation and revision events describe. A chain rewritten
+   * consistently from genesis still verifies, so each evidence event's recorded chain heads must be on the chains too.
+   * Events are digested without a key: someone who computes the digests can still append a matching forgery.
    */
   assertMergeEventChainsIntact(proposalId: string) {
+    const proposal = this.getChangeProposal(proposalId)
     const rows = this.db.prepare('SELECT id, run_id, summary_json FROM evidence_packages WHERE change_proposal_id = ?').all(proposalId) as Array<{ id: string; run_id: string; summary_json: string }>
     const runIds = [...new Set(rows.map((row) => row.run_id))]
     const broken = [['change_proposal', proposalId], ...runIds.map((runId) => ['agent_run', runId])].filter(([type, aggregateId]) => !this.verifyAggregateEventChain(type, aggregateId)).map(([type, aggregateId]) => `${type} ${aggregateId}`)
+    const events = this.listAggregateEvents('change_proposal', proposalId)
+    // The latest event for a row: an external check is updated in place and records an event each time.
+    const eventFor = (eventType: string, key: string, value: string) => events.findLast((event) => event.eventType === eventType && event.payload[key] === value)
+    const unbound: string[] = []
+    if (events[0]?.eventType !== 'change_proposal.created') unbound.push('the proposal has no creation event')
+    const headEvent = events.filter((event) => event.eventType === 'change_proposal.created' || event.eventType === 'change_proposal.revision_changed').at(-1)
+    if (headEvent && headEvent.payload.headSha !== proposal.headSha) unbound.push(`head ${proposal.headSha.slice(0, 12)} is not the head its events record`)
+    const approvals = this.db.prepare("SELECT id, head_sha, reviewer_actor_id FROM review_decisions WHERE change_proposal_id = ? AND head_sha = ? AND decision = 'approved' AND invalidated_at IS NULL").all(proposalId, proposal.headSha) as Array<{ id: string; head_sha: string; reviewer_actor_id: string }>
+    for (const approval of approvals) {
+      const event = eventFor('review.approved', 'reviewId', approval.id)
+      if (!event || event.payload.headSha !== approval.head_sha || event.actorId !== approval.reviewer_actor_id) unbound.push(`approval ${approval.id}`)
+    }
+    const readiness = this.getReviewReadiness(proposalId)
+    for (const check of readiness.checks) {
+      const event = eventFor('check.recorded', 'checkId', check.id)
+      if (!event || event.payload.headSha !== proposal.headSha || (event.payload.conclusion ?? undefined) !== check.conclusion) unbound.push(`check ${check.id}`)
+    }
     for (const row of rows) {
-      const heads = parseJson<{ eventChainHeads?: { runEventChainHead?: unknown; proposalEventChainHead?: unknown } }>(row.summary_json).eventChainHeads
+      const evidence = readiness.evidence.find((item) => item.id === row.id)
+      const event = eventFor('evidence.recorded', 'evidenceId', row.id)
+      if (!event) { unbound.push(`evidence ${row.id}`); continue }
+      if (evidence && (event.payload.sha256 !== evidence.sha256 || event.payload.uri !== evidence.uri || event.payload.runId !== evidence.runId)) unbound.push(`evidence ${row.id}`)
+      // Events from before the summary digest was recorded carry neither it nor the chain heads.
+      if (typeof event.payload.summaryDigest === 'string' && event.payload.summaryDigest !== `sha256:${sha256(row.summary_json)}`) unbound.push(`evidence ${row.id} summary`)
+      const heads = event.payload.eventChainHeads as { runEventChainHead?: unknown; proposalEventChainHead?: unknown } | undefined
       if (!heads) continue
       if (!this.isOnEventChain('agent_run', row.run_id, heads.runEventChainHead)) broken.push(`agent_run ${row.run_id} (head recorded by ${row.id})`)
       if (!this.isOnEventChain('change_proposal', proposalId, heads.proposalEventChainHead)) broken.push(`change_proposal ${proposalId} (head recorded by ${row.id})`)
     }
+    for (const criterion of readiness.criteria) {
+      if (criterion.override && !eventFor('decision.override_recorded', 'decisionId', criterion.override.decisionId)) unbound.push(`override ${criterion.override.decisionId}`)
+    }
     if (broken.length) throw new AppError(409, `The event chain of ${broken.join(', ')} does not verify; the audit trail was altered outside the Control Plane`, 'event_chain_broken')
+    if (unbound.length) throw new AppError(409, `Merge state has no matching event on the proposal's chain: ${unbound.join(', ')}; the audit trail was altered outside the Control Plane`, 'event_chain_broken')
   }
 
   private isOnEventChain(aggregateType: string, aggregateId: string, digest: unknown) {

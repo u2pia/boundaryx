@@ -189,7 +189,7 @@ Intent 页的表单按 `PRODUCT_CHARTER.md` 的定义补三样东西：验收标
 
 **验收标准证据门禁**：审查与批准路径逐条读取 `criticality` / `verificationType`（实现在 `server/criteria-coverage.ts`，由 `getReviewReadiness` 与 `recordReview` 调用）。`DOMAIN_MODEL.md` 要求 AC → 检查的映射来自人或确定性规则、不能来自模型；写了 `[验证: …]` 的标准用人声明的映射（`mapping: 'declared'`），其余用规则映射（`mapping: 'rule'`）：
 
-- `[确定性]` 映射到 manifest 的 test / build / evaluation 检查（evaluation 的判定是阈值比较，本身是确定性的）。只靠 Run 自己可能写出来的测试通过的标准，状态是 `self_graded`（"仅自带测试"）：对关键标准它和"证据失败"一样阻塞批准。能解除它的是独立证据：`@baseline` 检查（把测试文件重置回 Base 后重跑）、manifest 声明了 `testPaths` 且 Agent 未改动这些文件，或隐藏评估数据集通过完整性校验**且**评分器（`evaluation.harnessPaths`）未被 Run 改动或已由 `@baseline` 用 Base 版本重跑。`@baseline` 只重置 `testPaths`，测试依赖的 helper / fixture 若不在其中，重跑时仍是 Head 版本：Evidence Package 的 `testProvenance.filesAtHeadDuringBaseline` 列出这些文件，`testPaths` 应覆盖测试运行所需的全部输入；
+- `[确定性]` 映射到 manifest 的 test / build / evaluation 检查（evaluation 的判定是阈值比较，本身是确定性的）。只靠 Run 自己可能写出来的测试通过的标准，状态是 `self_graded`（"仅自带测试"）：对关键标准它和"证据失败"一样阻塞批准。能解除它的是独立证据：`@baseline` 检查（把测试文件重置回 Base 后重跑）、manifest 声明了 `testPaths` 且 Agent 未改动这些文件，或外部上报的检查。本地 Evaluation 永远不算独立（见下文 Agent System 一节）。`@baseline` 只重置 `testPaths`，测试依赖的 helper / fixture 若不在其中，重跑时仍是 Head 版本：Evidence Package 的 `testProvenance.filesAtHeadDuringBaseline` 列出这些文件，`testPaths` 应覆盖测试运行所需的全部输入；
 - `[模型]` 只映射到 evaluation 检查，manifest 没有声明 evaluation 时标为"无可映射检查"并给出原因；
 - 声明映射只采信所列检查（及其 `@baseline`）；任一所列检查没有运行，标准为"无可映射检查"并写明是哪个，不会退回规则映射去找别的检查凑数；
 - `[人工]` 由批准本身证明：存在人工标准时，批准意见必须**逐条点名**每条人工标准的编号（`AC-2：已与安全负责人核对威胁模型`），缺哪条就拒绝哪条（`review_human_criteria_unsigned`），事件里记录 `humanCriteriaSignedOff`。一句「ok」不再能签署任何人工标准，界面也不自动填充默认意见；
@@ -404,12 +404,13 @@ Dataset 必须存在于 Base Revision，且不能列入 Builder Context。Contro
 
 「Dataset 没被改」不等于「评分诚实」：评分器也在 Builder 的 worktree 里。`harnessPaths` 声明评分器所在路径，是 evaluation 版的 `testPaths`：
 
-- Run 没改这些路径 → Evaluation 结论为 `pre_existing`，配合 Dataset 完整性校验才算独立证据；
-- Run 改了 → 头版本结论不独立，另跑一次 `<name>@baseline`，评分器重置回 Base、被测代码留在 Head；
-- 未声明 `harnessPaths` → 没有任何 Evaluation 结论是独立的，关键 `[模型]` 标准为"仅自带测试"并阻塞批准；
-- 同一指标在 stdout 里出现两个不同的值（被测代码在评分器之后自己打印一个满分）→ 该 Check 失败，而不是"最后一个算数"。
+- Run 没改这些路径 → Evaluation 结论为 `pre_existing`（评分器取自 Base）；
+- Run 改了 → 头版本结论不可信，另跑一次 `<name>@baseline`，评分器重置回 Base、被测代码留在 Head；
+- 未声明 `harnessPaths` → Run 可能改过评分器，结论同样只算自评；
+- 同一指标在 stdout 里出现两个不同的值（被测代码在评分器之后自己打印一个满分）→ 该 Check 失败，而不是"最后一个算数"；
+- Dataset 里长度 ≥ 12 的字符串值（JSON 叶子，非 JSON 则整行）原样或 JSON 转义后出现在 Run 新增的行里（Dataset 文件本身除外）→ `evaluation-dataset-leakage` 失败。它和 `evaluation-dataset-integrity` 一起并入该标准的映射检查，任一失败即标准"证据失败"（推翻不了成"自评"）。Builder 读了 worktree 里的 Dataset 并把答案写成查表，评分器再诚实也只是在考它抄的答案。Check 输出只记录命中值的 Digest 与文件，不外泄 Dataset。
 
-仍然挡不住的：评分器与被测代码在同一进程里时，被测代码可以篡改评分器的输出本身；也挡不住 Builder 在 Run 中直接读取 worktree 里的 Dataset。前者要求评分器在子进程里调用被测代码，后者要求容器 Runtime 不挂载 Dataset，两者目前都靠项目自律。契约见 `../docs/AGENT_SYSTEM_EVALUATION_CONTRACT.md`。
+**本地 Runtime 下没有任何 Evaluation 结论是独立证据。** 评分器把被测代码导入自己的进程，Dataset 就在 worktree 里：被测代码可以在运行时读取 Dataset 直接答题（不留任何拷贝，泄漏检测看不见），也可以篡改评分器的输出。所以即便评分器取自 Base、Dataset 完好、没有泄漏，关键 `[模型]` 标准也只是 `self_graded`（界面显示"评测未隔离"），阻塞批准，需要 Owner 看过变更后带理由推翻（`decision.override_recorded`）。上面这些检查的作用是把能自动识别的作弊变成"证据失败"，而不是证明分数可信。要让 Evaluation 成为独立证据，需要隔离的评估器：被测代码在拿不到 Dataset 的沙箱里运行，由外部评分；目前没有。泄漏检测只认原样拷贝，改写、拆分、编码后的答案或短答案识别不出来。契约见 `../docs/AGENT_SYSTEM_EVALUATION_CONTRACT.md`。
 
 Change Proposal 获得独立批准后，只有 Owner 或 Maintainer 可以显式执行本地 fast-forward 合并。Control Plane 会复验 Base、Approved Head、Check、Evidence 和 Approval，要求实际目标分支 SHA 精确等于 Approved Head SHA，再生成不可更新、不可删除并带 Digest 的 Merge Evidence。合并前还会重算该 Proposal 以及产出其证据的每个 Run 的事件哈希链；有一条对不上（例如绕过平台直接 INSERT 进来的伪造批准事件）就拒绝合并（`event_chain_broken`），且在目标分支移动之前拒绝。整条链从 genesis 重算一遍也能自洽，所以还要求每个 Evidence Package 生成时记录的链头（`eventChainHeads`，写入证据摘要和 `evidence.recorded` 事件，外部附加的证据取自包文件）仍在当前链上；Merge Evidence 读取时同样核对其 `proposalEventChainHead`（`merge_evidence_chain_mismatch`）。`host_protected` 模式下合并已经发生，链校验失败会作为绕过门禁的原因记录。契约见 `../docs/MERGE_EVIDENCE_CONTRACT.md`。该能力不是自动合并，也不代表发布授权。
 
