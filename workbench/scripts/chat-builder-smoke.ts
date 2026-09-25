@@ -81,7 +81,8 @@ const provider = { APERTURE_AGENT_MODEL: 'deepseek-chat', APERTURE_AGENT_MODEL_P
 
 try {
   // A chat provider runs the built-in engine through the single configured entry point.
-  const result = await run([join(agents, 'builder.mjs'), '--codex', '/nonexistent/codex'], { ...provider, APERTURE_AGENT_PROVIDER_WIRE_API: 'chat' })
+  const progressPath = join(root, 'progress.jsonl')
+  const result = await run([join(agents, 'builder.mjs'), '--codex', '/nonexistent/codex'], { ...provider, APERTURE_AGENT_PROVIDER_WIRE_API: 'chat', APERTURE_PROGRESS_FILE: progressPath })
   assert.equal(result.status, 0, result.stderr)
   assert.match(result.stderr, /deepseek · wire API chat → chat-builder/u)
   assert.equal(requests.length, 3)
@@ -103,6 +104,12 @@ try {
   assert.match(result.stdout, /"type":"context_consumed","path":"README\.md"/u)
   assert.match(result.stdout, /"type":"message","summary":"Created src\/generated\.ts\."\}/u, 'a Builder that finished on its own is not marked as stopped')
   assert.equal(result.stdout.includes(secret) || result.stderr.includes(secret), false)
+  // Each tool call is reported for the running Intent, by what it did and not by what it read or wrote.
+  const steps = readFileSync(progressPath, 'utf8').trim().split('\n').map((line) => (JSON.parse(line) as { summary: string }).summary)
+  assert.deepEqual(steps.slice(0, 2), ['第 1 步 · 列目录 .', '第 1 步 · 读取 README.md'])
+  assert.equal(steps.includes('第 2 步 · 写入 src/generated.ts'), true)
+  assert.equal(steps.at(-1), '第 3 步 · 写总结')
+  assert.equal(steps.some((step) => step.includes('export const generated')), false)
 
   // A provider error is surfaced with the provider's message and a failing exit.
   const unreachable = await run([join(agents, 'chat-builder.mjs')], { ...provider, APERTURE_AGENT_PROVIDER_BASE_URL: `http://127.0.0.1:${port}/missing`, APERTURE_AGENT_PROVIDER_WIRE_API: 'chat' })
@@ -151,14 +158,33 @@ try {
   const noCodex = await run([join(agents, 'builder.mjs')], { ...provider, APERTURE_AGENT_PROVIDER_WIRE_API: 'responses' })
   assert.equal(noCodex.status, 2)
   assert.match(noCodex.stdout, /Builder not started: .*needs the Codex engine/u)
-  const noClaude = await run([join(agents, 'builder.mjs')], { ...provider, APERTURE_AGENT_MODEL_PROVIDER: 'anthropic', APERTURE_AGENT_PROVIDER_WIRE_API: 'chat' })
+  // Without --claude the local Claude Code is looked up; an empty home and a PATH without it leave nothing to find.
+  const emptyHome = join(root, 'empty-home')
+  mkdirSync(emptyHome)
+  const bareEnvironment = { HOME: emptyHome, PATH: `${dirname(process.execPath)}:/usr/bin:/bin` }
+  const noClaude = await run([join(agents, 'builder.mjs')], { ...provider, ...bareEnvironment, APERTURE_AGENT_MODEL_PROVIDER: 'anthropic', APERTURE_AGENT_PROVIDER_WIRE_API: 'chat' })
   assert.equal(noClaude.status, 2)
   assert.match(noClaude.stdout, /needs the Claude Code engine/u)
+  // The copy bundled with the VS Code extension is found, newest version first (2.1.10 after 2.1.9, not before).
+  const claudeHome = join(root, 'claude-home')
+  for (const version of ['2.1.9', '2.1.10']) {
+    const binary = join(claudeHome, `.vscode/extensions/anthropic.claude-code-${version}-darwin-arm64/resources/native-binary/claude`)
+    mkdirSync(dirname(binary), { recursive: true })
+    // Claude Code's stream-json: a tool call, then the result.
+    writeFileSync(binary, `#!/usr/bin/env node\nrequire('node:fs').readFileSync(0)\nrequire('node:fs').writeFileSync('claude-ran', ${JSON.stringify(version)})\nconsole.log(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: process.cwd() + '/src/app.ts' } }] } }))\nconsole.log(JSON.stringify({ type: 'result', subtype: 'success', result: 'done' }))\n`)
+    chmodSync(binary, 0o755)
+  }
+  const claudeProgress = join(root, 'claude-progress.jsonl')
+  const localClaude = await run([join(agents, 'builder.mjs')], { ...provider, ...bareEnvironment, HOME: claudeHome, APERTURE_PROGRESS_FILE: claudeProgress, APERTURE_AGENT_MODEL_PROVIDER: 'anthropic', APERTURE_AGENT_PROVIDER_WIRE_API: 'chat' })
+  assert.equal(localClaude.status, 0, localClaude.stderr)
+  assert.equal(readFileSync(join(workspace, 'claude-ran'), 'utf8'), '2.1.10')
+  assert.match(localClaude.stdout, /"type":"message","summary":"done"/u)
+  assert.match(readFileSync(claudeProgress, 'utf8'), /Claude Code 已启动[\s\S]*"summary":"修改 src\/app\.ts"/u)
   const unconfigured = await run([join(agents, 'builder.mjs')], {})
   assert.equal(unconfigured.status, 2)
   assert.match(unconfigured.stdout, /No LLM provider is configured/u)
 
-  console.log('chat builder smoke passed · 3 model turns · worktree-confined tools · key kept from commands · engine routed by provider · step budget ends in finish · time budget ends in finish before the deadline')
+  console.log('chat builder smoke passed · 3 model turns · worktree-confined tools · key kept from commands · engine routed by provider · progress reported per step · step budget ends in finish · time budget ends in finish before the deadline')
 } finally {
   server.closeAllConnections()
   server.close()

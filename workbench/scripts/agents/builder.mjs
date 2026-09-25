@@ -1,10 +1,11 @@
 import { spawn } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { localClaude } from './local-claude.mjs'
 
 // The one Builder the server is configured with. Which engine runs follows the provider saved in the Control
 // Plane, so switching models never needs a restart or a different server command:
-//   Anthropic provider         → claude-builder (needs --claude <path>)
+//   Anthropic provider         → claude-builder (--claude <path>, else the local Claude Code)
 //   wire API "responses"       → codex-builder  (needs --codex <path>)
 //   wire API "chat"            → chat-builder, built in, any OpenAI-compatible Chat Completions endpoint
 // Usage: node builder.mjs [--codex /path/to/codex] [--claude /path/to/claude]
@@ -35,6 +36,7 @@ function safeHost(url) {
 let engine
 let args
 if (anthropic) {
+  cli.claude ??= localClaude()
   if (!cli.claude) fail(`Provider ${providerId || 'anthropic'} uses the Anthropic API, which needs the Claude Code engine; start the server with --claude <path> in CONTROL_PLANE_AGENT_ARGS_JSON, or choose an OpenAI-compatible provider with wire API "chat".`)
   engine = 'claude-builder'
   args = [resolve(here, 'claude-builder.mjs'), cli.claude]
@@ -57,7 +59,7 @@ function fail(message) {
   process.exit(2)
 }
 
-console.error(`[builder] provider ${providerId || '(none)'} · wire API ${wireApi || '(none)'} → ${engine}`)
+console.error(`[builder] provider ${providerId || '(none)'} · wire API ${wireApi || '(none)'} → ${engine}${engine === 'claude-builder' ? ` · ${cli.claude}` : ''}`)
 const child = spawn(process.execPath, args, { cwd: process.cwd(), stdio: 'inherit', env: process.env })
 // A cancelled or timed-out run signals this process; the engine must stop with it rather than keep editing.
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => child.kill(signal))

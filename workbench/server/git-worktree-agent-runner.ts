@@ -6,6 +6,7 @@ import type { ControlPlaneDatabase } from './database.ts'
 import { resolveProjectRepository } from './code-host/index.ts'
 import { LocalGitAuthority } from './local-git-authority.ts'
 import { applyProjectManifest, loadProjectManifest, type ProjectManifestBinding } from './project-manifest.ts'
+import { progressPathFor, readBuilderSteps } from './run-progress.ts'
 import { removeRunWorktree, runRootFor, type PruneOutcome } from './run-worktree-lifecycle.ts'
 import { sha256 } from './security.ts'
 import { AppError, type AgentRun, type AgentRunRequest, type AgentRunner, type AgentRunnerDescriptor, type BuilderStopReason, type ChangeProposal, type IntentVersion, type WorkItem } from './types.ts'
@@ -211,6 +212,7 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     try {
       const result = this.input.runtime.execute(runtimeContext)
       diagnostic = result.diagnostic
+      this.recordBuilderProgress(runId, plan.requestPath, actorId)
       const stdout = result.stdout ?? ''
       const stderr = result.stderr ?? ''
       exitCode = result.status ?? undefined
@@ -249,6 +251,12 @@ export class GitWorktreeAgentRunner implements AgentRunner {
       this.terminal(runId, repositoryPath, actorId, { status: cancelled ? 'cancelled' : 'failed', changeProposalId, exitCode, stdoutDigest, stderrDigest, errorMessage: cancelled ? `Agent run was cancelled: ${message}` : message })
       throw error
     }
+  }
+
+  /** Keeps the Builder's own step log, which goes with the run directory, as its self-report for later reading. */
+  private recordBuilderProgress(runId: string, requestPath: string, actorId: string) {
+    const steps = readBuilderSteps(progressPathFor(requestPath), 50)
+    if (steps.total) this.input.database.recordAgentRunEvent(runId, 'agent_run.builder_progress', { source: 'builder_self_report', total: steps.total, steps: steps.recent }, actorId)
   }
 
   /**

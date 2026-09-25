@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
+import { progress } from './progress.mjs'
 import { cliTimeoutMs, partialMessage, stoppedAtDeadline } from './run-deadline.mjs'
 
 const [codexExecutable, ...configuredArgs] = process.argv.slice(2)
@@ -63,6 +64,7 @@ if (providerId) {
 if (process.env.APERTURE_AGENT_REASONING_EFFORT) providerArgs.push('-c', `model_reasoning_effort=${process.env.APERTURE_AGENT_REASONING_EFFORT}`)
 
 const lastMessagePath = resolve(dirname(requestPath), 'codex-last-message.txt')
+progress('Codex 已启动，正在工作（Codex 不逐步报告进度）')
 const result = spawnSync(codexExecutable, ['exec', '--approve-for-me', '--ephemeral', '--json', '-o', lastMessagePath, ...providerArgs, ...configuredArgs, '-'], { cwd: worktreePath, encoding: 'utf8', input: prompt, maxBuffer: 20 * 1024 * 1024, timeout: cliTimeoutMs() })
 
 if (result.stdout) process.stdout.write(result.stdout)

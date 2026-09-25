@@ -1,7 +1,8 @@
-import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
-import { cliTimeoutMs, partialMessage, stoppedAtDeadline } from './run-deadline.mjs'
+import { progress } from './progress.mjs'
+import { cliTimeoutMs, partialMessage } from './run-deadline.mjs'
 
 const [claudeExecutable, ...configuredArgs] = process.argv.slice(2)
 const requestPath = process.env.APERTURE_RUN_REQUEST
@@ -64,37 +65,89 @@ const providerEnvironment = {
   ...(apiKeyVariable && process.env[apiKeyVariable] ? { ANTHROPIC_API_KEY: process.env[apiKeyVariable] } : {}),
 }
 
-const result = spawnSync(claudeExecutable, [
+// stream-json reports each tool call as it happens, so the running Intent shows what Claude Code is working on.
+const child = spawn(claudeExecutable, [
   '--print',
-  '--output-format', 'json',
+  '--output-format', 'stream-json',
+  '--verbose',
   '--permission-mode', 'acceptEdits',
   '--allowedTools', 'Read,Write,Edit,Glob,Grep',
   ...modelArgs,
   ...configuredArgs,
-], { cwd: worktreePath, encoding: 'utf8', input: prompt, maxBuffer: 20 * 1024 * 1024, timeout: cliTimeoutMs(), env: { ...process.env, ...providerEnvironment } })
+], { cwd: worktreePath, env: { ...process.env, ...providerEnvironment } })
+progress('Claude Code 已启动，正在阅读需求')
+// A CLI that never reads its input must not crash the wrapper.
+child.stdin.on('error', () => {})
+child.stdin.end(prompt)
+child.stderr.on('data', (chunk) => process.stderr.write(chunk))
 
-if (result.stderr) process.stderr.write(result.stderr)
+// Stopped before the runner's deadline: what Claude Code wrote so far goes to the checks instead of being thrown away.
+let stoppedAtDeadline = false
+const timeoutMs = cliTimeoutMs()
+const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
+  stoppedAtDeadline = true
+  child.kill('SIGTERM')
+}, timeoutMs)
+// A cancelled run signals this process; Claude Code must stop with it rather than keep editing.
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => { child.kill(signal); process.exit(1) })
 
-let summary
-if (result.stdout) {
-  writeFileSync(resolve(dirname(requestPath), 'claude-result.json'), result.stdout)
-  try {
-    const payload = JSON.parse(result.stdout)
-    if (typeof payload.result === 'string') summary = payload.result
-    if (payload.is_error) process.stderr.write(`claude reported is_error: ${payload.subtype ?? 'unknown'}\n`)
-  } catch {
-    process.stderr.write('claude-builder could not parse --output-format json payload\n')
+const toolLabels = { Read: '读取', Write: '写入', Edit: '修改', Glob: '查找文件', Grep: '搜索' }
+// Claude Code reports resolved paths, which differ from the worktree path wherever it passes through a symlink.
+const worktreeRoots = [...new Set([worktreePath, realpathSync(worktreePath)])]
+function worktreeRelative(path) {
+  const inside = worktreeRoots.map((root) => relative(root, path)).find((candidate) => !candidate.startsWith('..'))
+  return inside === undefined ? path : inside.split(sep).join('/')
+}
+function describeTool(use) {
+  const input = use.input ?? {}
+  const target = input.file_path ? worktreeRelative(String(input.file_path)) : input.pattern ?? ''
+  return `${toolLabels[use.name] ?? use.name}${target ? ` ${target}` : ''}`
+}
+
+let resultLine
+let buffered = ''
+function readLine(line) {
+  if (!line.trim()) return
+  let event
+  try { event = JSON.parse(line) } catch { return }
+  if (event.type === 'assistant') {
+    for (const part of event.message?.content ?? []) if (part.type === 'tool_use') progress(describeTool(part))
+  } else if (event.type === 'result' || (event.type === undefined && 'result' in event)) {
+    resultLine = line
   }
 }
-// Stopped before the runner's deadline: what Claude Code wrote so far goes to the checks instead of being thrown away.
-if (stoppedAtDeadline(result)) {
+child.stdout.setEncoding('utf8')
+child.stdout.on('data', (chunk) => {
+  buffered += chunk
+  const lines = buffered.split('\n')
+  buffered = lines.pop()
+  lines.forEach(readLine)
+})
+
+const { status, error } = await new Promise((done) => {
+  child.on('error', (spawnError) => done({ status: null, error: spawnError }))
+  child.on('close', (code) => done({ status: code, error: undefined }))
+})
+clearTimeout(timer)
+readLine(buffered)
+
+let summary
+if (resultLine) {
+  writeFileSync(resolve(dirname(requestPath), 'claude-result.json'), resultLine)
+  const payload = JSON.parse(resultLine)
+  if (typeof payload.result === 'string') summary = payload.result
+  if (payload.is_error) process.stderr.write(`claude reported is_error: ${payload.subtype ?? 'unknown'}\n`)
+} else if (!stoppedAtDeadline && !error) {
+  process.stderr.write('claude-builder found no result in the --output-format stream-json output\n')
+}
+if (stoppedAtDeadline) {
   console.log(partialMessage('Claude Code'))
   process.exit(0)
 }
 if (summary) console.log(JSON.stringify({ type: 'message', summary: summary.trim().slice(0, 1000) }))
 
-if (result.error) {
-  console.error(result.error.message)
+if (error) {
+  console.error(error.message)
   process.exit(1)
 }
-process.exit(result.status ?? 1)
+process.exit(status ?? 1)

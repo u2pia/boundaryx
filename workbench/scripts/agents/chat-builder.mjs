@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
+import { progress } from './progress.mjs'
 
 // A Builder Agent with no external CLI: it drives any OpenAI-compatible Chat Completions endpoint (DeepSeek,
 // Qwen, OpenAI, vLLM, Ollama, a gateway) through tool calls, so which model writes the code is decided only by
@@ -98,6 +99,17 @@ function worktreeFile(path) {
 // with the key, and a command that printed its environment would otherwise put it in the conversation.
 const commandEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== apiKeyVariable && !key.startsWith('APERTURE_AGENT_')))
 const forbiddenGit = /\bgit\s+(commit|push|reset|rebase|merge|checkout|switch|stash|tag|branch\s+-[dD]|worktree|remote)\b/u
+
+// One line for the running Intent: what the model is doing, not the content it read or wrote.
+function progressLabel(name, args) {
+  if (name === 'list_files') return `列目录 ${args.path ?? '.'}`
+  if (name === 'read_file') return `读取 ${args.path}`
+  if (name === 'write_file') return `写入 ${args.path}`
+  if (name === 'replace_in_file') return `修改 ${args.path}`
+  if (name === 'run_command') return `运行 ${String(args.command ?? '').replaceAll(`${root}/`, '').replaceAll(root, '.').slice(0, 120)}`
+  if (name === 'finish') return '写总结'
+  return String(name)
+}
 
 /** A command as it reads in the run log: relative to the worktree (the absolute root says nothing) with its outcome. */
 function describeCommand(command, output) {
@@ -253,6 +265,7 @@ try {
       } catch (error) {
         output = `error: ${error instanceof Error ? error.message : String(error)}`
       }
+      progress(`第 ${step} 步 · ${progressLabel(name, args)}`)
       console.error(`[chat-builder] step ${step} ${name}${args.path ? ` ${args.path}` : ''}${args.command ? ` ${describeCommand(args.command, output)}` : ''}${String(output).startsWith('error: ') ? ` → ${String(output).slice(0, 160)}` : ''}`)
       messages.push({ role: 'tool', tool_call_id: call.id, content: String(output) })
     }

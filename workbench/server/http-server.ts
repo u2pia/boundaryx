@@ -10,6 +10,8 @@ import type { LocalEvidenceStore } from './local-evidence-store.ts'
 import { LocalGitAuthority } from './local-git-authority.ts'
 import { LocalReleaseAuthority } from './local-release-authority.ts'
 import { requestContext, type RequestContext } from './request-context.ts'
+import { probeAgentProvider } from './provider-probe.ts'
+import { agentRunProgress } from './run-progress.ts'
 import { createSessionToken } from './security.ts'
 import { AppError, type AgentRunner, type AgentRunnerDescriptor, type CodeHostKind, type MergeMode, type ProjectRole, type SessionActor, type TeamRole } from './types.ts'
 
@@ -374,9 +376,30 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         return sendJson(response, 200, { settings })
       }
 
+      // Tries the settings in the form, saved or not, with one short request. The key is the one typed, else the
+      // configured environment variable, else the stored one; the stored key is only sent to the base URL it was
+      // saved for, so editing the URL cannot make the server hand the secret to another host.
+      if (method === 'POST' && path === '/api/settings/agent-provider/test') {
+        requireRole(actor, ['owner'])
+        const body = await readJson(request)
+        const wireApi = requireString(body, 'wireApi')
+        if (!['responses', 'chat'].includes(wireApi)) throw new AppError(400, 'wireApi must be responses or chat', 'invalid_wire_api')
+        const baseUrl = requireString(body, 'baseUrl')
+        if (!/^https?:\/\//u.test(baseUrl)) throw new AppError(400, 'baseUrl must be an http(s) URL', 'invalid_base_url')
+        const stored = database.getAgentProviderSettings()
+        const apiKeyEnv = optionalString(body, 'apiKeyEnv')
+        let apiKey = typeof body.apiKey === 'string' && body.apiKey.trim() ? body.apiKey.trim() : apiKeyEnv ? process.env[apiKeyEnv] : undefined
+        if (!apiKey && body.apiKey === undefined && stored?.apiKey) {
+          if (stored.baseUrl.trim().replace(/\/+$/u, '') !== baseUrl.replace(/\/+$/u, '')) throw new AppError(400, 'The stored API key is only sent to the base URL it was saved for; type the key to test another URL', 'provider_test_key_withheld')
+          apiKey = stored.apiKey
+        }
+        const result = await probeAgentProvider({ providerId: requireString(body, 'providerId'), model: requireString(body, 'model'), baseUrl, wireApi: wireApi as 'responses' | 'chat', apiKey })
+        return sendJson(response, 200, { result })
+      }
+
       if (method === 'GET' && path === '/api/work-items') return sendJson(response, 200, { workItems: database.listWorkItems(scope()) })
 
-      if (method === 'GET' && path === '/api/agent-runs') return sendJson(response, 200, { agentRuns: database.listAgentRuns(scope()) })
+      if (method === 'GET' && path === '/api/agent-runs') return sendJson(response, 200, { agentRuns: database.listAgentRuns(scope()).map((run) => ({ ...run, progress: agentRunProgress(database, run) })) })
 
       if (method === 'POST' && path === '/api/agent-runs') {
         if (!agentRunner) throw new AppError(503, 'Local Agent Runner is not configured', 'agent_runner_unavailable')

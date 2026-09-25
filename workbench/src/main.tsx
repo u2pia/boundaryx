@@ -71,8 +71,8 @@ import { criteriaSyntaxHint, criticalityLabels, inspectStatement, intentTemplate
 import type { WorkbenchState } from './store-model'
 import { useWorkbench } from './use-workbench'
 import { useLocalControlPlane } from './local-control-plane-context'
-import type { LocalActor, LocalActorUpdate, LocalAgentRunDetail, LocalAgentRuntimeDescriptor, LocalWorkItem, LocalCodeHostConnection, LocalProject, LocalProjectInput, LocalProjectRole, LocalIdentityMode, LocalChangeProposal, LocalEvidencePackageView, LocalIntentVersion, LocalReviewAssignment, LocalReviewReadiness } from './local-control-plane-client'
-import { DEMO_PROJECT_ID } from './local-control-plane-client'
+import type { LocalActor, LocalActorUpdate, LocalAgentRun, LocalAgentRunDetail, LocalAgentRuntimeDescriptor, LocalWorkItem, LocalCodeHostConnection, LocalProject, LocalProjectInput, LocalProjectRole, LocalIdentityMode, LocalChangeProposal, LocalEvidencePackageView, LocalIntentVersion, LocalReviewAssignment, LocalReviewReadiness } from './local-control-plane-client'
+import { DEMO_PROJECT_ID, localControlPlaneClient, type LocalAgentProviderTestResult } from './local-control-plane-client'
 import './styles.css'
 
 type Page = '总览' | 'Intents' | '上下文' | 'Agent Runs' | '评审队列' | '发布' | '评估' | '证据中心' | '追溯' | '策略' | '反馈闭环' | '集成' | '项目' | '团队' | '度量'
@@ -810,7 +810,8 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
         {approvalError && <p className="local-form-error" role="alert">{approvalError}</p>}
         {local.workItems.length > 0 && <div className="local-work-items">{local.workItems.map((item) => {
           const intent = latestIntentFor(item.id)
-          return <article key={item.id} className="local-work-item-row" onClick={() => setOpenWorkItemId(item.id)}><span className={`local-product-type ${item.productType}`}>{item.productType === 'agent_system' ? 'AGENT' : 'APP'}</span><div><button className="local-work-item-open" onClick={(event) => { event.stopPropagation(); setOpenWorkItemId(item.id) }} title="查看 Intent 详情"><strong>{workItemLabel(item)}</strong></button><small>{item.id} · {intent ? `v${intent.version} · ${riskLabels[intent.riskLevel]} · ${intent.contentDigest.slice(7, 19)}` : item.authorityRef}</small></div>{intent && <div className="local-intent-approval"><span className={`local-status ${intent.status}`}>{intentStatusLabel(intent)}</span>{intent.status === 'draft' && <button className="secondary-button" disabled={approvingId === intent.id || !canApproveIntent(intent)} title={approveIntentTitle(intent)} onClick={(event) => { event.stopPropagation(); void approveIntent(intent.id) }}><ShieldCheck size={13} />{approvingId === intent.id ? '批准中' : '批准 Intent'}</button>}</div>}<code>{item.updatedAt.slice(0, 16).replace('T', ' ')}<span className="local-work-item-more">详情<ChevronRight size={13} /></span></code></article>
+          const runInFlight = local.agentRuns.find((run) => run.workItemId === item.id && (run.status === 'queued' || run.status === 'running'))
+          return <article key={item.id} className={`local-work-item-row${runInFlight ? ' has-run' : ''}`} onClick={() => setOpenWorkItemId(item.id)}><span className={`local-product-type ${item.productType}`}>{item.productType === 'agent_system' ? 'AGENT' : 'APP'}</span><div><button className="local-work-item-open" onClick={(event) => { event.stopPropagation(); setOpenWorkItemId(item.id) }} title="查看 Intent 详情"><strong>{workItemLabel(item)}</strong></button><small>{item.id} · {intent ? `v${intent.version} · ${riskLabels[intent.riskLevel]} · ${intent.contentDigest.slice(7, 19)}` : item.authorityRef}</small></div>{intent && <div className="local-intent-approval"><span className={`local-status ${intent.status}`}>{intentStatusLabel(intent)}</span>{intent.status === 'draft' && <button className="secondary-button" disabled={approvingId === intent.id || !canApproveIntent(intent)} title={approveIntentTitle(intent)} onClick={(event) => { event.stopPropagation(); void approveIntent(intent.id) }}><ShieldCheck size={13} />{approvingId === intent.id ? '批准中' : '批准 Intent'}</button>}</div>}<code>{item.updatedAt.slice(0, 16).replace('T', ' ')}<span className="local-work-item-more">详情<ChevronRight size={13} /></span></code>{runInFlight && <LocalRunProgress run={runInFlight} />}</article>
         })}</div>}
         {openWorkItemId && local.workItems.some((item) => item.id === openWorkItemId) && <LocalIntentDrawer workItemId={openWorkItemId} onClose={() => setOpenWorkItemId(undefined)} approval={{ can: canApproveIntent, title: approveIntentTitle, approvingId, error: approvalError, approve: approveIntent }} />}
       </section>}
@@ -825,6 +826,41 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
       </DemoRegion>
     </>
   )
+}
+
+function durationLabel(ms: number) {
+  const seconds = Math.max(0, Math.round(ms / 1000))
+  return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
+}
+
+const checkConclusionLabels: Record<string, string> = { success: '通过', failure: '失败', neutral: '中性', cancelled: '取消' }
+
+/** The running Run of a work item, on its row: stage, time used, and the latest steps the Builder reported. */
+function LocalRunProgress({ run }: { run: LocalAgentRun }) {
+  const progress = run.progress
+  const now = Date.now()
+  const stage = progress?.stage ?? (run.status === 'queued' ? 'queued' : 'building')
+  const stageLabel = run.cancellationRequestedAt ? '正在取消' : stage === 'queued' ? '排队中，等待空闲的 Runner' : stage === 'building' ? 'Agent 正在改代码' : '改动已提交，正在运行检查'
+  const startedAt = progress?.startedAt ? Date.parse(progress.startedAt) : undefined
+  const deadlineAt = progress?.deadlineAt ? Date.parse(progress.deadlineAt) : undefined
+  const share = startedAt !== undefined && deadlineAt !== undefined && deadlineAt > startedAt ? Math.min(1, (now - startedAt) / (deadlineAt - startedAt)) : undefined
+  const steps = progress?.builderSteps
+  const latest = steps?.recent.at(-1)
+  const checks = progress?.checks
+  return <div className={`local-run-progress ${stage}`} onClick={(event) => event.stopPropagation()}>
+    <div className="local-run-progress-head">
+      <span className="local-run-progress-stage"><i />{stageLabel}</span>
+      <small>{run.id}{startedAt !== undefined ? ` · 已运行 ${durationLabel(now - startedAt)}` : ''}{stage === 'building' && deadlineAt !== undefined ? ` · 上限 ${durationLabel(deadlineAt - (startedAt ?? now))}` : ''}</small>
+    </div>
+    {stage === 'building' && share !== undefined && <div className="local-run-progress-bar" title="Agent 已用时间 / 时间上限；到上限时已有改动会标为部分变更交出"><span style={{ width: `${Math.round(share * 100)}%` }} /></div>}
+    {stage === 'building' && (latest
+      ? <div className="local-run-progress-steps">
+          <p><em>Builder 自报</em>第 {steps!.total} 条 · {latest.summary}<small>{latest.at ? ` · ${durationLabel(now - Date.parse(latest.at))}前` : ''}</small></p>
+          {steps!.recent.slice(0, -1).reverse().map((step, index) => <p className="earlier" key={`${step.at}-${index}`}>{step.summary}</p>)}
+        </div>
+      : <p className="local-run-progress-note">Builder 还没有报告步骤；它读完需求后会开始报告。</p>)}
+    {stage === 'checking' && checks && <p className="local-run-progress-note">检查已完成 {checks.done} 项{checks.declared ? `（项目声明 ${checks.declared} 项，另含基线与完整性检查）` : ''}{checks.failed ? ` · ${checks.failed} 项失败` : ''}{checks.latest ? ` · 最近：${checks.latest.name} ${checkConclusionLabels[checks.latest.conclusion] ?? checks.latest.conclusion}` : ''}</p>}
+  </div>
 }
 
 function StageBadge({ stage }: { stage: string }) {
@@ -1910,7 +1946,8 @@ const providerPresets: Record<string, { providerId: string; model: string; baseU
   deepseek: { providerId: 'deepseek', model: 'deepseek-chat', baseUrl: 'https://api.deepseek.com/v1', wireApi: 'chat', note: 'OpenAI 兼容 Chat Completions。' },
   openai: { providerId: 'openai', model: 'gpt-5.1-codex', baseUrl: 'https://api.openai.com/v1', wireApi: 'responses', note: 'Responses API。' },
   ica: { providerId: 'ica', model: 'gpt-5.6-sol', baseUrl: 'https://api.servicesessentials.ibm.com/v1', wireApi: 'responses', note: '当前 codex 全局配置使用的内网网关。' },
-  anthropic: { providerId: 'anthropic', model: 'claude-opus-5', baseUrl: 'https://api.anthropic.com', wireApi: 'chat', note: '由 Claude Code 引擎执行（服务需以 --claude 启动）：base_url 与密钥以 ANTHROPIC_* 环境变量注入。' },
+  'local-claude': { providerId: 'anthropic', model: 'claude-opus-5-5', baseUrl: 'https://api.servicesessentials.ibm.com', wireApi: 'chat', note: '本机 Claude Code：API Key 留空（已存的请清除），Claude Code 沿用本机登录与 ~/.claude/settings.json 里的网关 token，密钥不进 Control Plane。' },
+  anthropic: { providerId: 'anthropic', model: 'claude-opus-5', baseUrl: 'https://api.anthropic.com', wireApi: 'chat', note: '由 Claude Code 引擎执行（未用 --claude 指定时自动使用本机安装的 Claude Code）：base_url 与密钥以 ANTHROPIC_* 环境变量注入。' },
 }
 
 /**
@@ -1927,8 +1964,24 @@ function LocalAgentProviderPanel() {
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string>()
   const [error, setError] = useState<string>()
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<LocalAgentProviderTestResult>()
   if (local.status !== 'ready' || !local.agentProviderReadable) return null
   const canEdit = local.actor?.role === 'owner'
+  // Tries what is in the form, saved or not; an untouched key field lets the server use the stored key.
+  const test = async () => {
+    setTesting(true)
+    setError(undefined)
+    setTestResult(undefined)
+    try {
+      const { result } = await localControlPlaneClient.testAgentProviderSettings({ providerId: input.providerId.trim(), model: input.model.trim(), baseUrl: input.baseUrl.trim(), wireApi: input.wireApi, apiKey: apiKey.trim() || undefined, apiKeyEnv: input.apiKeyEnv.trim() || undefined })
+      setTestResult(result)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setTesting(false)
+    }
+  }
   const applyPreset = (key: string) => {
     const preset = providerPresets[key]
     if (!preset) return
@@ -1960,7 +2013,7 @@ function LocalAgentProviderPanel() {
   }
   // Mirrors scripts/agents/builder.mjs, which picks the engine from these same fields at each run.
   const anthropicProvider = input.providerId.trim() === 'anthropic' || /(^|\.)anthropic\.com(\/|:|$)/u.test(input.baseUrl.replace(/^https?:\/\//u, ''))
-  const engineNote = anthropicProvider ? 'Anthropic API → Claude Code 引擎：服务启动参数需含 --claude <路径>。' : input.wireApi === 'responses' ? 'Responses API → Codex 引擎：服务启动参数需含 --codex <路径>；新版 Codex 只支持 responses。' : 'Chat Completions → 内置 Chat Builder：直接调用 Base URL 的 /chat/completions，不依赖任何 Agent CLI，适用于 DeepSeek、Qwen、OpenAI、vLLM、Ollama 等 OpenAI 兼容接口。'
+  const engineNote = anthropicProvider ? 'Anthropic API → Claude Code 引擎：启动参数未用 --claude 指定时，自动使用本机安装的 Claude Code（PATH、~/.local/bin 或 VS Code 扩展自带的最新版本）；API Key 留空则沿用它自己的登录与 ~/.claude/settings.json。' : input.wireApi === 'responses' ? 'Responses API → Codex 引擎：服务启动参数需含 --codex <路径>；新版 Codex 只支持 responses。' : 'Chat Completions → 内置 Chat Builder：直接调用 Base URL 的 /chat/completions，不依赖任何 Agent CLI，适用于 DeepSeek、Qwen、OpenAI、vLLM、Ollama 等 OpenAI 兼容接口。'
   const keySource = current?.apiKeySet ? `Control Plane 已存密钥 · 以 ${local.agentProviderKeyVariable} 注入` : current?.apiKeyEnv ? `读取服务进程环境变量 ${current.apiKeyEnv}` : '无密钥：回退到 Agent CLI 自身凭证'
   return <section className="panel local-provider-panel">
     <div className="local-core-heading">
@@ -1983,12 +2036,14 @@ function LocalAgentProviderPanel() {
     </div>
     <div className="local-provider-actions">
       <button className="primary-button" disabled={!canEdit || busy || !input.providerId.trim() || !input.model.trim() || !input.baseUrl.trim()} onClick={() => void save(false)}><Save size={13} />{busy ? '保存中' : '保存 Provider'}</button>
+<button className="secondary-button" disabled={!canEdit || testing || !input.providerId.trim() || !input.model.trim() || !input.baseUrl.trim()} title="用表单里的配置发一条很短的请求，不保存" onClick={() => void test()}><Zap size={12} />{testing ? '测试中…' : '测试连接'}</button>
       {current?.apiKeySet && <button className="secondary-button" disabled={!canEdit || busy} onClick={() => void save(true)}><X size={12} />清除已存密钥</button>}
       <small><KeyRound size={11} />{keySource}</small>
     </div>
     <p className="local-run-notice" role="status"><Bot size={11} />执行引擎按此配置自动选择：{engineNote}</p>
     {!canEdit && <p className="local-run-notice" role="status"><ShieldAlert size={11} />只有 Owner 能修改 Provider；当前角色为只读。</p>}
     {current && <p className="local-run-notice" role="status"><Clock3 size={11} />当前配置由 {local.actors.find((item) => item.id === current.updatedByActorId)?.displayName ?? current.updatedByActorId} 于 {new Date(current.updatedAt).toLocaleString()} 保存；密钥以明文存于本地 SQLite，若不希望落盘请改用环境变量字段。</p>}
+    {testResult && <p className={testResult.ok ? 'local-run-notice' : 'local-form-error'} role="status">{testResult.ok ? <Check size={11} /> : <ShieldAlert size={11} />}{testResult.ok ? `连接成功 · ${testResult.engine === 'claude-code' ? '本机 Claude Code' : testResult.endpoint} · ${(testResult.latencyMs / 1000).toFixed(1)} 秒 · 模型回复「${testResult.reply}」` : `连接失败：${testResult.error}${testResult.detail ? `。服务商返回：${testResult.detail}` : ''}`}</p>}
     {error && <p className="local-form-error" role="alert">{error}</p>}
     {notice && !error && <p className="local-run-notice" role="status"><Check size={11} />{notice}</p>}
   </section>

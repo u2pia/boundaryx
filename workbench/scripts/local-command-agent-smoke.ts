@@ -10,6 +10,7 @@ import { LocalCommandAgentRunner } from '../server/local-command-agent-runner.ts
 import { LocalEvidenceStore } from '../server/local-evidence-store.ts'
 import { LocalRunPostprocessor } from '../server/local-run-postprocessor.ts'
 import { loadProjectManifest } from '../server/project-manifest.ts'
+import { agentRunProgress, readBuilderSteps } from '../server/run-progress.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'aperture-local-agent-'))
 const repositoryPath = join(root, 'repository')
@@ -43,7 +44,7 @@ git('add', '.aperture/project.json')
 git('commit', '-m', 'invalid exposed evaluation dataset')
 assert.throws(() => loadProjectManifest(repositoryPath, git('rev-parse', 'HEAD')), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'evaluation_dataset_context_exposed')
 git('reset', '--hard', initialSha)
-writeFileSync(agentScript, `import { readFileSync, writeFileSync } from 'node:fs'\nconst request = JSON.parse(readFileSync(process.env.APERTURE_RUN_REQUEST, 'utf8'))\nreadFileSync('README.md', 'utf8')\nconsole.log(JSON.stringify({ type: 'context_consumed', path: 'README.md' }))\nconsole.log(JSON.stringify({ type: 'context_consumed', path: '../outside.txt' }))\nconsole.log(JSON.stringify({ type: 'message', summary: 'Implemented the requested local change.' }))\nconst untilDeadline = Number(process.env.APERTURE_RUN_DEADLINE) - Date.now()\nconsole.log(JSON.stringify({ type: 'message', summary: untilDeadline > 0 && untilDeadline <= 10000 ? 'deadline ahead' : 'deadline missing' }))\nconst goal = request.intent.goal\nif (goal.includes('时间预算') && !request.revision) console.log(JSON.stringify({ type: 'message', summary: 'Stopped at the time budget; feature.ts only.', stopped: 'time_budget' }))\nconst mode = goal.includes('缺失指标') ? 'missing' : goal.includes('低于阈值') ? 'below' : goal.includes('篡改数据集') ? 'tamper' : 'pass'\nif (mode !== 'pass') writeFileSync('evaluation-mode.txt', mode + '\\n')\nif (mode === 'tamper') writeFileSync('evals/dataset.jsonl', '{"id":"tampered"}\\n')\nwriteFileSync('feature.ts', 'export const generatedByAgent = ' + JSON.stringify(request.runId) + '\\n')\n`)
+writeFileSync(agentScript, `import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'\nconst request = JSON.parse(readFileSync(process.env.APERTURE_RUN_REQUEST, 'utf8'))\nappendFileSync(process.env.APERTURE_PROGRESS_FILE, JSON.stringify({ at: new Date().toISOString(), summary: '读取 README.md' }) + '\\n')\nreadFileSync('README.md', 'utf8')\nconsole.log(JSON.stringify({ type: 'context_consumed', path: 'README.md' }))\nconsole.log(JSON.stringify({ type: 'context_consumed', path: '../outside.txt' }))\nconsole.log(JSON.stringify({ type: 'message', summary: 'Implemented the requested local change.' }))\nconst untilDeadline = Number(process.env.APERTURE_RUN_DEADLINE) - Date.now()\nconsole.log(JSON.stringify({ type: 'message', summary: untilDeadline > 0 && untilDeadline <= 10000 ? 'deadline ahead' : 'deadline missing' }))\nconst goal = request.intent.goal\nif (goal.includes('时间预算') && !request.revision) console.log(JSON.stringify({ type: 'message', summary: 'Stopped at the time budget; feature.ts only.', stopped: 'time_budget' }))\nconst mode = goal.includes('缺失指标') ? 'missing' : goal.includes('低于阈值') ? 'below' : goal.includes('篡改数据集') ? 'tamper' : 'pass'\nif (mode !== 'pass') writeFileSync('evaluation-mode.txt', mode + '\\n')\nif (mode === 'tamper') writeFileSync('evals/dataset.jsonl', '{"id":"tampered"}\\n')\nwriteFileSync('feature.ts', 'export const generatedByAgent = ' + JSON.stringify(request.runId) + '\\n')\n`)
 writeFileSync(checkScript, `import { existsSync, readFileSync } from 'node:fs'\nif (!readFileSync('feature.ts', 'utf8').includes('generatedByAgent')) process.exit(1)\nconst mode = existsSync('evaluation-mode.txt') ? readFileSync('evaluation-mode.txt', 'utf8').trim() : 'pass'\nif (mode !== 'missing') console.log(JSON.stringify({ type: 'evaluation_metrics', metrics: { task_success_rate: mode === 'below' ? 0.5 : 1, tool_call_accuracy: 1 } }))\nconsole.log('feature evaluation completed')\n`)
 
 try {
@@ -76,6 +77,16 @@ try {
   // The agent is told when the runner will kill it, within the run's timeout.
   assert.ok(events.some((event) => event.eventType === 'agent_run.message' && event.payload.summary === 'deadline ahead'))
   assert.equal(events.some((event) => event.eventType === 'agent_run.project_manifest_bound'), true)
+  // The Builder's step log goes with the run directory; the runner keeps it as the Builder's own report first.
+  const builderProgress = events.find((event) => event.eventType === 'agent_run.builder_progress')?.payload
+  assert.equal(builderProgress?.source, 'builder_self_report')
+  assert.deepEqual((builderProgress?.steps as { summary: string }[]).map((step) => step.summary), ['读取 README.md'])
+  // A progress file that is missing, or has lines that are not steps, is read as the steps it does hold.
+  const looseProgress = join(root, 'loose-progress.jsonl')
+  writeFileSync(looseProgress, `not json\n${JSON.stringify({ at: 'a', summary: 'one' })}\n{"at":"b"}\n${JSON.stringify({ at: 'c', summary: 'two' })}\n`)
+  assert.deepEqual(readBuilderSteps(looseProgress, 1), { total: 2, recent: [{ at: 'c', summary: 'two' }] })
+  assert.deepEqual(readBuilderSteps(join(root, 'missing-progress.jsonl')), { total: 0, recent: [] })
+  assert.equal(agentRunProgress(database, run), undefined, 'a finished run shows no progress')
   assert.equal(events.some((event) => event.eventType === 'agent_run.context_consumed' && event.payload.declared === true), true)
   assert.equal(events.some((event) => event.eventType === 'agent_run.context_rejected'), true)
   assert.equal(events.some((event) => event.eventType === 'agent_run.check_completed'), true)

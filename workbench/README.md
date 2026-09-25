@@ -104,6 +104,8 @@ npm run build
 npm run server:start
 ```
 
+服务默认只监听 `127.0.0.1`。小团队在同一局域网内使用时，设置 `CONTROL_PLANE_HOST=0.0.0.0`（或本机局域网地址）；此时是明文 HTTP，启动日志会给出警告，只在可信内网使用，或在前面加 TLS 反向代理。试用团队的上手说明见 `docs/TEAM_QUICKSTART.md`。
+
 完成首次初始化（创建 Owner）后，`npm run seed:demo` 给默认项目写入一套演示：在数据目录下建一个发票服务示例仓库并接到默认项目，由一个脚本化 Builder（不调模型、不联网）走真实流水线——Run、仓库声明的 Check、`@baseline` 复跑、证据包、审查与合并——留下五条工作项：已合并、待审查、被失败测试阻塞、到时间预算交出的部分变更（批准需书面确认）、Intent 待批准。演示成员（`demo-*`）用随机密码创建、写完即停用，没人能以它们登录；待审查那条留给真实成员来审。默认项目已有工作项时脚本什么都不做；`npm run test:seed-demo` 在临时库上验证这套结果。
 
 真实案例驱动脚本为 `npm run case:real`。它需要显式提供 Owner、Reviewer 密码与目标仓库路径，并要求服务已配置 `CONTROL_PLANE_AGENT_EXECUTABLE` 和 `CONTROL_PLANE_AGENT_ARGS_JSON`。Check、Context 与项目执行策略不再由服务启动变量提供，而是从目标仓库基线 Revision 的 `.aperture/project.json` 加载。脚本不保存明文密码。
@@ -116,7 +118,7 @@ npm run server:start
 | --- | --- | --- |
 | Wire API `chat` | 内置 `chat-builder.mjs`：直接调用 `<Base URL>/chat/completions` 的工具调用循环（列目录、读写文件、替换、在 Worktree 内运行命令） | 无需任何 Agent CLI；DeepSeek、Qwen、OpenAI、vLLM、Ollama 等 OpenAI 兼容接口均可 |
 | Wire API `responses` | `codex-builder.mjs` | 启动参数含 `--codex <路径>`；新版 Codex 已不支持 `wire_api = "chat"` |
-| Provider `anthropic` | `claude-builder.mjs` | 启动参数含 `--claude <路径>` |
+| Provider `anthropic` | `claude-builder.mjs` | 启动参数含 `--claude <路径>`；未指定时自动使用本机的 Claude Code（PATH、`~/.local/bin`、`~/.claude/local`，或 VS Code / Cursor 扩展自带的最新版本）。API Key 留空时它沿用自己的登录与 `~/.claude/settings.json`（含网关与 token），密钥不必存进 Control Plane |
 
 ```bash
 CONTROL_PLANE_AGENT_EXECUTABLE="$(command -v node)" \

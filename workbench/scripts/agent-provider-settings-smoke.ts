@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
+import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from 'node:http'
 import { once } from 'node:events'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -253,7 +253,58 @@ try {
     rmSync(wrapperRoot, { recursive: true, force: true })
   }
 
-  console.log(`agent provider settings smoke passed · ${runId} · owner-only · key never returned · model attested`)
+  // "Test connection" sends one short request with the form's settings. A stand-in provider records the key it got.
+  const probeKeys: (string | undefined)[] = []
+  const provider = createServer((incoming, outgoing) => {
+    probeKeys.push(incoming.headers.authorization)
+    incoming.resume()
+    incoming.on('end', () => incoming.url === '/v1/chat/completions'
+      ? outgoing.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'OK' } }] }))
+      : outgoing.writeHead(404).end(`no such route; you sent ${incoming.headers.authorization}`))
+  })
+  await new Promise<void>((done) => provider.listen(0, '127.0.0.1', done))
+  const probeBase = `http://127.0.0.1:${(provider.address() as { port: number }).port}`
+  try {
+    type ProbeResult = { result: { ok: boolean; engine: string; error?: string; detail?: string; reply?: string } }
+    const testForm = { providerId: 'deepseek', model: 'deepseek-chat', baseUrl: `${probeBase}/v1`, wireApi: 'chat' }
+    assert.equal((await request('/api/settings/agent-provider/test', { cookie: maintainerCookie, body: testForm })).status, 403)
+    // The stored key was saved for another host, so it is not sent to this one.
+    const withheld = await request<{ error: { code: string } }>('/api/settings/agent-provider/test', { cookie: ownerCookie, body: testForm })
+    assert.equal(withheld.status, 400)
+    assert.equal(withheld.body?.error.code, 'provider_test_key_withheld')
+    assert.equal(probeKeys.length, 0)
+    const typed = await request<ProbeResult>('/api/settings/agent-provider/test', { cookie: ownerCookie, body: { ...testForm, apiKey: otherSecret } })
+    assert.equal(typed.body?.result.ok, true, typed.text)
+    assert.equal(typed.body?.result.reply, 'OK')
+    assert.deepEqual(probeKeys, [`Bearer ${otherSecret}`])
+    // A wrong URL is explained, and whatever the provider echoes back has the key scrubbed out.
+    const wrongPath = await request<ProbeResult>('/api/settings/agent-provider/test', { cookie: ownerCookie, body: { ...testForm, baseUrl: `${probeBase}/wrong`, apiKey: otherSecret } })
+    assert.equal(wrongPath.body?.result.ok, false)
+    assert.match(wrongPath.body?.result.error ?? '', /404/u)
+    assert.equal(wrongPath.text.includes(otherSecret), false)
+    assert.match(wrongPath.body?.result.detail ?? '', /Bearer \*\*\*/u)
+    // With the stored key's own host it is used; nothing is saved by a test.
+    await request('/api/settings/agent-provider', { cookie: ownerCookie, body: { ...testForm, apiKey: secret } })
+    const stored = await request<ProbeResult>('/api/settings/agent-provider/test', { cookie: ownerCookie, body: { ...testForm, model: 'deepseek-reasoner' } })
+    assert.equal(stored.body?.result.ok, true, stored.text)
+    assert.equal(probeKeys.at(-1), `Bearer ${secret}`)
+    assert.equal(database.getAgentProviderView()?.model, 'deepseek-chat')
+    // Anthropic without a key runs on the local Claude Code; with none installed the test says so.
+    const saved = { HOME: process.env.HOME, PATH: process.env.PATH }
+    process.env.HOME = root
+    process.env.PATH = ''
+    try {
+      const noClaude = await request<ProbeResult>('/api/settings/agent-provider/test', { cookie: ownerCookie, body: { providerId: 'anthropic', model: 'claude-opus-5-5', baseUrl: `${probeBase}/v1`, wireApi: 'chat', apiKey: '' } })
+      assert.equal(noClaude.body?.result.engine, 'claude-code', noClaude.text)
+      assert.match(noClaude.body?.result.error ?? '', /没有找到 Claude Code/u)
+    } finally {
+      Object.assign(process.env, saved)
+    }
+  } finally {
+    provider.close()
+  }
+
+  console.log(`agent provider settings smoke passed · ${runId} · owner-only · key never returned · model attested · connection test`)
 } finally {
   database.close()
   rmSync(root, { recursive: true, force: true })

@@ -13,6 +13,9 @@ const workbenchDirectory = resolve(serverDirectory, '..')
 const dataDirectory = resolve(process.env.CONTROL_PLANE_DATA_DIR ?? joinDefault(workbenchDirectory, '.aperture'))
 const databasePath = resolve(process.env.CONTROL_PLANE_DB ?? joinDefault(dataDirectory, 'control-plane.db'))
 const port = Number(process.env.CONTROL_PLANE_PORT ?? 8787)
+// Loopback by default. A small team on one LAN sets CONTROL_PLANE_HOST=0.0.0.0 (or the machine's LAN address).
+const host = process.env.CONTROL_PLANE_HOST ?? '127.0.0.1'
+const loopback = host === '127.0.0.1' || host === '::1' || host === 'localhost'
 
 function joinDefault(...parts: string[]) {
   return parts.join('/')
@@ -29,8 +32,9 @@ const codeHostSyncSeconds = Number(process.env.CONTROL_PLANE_CODE_HOST_SYNC_SECO
 codeHostSyncer.start(codeHostSyncSeconds)
 const server = createControlPlaneServer({ database, staticDirectory: resolve(workbenchDirectory, 'dist'), agentRunner: configuredAgent.runner, agentRunQueue, agentRuntimeDescriptor: configuredAgent.descriptor, evidenceStore: configuredAgent.evidenceStore, githubOAuth, codeHostSyncer })
 
-server.listen(port, '127.0.0.1', () => {
-  console.log(`${new Date().toISOString()} Local Control Plane listening on http://127.0.0.1:${port}`)
+server.listen(port, host, () => {
+  console.log(`${new Date().toISOString()} Local Control Plane listening on http://${host}:${port}`)
+  if (!loopback) console.log('Warning: reachable from the network over plain HTTP; passwords and session cookies travel unencrypted. Keep it on a trusted LAN or put a TLS proxy in front.')
   console.log(`SQLite: ${databasePath}`)
   console.log(`Agent Runner: ${configuredAgent.runner?.id ?? 'disabled'} · ${configuredAgent.descriptor.status} · ${configuredAgent.descriptor.isolation}`)
   console.log(`Identity: ${database.getIdentityMode()} mode · GitHub sign-in ${githubOAuth ? `configured · callback ${githubOAuth.redirectUri}` : 'not configured'}`)

@@ -3,6 +3,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import type { ControlPlaneDatabase } from './database.ts'
 import { GitWorktreeAgentRunner, type AgentExecutionRuntime, type AgentRunPostprocessor, type AgentRuntimeContext } from './git-worktree-agent-runner.ts'
+import { progressPathFor } from './run-progress.ts'
 import { seatbeltCommand, type SeatbeltPolicy } from './seatbelt.ts'
 import { sha256 } from './security.ts'
 import type { AgentProviderSettings, AgentRun, AgentRunRequest, AgentRunner, AgentRunnerDescriptor } from './types.ts'
@@ -73,7 +74,7 @@ class LocalProcessRuntime implements AgentExecutionRuntime {
     const deadline = String(Date.now() + context.timeoutMs)
     const policy = this.policy(context)
     const command = policy ? seatbeltCommand(policy, this.input.executable, this.input.args) : { executable: this.input.executable, args: this.input.args }
-    const result = spawnSync(command.executable, command.args, { cwd: context.worktreePath, encoding: 'utf8', timeout: context.timeoutMs, maxBuffer: 20 * 1024 * 1024, env: { ...this.buildEnvironment(), APERTURE_RUN_REQUEST: context.requestPath, APERTURE_WORKTREE: context.worktreePath, APERTURE_RUN_DEADLINE: deadline } })
+    const result = spawnSync(command.executable, command.args, { cwd: context.worktreePath, encoding: 'utf8', timeout: context.timeoutMs, maxBuffer: 20 * 1024 * 1024, env: { ...this.buildEnvironment(), APERTURE_RUN_REQUEST: context.requestPath, APERTURE_WORKTREE: context.worktreePath, APERTURE_RUN_DEADLINE: deadline, APERTURE_PROGRESS_FILE: progressPathFor(context.requestPath) } })
     return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', error: result.error, diagnostic: this.diagnostic(result.stderr ?? '') }
   }
 

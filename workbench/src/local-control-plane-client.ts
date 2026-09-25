@@ -268,6 +268,16 @@ export type LocalAgentRun = {
   workerPid?: number
   cancellationRequestedAt?: string
   completedAt?: string
+  /** Only while queued or running: the stage and checks from recorded events, and the Builder's own step log. */
+  progress?: LocalAgentRunProgress
+}
+
+export type LocalAgentRunProgress = {
+  stage: 'queued' | 'building' | 'checking'
+  startedAt?: string
+  deadlineAt?: string
+  builderSteps: { total: number; recent: Array<{ at: string; summary: string }> }
+  checks: { declared: number; done: number; failed: number; latest?: { name: string; conclusion: string } }
 }
 
 /** A single run plus its event log and the Context it declared at admission, for declared-vs-actual review. */
@@ -301,6 +311,9 @@ export type LocalAgentProviderSettings = {
   updatedByActorId: string
   updatedAt: string
 }
+
+/** One short request to the provider in the form; `error` is a plain-language reason, `detail` the provider's own words. */
+export type LocalAgentProviderTestResult = { ok: boolean; engine: 'anthropic' | 'chat' | 'responses' | 'claude-code'; endpoint: string; status?: number; latencyMs: number; reply?: string; error?: string; detail?: string }
 
 export type LocalAgentProviderInput = {
   providerId: string
@@ -382,6 +395,7 @@ export const localControlPlaneClient = {
   removeProjectMember: (projectId: string, actorId: string) => post<void>(`/api/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(actorId)}/remove`, {}),
   getAgentProviderSettings: () => request<{ settings: LocalAgentProviderSettings | null; apiKeyVariable: string }>('/api/settings/agent-provider'),
   saveAgentProviderSettings: (input: LocalAgentProviderInput) => post<{ settings: LocalAgentProviderSettings }>('/api/settings/agent-provider', input as unknown as Record<string, unknown>),
+  testAgentProviderSettings: (input: LocalAgentProviderInput) => post<{ result: LocalAgentProviderTestResult }>('/api/settings/agent-provider/test', input as unknown as Record<string, unknown>),
   listWorkItems: (projectId?: string) => request<{ workItems: LocalWorkItem[] }>(scoped('/api/work-items', projectId)),
   getWorkItem: (workItemId: string) => request<{ workItem: LocalWorkItem; intentVersions: LocalIntentVersion[] }>(`/api/work-items/${workItemId}`),
   createWorkItem: (input: { title: string; description: string; productType: LocalWorkItem['productType']; ownerActorId?: string; projectId: string }) => post<{ workItem: LocalWorkItem }>('/api/work-items', input),
