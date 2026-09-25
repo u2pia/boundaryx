@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
 
 // A Builder Agent with no external CLI: it drives any OpenAI-compatible Chat Completions endpoint (DeepSeek,
@@ -12,10 +12,31 @@ const model = process.env.APERTURE_AGENT_MODEL
 const apiKeyVariable = process.env.APERTURE_AGENT_PROVIDER_API_KEY_ENV
 const apiKey = apiKeyVariable ? process.env[apiKeyVariable] : undefined
 const maxSteps = Number(process.env.APERTURE_BUILDER_MAX_STEPS) || 120
+// The largest conversation this builder sends. Past it the run fails with its own reason, instead of the provider
+// rejecting the request with a context-length error that reads like an outage.
+const maxContextTokens = Number(process.env.APERTURE_BUILDER_MAX_CONTEXT_TOKENS) || 100_000
+// Where the Control Plane reads steps while the run is still going; stdout is only parsed once the process exits.
+const progressPath = process.env.APERTURE_RUN_PROGRESS
 
 if (!requestPath || !worktreePath || !baseUrl || !model) {
   console.error('chat-builder requires APERTURE_RUN_REQUEST, APERTURE_WORKTREE, and a provider with a base URL and model configured in the Control Plane')
   process.exit(2)
+}
+
+/** Nothing this builder writes carries the credential, even if a provider or a command echoed it back. */
+function redact(text) {
+  return apiKey && apiKey.length >= 8 ? String(text).replaceAll(apiKey, '[redacted]') : String(text)
+}
+
+/** A protocol line: on stdout for the Control Plane's event log, and in the progress file for the live view. */
+function emit(value, { live = false } = {}) {
+  const line = redact(JSON.stringify(value))
+  console.log(line)
+  if (live && progressPath) {
+    try {
+      appendFileSync(progressPath, `${line}\n`)
+    } catch {}
+  }
 }
 
 const root = realpathSync(worktreePath)
@@ -30,7 +51,7 @@ for (const declaredPath of request.declaredContextPaths ?? []) {
   contextBytes += Buffer.byteLength(content)
   const normalizedPath = relative(worktreePath, candidate).split(sep).join('/')
   contextSections.push(`\n## Declared context: ${normalizedPath}\n\n${content}`)
-  console.log(JSON.stringify({ type: 'context_consumed', path: normalizedPath }))
+  emit({ type: 'context_consumed', path: normalizedPath })
 }
 
 const criteria = (request.intent.acceptanceCriteria ?? []).map((criterion) => `- [${criterion.criticality}/${criterion.verificationType}] ${criterion.statement}`).join('\n')
@@ -87,11 +108,66 @@ function worktreeFile(path) {
 const commandEnvironment = Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== apiKeyVariable && !key.startsWith('APERTURE_AGENT_')))
 const forbiddenGit = /\bgit\s+(commit|push|reset|rebase|merge|checkout|switch|stash|tag|branch\s+-[dD]|worktree|remote)\b/u
 
-/** A command as it reads in the run log: relative to the worktree (the absolute root says nothing) with its outcome. */
+/** A command as the model wrote it, relative to the worktree (the absolute root says nothing) and bounded. */
+function relativeCommand(command) {
+  const text = String(command).replaceAll(`${root}/`, '').replaceAll(root, '.').replace(/^cd "?\.?"? *&& */u, '')
+  return text.length > 160 ? `${text.slice(0, 160)}…` : text
+}
+
+/** A command as it reads in the run log, with its outcome. */
 function describeCommand(command, output) {
-  const relativeCommand = String(command).replaceAll(`${root}/`, '').replaceAll(root, '.').replace(/^cd "?\.?"? *&& */u, '')
   const status = String(output).split('\n')[0]
-  return `${relativeCommand.length > 160 ? `${relativeCommand.slice(0, 160)}…` : relativeCommand} → ${status.startsWith('exit ') || status.startsWith('failed') ? status : 'rejected'}`
+  return `${relativeCommand(command)} → ${status.startsWith('exit ') || status.startsWith('failed') ? status : 'rejected'}`
+}
+
+/**
+ * One tool call as the run log records it: which tool, on which path or command, and how it ended. Never the file
+ * content written or read, nor the command's output; those stay in the conversation with the model.
+ */
+function toolStep(step, name, args, output, parsed) {
+  const text = String(output)
+  const exit = /^exit (-?\d+|null)/u.exec(text)
+  const outcome = !parsed || text.startsWith('error: ') || text.startsWith('unknown tool') ? 'error' : text.startsWith('not run') ? 'not_run' : exit ? (exit[1] === '0' ? 'ok' : 'failed') : text.startsWith('failed to run') ? 'failed' : 'ok'
+  return {
+    type: 'tool_step',
+    step,
+    tool: String(name ?? 'unknown').slice(0, 64),
+    ...(typeof args.path === 'string' ? { path: args.path.slice(0, 300) } : {}),
+    ...(typeof args.command === 'string' ? { command: relativeCommand(args.command) } : {}),
+    outcome,
+    ...(exit ? { exitCode: exit[1] === 'null' ? null : Number(exit[1]) } : {}),
+    // Only this builder's own messages; an unparsable argument is not quoted, because it may be a file's content.
+    ...(outcome === 'error' ? { error: parsed ? text.replace(/^error: /u, '').slice(0, 160) : 'tool arguments are not valid JSON' } : {}),
+  }
+}
+
+// What the run cost, counted from the provider's own usage report on every response. A provider that reports no
+// usage still has its calls counted, and callsWithUsage says how many of the token figures are backed by a report.
+const usage = { modelCalls: 0, httpRequests: 0, callsWithUsage: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, peakContextTokens: 0, contextBudgetTokens: maxContextTokens }
+function reportUsage() {
+  emit({ type: 'usage', ...usage }, { live: true })
+}
+
+/**
+ * Tokens a text will cost, erring high: about four characters per token for ASCII (code and English) and one per
+ * character otherwise, which is where CJK lands. Only the budget check uses it, never the usage report.
+ */
+function estimateTokens(text) {
+  let ascii = 0
+  let other = 0
+  for (const character of text) {
+    if (character.charCodeAt(0) < 128) ascii += 1
+    else other += 1
+  }
+  return Math.ceil(ascii / 4) + other
+}
+
+// The provider's count for the conversation as of its last response, and how many messages that covered, so the
+// estimate only has to guess the messages added since.
+let reportedContext
+function contextTokens(messages, offered) {
+  if (reportedContext) return reportedContext.tokens + estimateTokens(JSON.stringify(messages.slice(reportedContext.messageCount)))
+  return estimateTokens(JSON.stringify({ messages, tools: offered }))
 }
 
 const handlers = {
@@ -105,7 +181,7 @@ const handlers = {
     const { absolute, relativePath } = worktreeFile(path)
     if (!existsSync(absolute) || !statSync(absolute).isFile()) throw new Error(`${relativePath} is not a file`)
     const content = readFileSync(absolute, 'utf8')
-    console.log(JSON.stringify({ type: 'context_consumed', path: relativePath }))
+    emit({ type: 'context_consumed', path: relativePath })
     const start = Math.max(0, Number(offset) || 0)
     const slice = content.slice(start, start + 60_000)
     return start + slice.length < content.length ? `${slice}\n… truncated at character ${start + slice.length} of ${content.length}; read again with offset` : slice
@@ -140,6 +216,7 @@ async function complete(messages, offered = tools, toolChoice = 'auto') {
   const body = { model, messages, tools: offered, tool_choice: toolChoice, ...(process.env.APERTURE_AGENT_REASONING_EFFORT ? { reasoning_effort: process.env.APERTURE_AGENT_REASONING_EFFORT } : {}) }
   for (let attempt = 1; ; attempt += 1) {
     let response
+    usage.httpRequests += 1
     try {
       response = await fetch(`${baseUrl}/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(300_000) })
     } catch (error) {
@@ -159,6 +236,18 @@ async function complete(messages, offered = tools, toolChoice = 'auto') {
     // The provider's message only, never the request: the request carries the key in a header.
     if (!response.ok) throw new Error(`${baseUrl}/chat/completions → ${response.status}: ${text.slice(0, 500)}`)
     const payload = JSON.parse(text)
+    usage.modelCalls += 1
+    const reported = payload.usage
+    if (reported && Number.isFinite(reported.prompt_tokens)) {
+      const promptTokens = Number(reported.prompt_tokens)
+      const completionTokens = Number.isFinite(reported.completion_tokens) ? Number(reported.completion_tokens) : 0
+      usage.callsWithUsage += 1
+      usage.promptTokens += promptTokens
+      usage.completionTokens += completionTokens
+      usage.totalTokens += Number.isFinite(reported.total_tokens) ? Number(reported.total_tokens) : promptTokens + completionTokens
+      // The reply becomes the next request's last message, so it is part of what the next call pays for.
+      reportedContext = { tokens: promptTokens + completionTokens, messageCount: messages.length + 1 }
+    } else reportedContext = undefined
     const message = payload.choices?.[0]?.message
     if (!message) throw new Error(`${baseUrl}/chat/completions returned no message`)
     return message
@@ -174,8 +263,15 @@ try {
     if (step === maxSteps - 10) messages.push({ role: 'user', content: 'You have 10 steps left. Wrap up: make sure your changes are complete and consistent, then call finish.' })
     const last = step === maxSteps
     if (last) messages.push({ role: 'user', content: 'This is your last step. Call finish now with a summary of what you changed and what is left undone.' })
+    const offered = last ? tools.filter((tool) => tool.function.name === 'finish') : tools
+    const estimated = contextTokens(messages, offered)
+    usage.peakContextTokens = Math.max(usage.peakContextTokens, estimated)
+    if (estimated > maxContextTokens) {
+      emit({ type: 'context_budget_exceeded', step, estimatedTokens: estimated, budgetTokens: maxContextTokens, basis: reportedContext ? 'provider_usage_plus_estimate' : 'estimate' }, { live: true })
+      throw new Error(`chat-builder context budget exceeded at step ${step}: the conversation is about ${estimated} tokens, over the ${maxContextTokens}-token budget (APERTURE_BUILDER_MAX_CONTEXT_TOKENS); the request was not sent`)
+    }
     // Models do not all honour a narrowed tool list, so the last step also forces finish and runs nothing else.
-    const message = await complete(messages, last ? tools.filter((tool) => tool.function.name === 'finish') : tools, last ? { type: 'function', function: { name: 'finish' } } : 'auto')
+    const message = await complete(messages, offered, last ? { type: 'function', function: { name: 'finish' } } : 'auto')
     const calls = message.tool_calls ?? []
     // reasoning_content is not echoed back: some providers reject it in the request.
     messages.push({ role: 'assistant', content: message.content ?? null, ...(calls.length ? { tool_calls: calls } : {}) })
@@ -188,8 +284,11 @@ try {
       const name = call.function?.name
       let args = {}
       let output
+      let parsed = false
       try {
         args = JSON.parse(call.function?.arguments || '{}')
+        if (!args || typeof args !== 'object') args = {}
+        parsed = true
         if (name === 'finish') {
           summary = String(args.summary ?? '').trim() || 'Builder finished without a summary.'
           output = 'ok'
@@ -199,17 +298,20 @@ try {
       } catch (error) {
         output = `error: ${error instanceof Error ? error.message : String(error)}`
       }
-      console.error(`[chat-builder] step ${step} ${name}${args.path ? ` ${args.path}` : ''}${args.command ? ` ${describeCommand(args.command, output)}` : ''}${String(output).startsWith('error: ') ? ` → ${String(output).slice(0, 160)}` : ''}`)
+      emit(toolStep(step, name, args, output, parsed), { live: true })
+      console.error(redact(`[chat-builder] step ${step} ${name}${args.path ? ` ${args.path}` : ''}${args.command ? ` ${describeCommand(args.command, output)}` : ''}${String(output).startsWith('error: ') ? ` → ${String(output).slice(0, 160)}` : ''}`))
       messages.push({ role: 'tool', tool_call_id: call.id, content: String(output) })
     }
   }
 } catch (error) {
-  console.error(error instanceof Error ? error.message : String(error))
+  reportUsage()
+  console.error(redact(error instanceof Error ? error.message : String(error)))
   process.exit(1)
 }
 
+reportUsage()
 if (summary === undefined) {
   console.error(`chat-builder stopped after ${maxSteps} steps without calling finish`)
   process.exit(1)
 }
-console.log(JSON.stringify({ type: 'message', summary: summary.slice(0, 1000) }))
+emit({ type: 'message', summary: summary.slice(0, 1000) })

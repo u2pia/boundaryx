@@ -51,6 +51,8 @@ export interface AgentExecutionRuntime {
   readonly descriptor: AgentRunnerDescriptor
   attest(context: AgentRuntimeContext): AgentRuntimeAttestation
   execute(context: AgentRuntimeContext): AgentRuntimeResult
+  /** Removes every secret this runtime passed to the agent from a text the agent produced. */
+  redact?(text: string): string
 }
 
 export type AgentRunPostprocessorInput = {
@@ -67,13 +69,94 @@ export type AgentRunPostprocessorInput = {
   attestation: AgentRuntimeAttestation
   stdoutDigest?: string
   stderrDigest?: string
+  /** Absent when the builder did not report usage (Codex and Claude Code wrappers today). */
+  modelUsage?: AgentModelUsage
+  toolSteps?: ReturnType<typeof summarizeToolSteps>
 }
 
 export interface AgentRunPostprocessor {
   process(input: AgentRunPostprocessorInput): unknown
 }
 
-type AgentProtocolMessage = { type: 'context_consumed'; path: string } | { type: 'message'; summary: string }
+/** One tool call as the builder reported it: tool, path or command, outcome. Never file content or command output. */
+export type AgentToolStep = { step: number; tool: string; path?: string; command?: string; outcome: 'ok' | 'failed' | 'error' | 'not_run'; exitCode?: number | null; error?: string }
+
+/** What the builder's model calls cost, as the provider reported it on each response. */
+export type AgentModelUsage = { modelCalls: number; httpRequests: number; callsWithUsage: number; promptTokens: number; completionTokens: number; totalTokens: number; peakContextTokens: number; contextBudgetTokens?: number }
+
+export type AgentContextBudgetExceeded = { step: number; estimatedTokens: number; budgetTokens: number; basis: string }
+
+type AgentProtocolMessage =
+  | { type: 'context_consumed'; path: string }
+  | { type: 'message'; summary: string }
+  | ({ type: 'tool_step' } & AgentToolStep)
+  | ({ type: 'usage' } & AgentModelUsage)
+  | ({ type: 'context_budget_exceeded' } & AgentContextBudgetExceeded)
+
+/** The file beside the run request where a builder appends its steps while it runs, for the live view. */
+export function runProgressPath(requestPath: string) {
+  return join(dirname(requestPath), 'progress.jsonl')
+}
+
+const count = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0
+const bounded = (value: unknown, limit: number) => typeof value === 'string' ? value.slice(0, limit) : undefined
+const toolOutcomes = new Set(['ok', 'failed', 'error', 'not_run'])
+
+/**
+ * Parses the builder's JSON lines. Every field is re-bounded here rather than trusted, because the builder is the
+ * party being audited; `redact` removes any secret the runtime passed in before a value reaches an event.
+ */
+export function parseProtocol(stdout: string, redact: (text: string) => string = (text) => text) {
+  const messages: AgentProtocolMessage[] = []
+  for (const line of stdout.split('\n')) {
+    if (!line.trim().startsWith('{')) continue
+    try {
+      const value = JSON.parse(redact(line)) as Record<string, unknown>
+      if (value.type === 'context_consumed' && typeof value.path === 'string') messages.push({ type: 'context_consumed', path: value.path })
+      if (value.type === 'message' && typeof value.summary === 'string') messages.push({ type: 'message', summary: value.summary.slice(0, 1000) })
+      if (value.type === 'tool_step' && typeof value.tool === 'string') {
+        const path = bounded(value.path, 300)
+        const command = bounded(value.command, 200)
+        const error = bounded(value.error, 200)
+        messages.push({
+          type: 'tool_step',
+          step: count(value.step),
+          tool: value.tool.slice(0, 64),
+          ...(path !== undefined ? { path } : {}),
+          ...(command !== undefined ? { command } : {}),
+          outcome: toolOutcomes.has(String(value.outcome)) ? value.outcome as AgentToolStep['outcome'] : 'error',
+          ...(typeof value.exitCode === 'number' || value.exitCode === null ? { exitCode: value.exitCode as number | null } : {}),
+          ...(error !== undefined ? { error } : {}),
+        })
+      }
+      if (value.type === 'usage') messages.push({ type: 'usage', modelCalls: count(value.modelCalls), httpRequests: count(value.httpRequests), callsWithUsage: count(value.callsWithUsage), promptTokens: count(value.promptTokens), completionTokens: count(value.completionTokens), totalTokens: count(value.totalTokens), peakContextTokens: count(value.peakContextTokens), ...(value.contextBudgetTokens !== undefined ? { contextBudgetTokens: count(value.contextBudgetTokens) } : {}) })
+      if (value.type === 'context_budget_exceeded') messages.push({ type: 'context_budget_exceeded', step: count(value.step), estimatedTokens: count(value.estimatedTokens), budgetTokens: count(value.budgetTokens), basis: bounded(value.basis, 64) ?? 'unknown' })
+    } catch {}
+  }
+  return messages
+}
+
+/** Tool steps a running builder has reported so far. The event log is the record; this is only the live view. */
+export function readLiveToolSteps(requestPath: string, redact?: (text: string) => string) {
+  const path = runProgressPath(requestPath)
+  if (!existsSync(path)) return { steps: [] as AgentToolStep[], usage: undefined as AgentModelUsage | undefined }
+  const messages = parseProtocol(readFileSync(path, 'utf8').slice(-2_000_000), redact)
+  const steps = messages.flatMap((message) => message.type === 'tool_step' ? [stripType(message)] : []).slice(-500)
+  const usage = messages.flatMap((message) => message.type === 'usage' ? [stripType(message)] : []).at(-1)
+  return { steps, usage }
+}
+
+function stripType<T extends { type: string }>(message: T): Omit<T, 'type'> {
+  const { type: _type, ...rest } = message
+  return rest
+}
+
+/** Totals for the Evidence Package: how many steps, of which tools, and how many did not succeed. */
+export function summarizeToolSteps(steps: AgentToolStep[]) {
+  const byTool: Record<string, number> = {}
+  for (const step of steps) byTool[step.tool] = (byTool[step.tool] ?? 0) + 1
+  return { total: steps.length, byTool, unsuccessful: steps.filter((step) => step.outcome !== 'ok').length, reportSource: 'agent_protocol' as const, independentlyObserved: false }
+}
 
 function git(repositoryPath: string, args: string[]) {
   try {
@@ -81,19 +164,6 @@ function git(repositoryPath: string, args: string[]) {
   } catch (error) {
     throw new AppError(400, `Git operation failed: ${error instanceof Error ? error.message : String(error)}`, 'git_operation_failed')
   }
-}
-
-function parseProtocol(stdout: string) {
-  const messages: AgentProtocolMessage[] = []
-  for (const line of stdout.split('\n')) {
-    if (!line.trim().startsWith('{')) continue
-    try {
-      const value = JSON.parse(line) as Record<string, unknown>
-      if (value.type === 'context_consumed' && typeof value.path === 'string') messages.push({ type: 'context_consumed', path: value.path })
-      if (value.type === 'message' && typeof value.summary === 'string') messages.push({ type: 'message', summary: value.summary.slice(0, 1000) })
-    } catch {}
-  }
-  return messages
 }
 
 export class GitWorktreeAgentRunner implements AgentRunner {
@@ -199,6 +269,7 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     let stderrDigest: string | undefined
     let changeProposalId: string | undefined
     let diagnostic: string | undefined
+    let postprocessorUsage: Pick<AgentRunPostprocessorInput, 'modelUsage' | 'toolSteps'> = {}
     try {
       const result = this.input.runtime.execute(runtimeContext)
       diagnostic = result.diagnostic
@@ -207,15 +278,35 @@ export class GitWorktreeAgentRunner implements AgentRunner {
       exitCode = result.status ?? undefined
       stdoutDigest = `sha256:${sha256(stdout)}`
       stderrDigest = `sha256:${sha256(stderr)}`
-      for (const message of parseProtocol(stdout)) {
+      const toolSteps: AgentToolStep[] = []
+      let modelUsage: AgentModelUsage | undefined
+      let budgetExceeded: AgentContextBudgetExceeded | undefined
+      for (const message of parseProtocol(stdout, (text) => this.input.runtime.redact?.(text) ?? text)) {
         if (message.type === 'message') this.input.database.recordAgentRunEvent(runId, 'agent_run.message', { summary: message.summary }, actorId)
-        else this.recordContextConsumption(runId, worktreePath, declaredContextPaths, message.path, actorId)
+        else if (message.type === 'context_consumed') this.recordContextConsumption(runId, worktreePath, declaredContextPaths, message.path, actorId)
+        else if (message.type === 'tool_step') {
+          const { type: _type, ...step } = message
+          toolSteps.push(step)
+          this.input.database.recordAgentRunEvent(runId, 'agent_run.tool_step', { ...step, reportSource: 'agent_protocol', independentlyObserved: false }, actorId)
+        } else if (message.type === 'usage') {
+          // A builder reports its running total; the last report is the run's.
+          const { type: _type, ...reported } = message
+          modelUsage = reported
+        } else {
+          const { type: _type, ...exceeded } = message
+          budgetExceeded = exceeded
+          this.input.database.recordAgentRunEvent(runId, 'agent_run.context_budget_exceeded', exceeded, actorId)
+        }
       }
+      if (modelUsage) this.input.database.recordAgentRunEvent(runId, 'agent_run.model_usage', { ...modelUsage, reportSource: 'agent_protocol', independentlyObserved: false }, actorId)
       if (this.input.database.isAgentRunCancellationRequested(runId)) return this.terminal(runId, repositoryPath, actorId, { status: 'cancelled', exitCode, stdoutDigest, stderrDigest, errorMessage: 'Agent run was cancelled while the agent was generating' })
       if (result.error) throw new AppError((result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT' ? 408 : 422, `Agent runtime failed: ${result.error.message}`, 'agent_runtime_failed')
+      // Said in the Control Plane's own words, so the reason does not depend on how the builder phrased its stderr.
+      if (budgetExceeded && result.status !== 0) throw new AppError(422, `Context budget exceeded: at step ${budgetExceeded.step} the conversation was about ${budgetExceeded.estimatedTokens} tokens, over the ${budgetExceeded.budgetTokens}-token budget; the builder stopped before sending it to the provider`, 'agent_context_budget_exceeded')
       // The message keeps the last few lines; the full tail goes to the failure diagnostic event.
       const lastLines = result.diagnostic?.split('\n').slice(-5).join('\n').slice(-800)
       if (result.status !== 0) throw new AppError(422, `Agent exited with status ${result.status ?? 'unknown'}${lastLines ? `: ${lastLines}` : ''}`, 'agent_execution_failed')
+      postprocessorUsage = { modelUsage, toolSteps: toolSteps.length ? summarizeToolSteps(toolSteps) : undefined }
       const changed = git(worktreePath, ['status', '--porcelain'])
       if (!changed) throw new AppError(422, 'Agent completed without producing a repository change', 'agent_empty_change')
       git(worktreePath, ['add', '-A'])
@@ -226,7 +317,7 @@ export class GitWorktreeAgentRunner implements AgentRunner {
         : authority.createChangeProposal({ workItemId: workItem.id, intentVersionId: intent.id, runId, repositoryPath, baseRef: queued.baseRef, headRef: branchRef, authorActorId: actorId }, actorId)
       changeProposalId = proposal.id
       this.input.database.recordAgentRunEvent(runId, revisionProposal ? 'agent_run.change_revised' : 'agent_run.change_proposed', { changeProposalId: proposal.id, previousHeadSha: revisionProposal?.headSha ?? null, headSha: proposal.headSha, changedFiles: proposal.changedFiles, additions: proposal.additions, deletions: proposal.deletions }, actorId)
-      this.input.postprocessor?.process({ runId, actorId, adapterId: this.id, worktreePath, workItem, intent, projectManifest, startSha, revisionOfProposalId: revisionProposal?.id, proposal, attestation, stdoutDigest, stderrDigest })
+      this.input.postprocessor?.process({ runId, actorId, adapterId: this.id, worktreePath, workItem, intent, projectManifest, startSha, revisionOfProposalId: revisionProposal?.id, proposal, attestation, stdoutDigest, stderrDigest, ...postprocessorUsage })
       return this.terminal(runId, repositoryPath, actorId, { status: 'succeeded', changeProposalId: proposal.id, exitCode: result.status ?? 0, stdoutDigest, stderrDigest })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
