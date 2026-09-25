@@ -145,6 +145,47 @@ export class CodeHostSyncer {
     }
   }
 
+  /**
+   * Merges a `host_protected` proposal through the host's API with the server's token, so nobody has to open GitHub.
+   * GitHub still enforces branch protection; the platform only asks once its own gate is green on the host for the
+   * approved head. The Merge Evidence names the person who asked, with their identity, and the host's merger login.
+   */
+  async mergeOnHost(proposalId: string, actorId: string) {
+    const proposal = this.database.getChangeProposal(proposalId)
+    const project = this.database.getProject(proposal.projectId)
+    if (project.mergeMode !== 'host_protected' || project.codeHost !== 'github') throw new AppError(409, `Project ${project.slug} is merged by the control plane; use merge`, 'merge_not_on_host')
+    if (proposal.status === 'merged') return { proposal, evidence: this.database.getMergeEvidence(proposalId), changed: false }
+    if (proposal.status !== 'approved') throw new AppError(409, 'Only an approved change proposal can be merged', 'merge_not_approved')
+    // Team mode refuses a password session here, before anything reaches GitHub.
+    const identity = this.database.decisionIdentity(actorId)
+    // Publishes the head and the gate first, and waits for a sync already running rather than racing it.
+    const report = await this.syncProject(project.id)
+    const failure = report.errors.find((error) => error.proposalId === proposalId || !error.proposalId)
+    if (failure) throw new AppError(502, `Sync with GitHub failed before the merge: ${failure.message}`, failure.code)
+    const current = this.database.getChangeProposal(proposalId)
+    if (current.status === 'merged') return { proposal: current, evidence: this.database.getMergeEvidence(proposalId), changed: false }
+    const link = this.database.getCodeHostLink(proposalId)
+    if (!link || link.state !== 'open' || link.headShaPublished !== current.headSha) throw new AppError(409, 'The approved head is not on an open pull request yet; sync and try again', 'host_pull_request_not_published')
+    const gate = this.gateFor(proposalId)
+    if (gate.state !== 'success' || link.gateStatePublished !== 'success' || link.gateShaPublished !== current.headSha) throw new AppError(409, `The gate is not open: ${gate.description}`, 'merge_evidence_incomplete')
+
+    const host = codeHostFor(project, { dataDirectory: this.database.dataDirectory, env: this.env }) as GithubCodeHost
+    const { mergedSha } = await host.mergePullRequest(link.externalId, current.headSha, this.title(current))
+    // The merge commit landed on the default branch; fetch it so its content can be compared with the approved head.
+    host.prepareForRun()
+    const pull = await host.getPullRequest(link.externalId)
+    const contentCheck = host.compareMergedContent({ approvedHeadSha: current.headSha, baseSha: current.baseSha, mergedSha, commits: pull.commits })
+    try {
+      const evidence = this.database.recordHostMerge({ proposalId, mergedSha, host: { provider: 'github', externalId: link.externalId, url: link.url, mergedBy: pull.mergedBy, hostMergedAt: pull.mergedAt, contentCheck, gateStateAtMerge: 'success', hostHeadSha: pull.headSha, requestedVia: 'control_plane' } }, actorId, identity)
+      this.save(link, { ...link, state: 'merged', lastError: undefined })
+      return { proposal: this.database.getChangeProposal(proposalId), evidence, changed: true }
+    } catch (error) {
+      // A timed sync saw the merge between the API call and here and recorded it first.
+      if (error instanceof AppError && error.code === 'proposal_merged') return { proposal: this.database.getChangeProposal(proposalId), evidence: this.database.getMergeEvidence(proposalId), changed: false }
+      throw error
+    }
+  }
+
   /** Host checks become external checks named `github/…`; only a change in status or conclusion is recorded. */
   private importChecks(proposal: ChangeProposal, checks: Awaited<ReturnType<GithubCodeHost['listChecks']>>, url: string) {
     const recorded = new Map(this.database.getReviewReadiness(proposal.id).checks.map((check) => [check.name, check]))

@@ -188,6 +188,8 @@ export type HostMergeRecord = {
   hostHeadSha?: string
   /** The `aperture/gate` status the platform had published for the approved head when the host merged. */
   gateStateAtMerge: 'pending' | 'success' | 'failure' | 'unpublished'
+  /** Set when a person asked the platform to merge through the host's API rather than merging on the host. */
+  requestedVia?: 'control_plane'
   outsideGate: boolean
   outsideGateReasons: string[]
 }

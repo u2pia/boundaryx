@@ -212,6 +212,27 @@ export class GithubCodeHost implements CodeHost {
     return { externalId: String(pull.number), url: pull.html_url, state: pull.state, merged: Boolean(pull.merged || pull.merged_at), mergedSha: pull.merge_commit_sha ?? undefined, mergedBy: pull.merged_by?.login, mergedAt: pull.merged_at ?? undefined, headSha: pull.head.sha, commits: pull.commits ?? 1 }
   }
 
+  /**
+   * Asks GitHub to merge the pull request at exactly `headSha`, so a commit pushed after approval is never merged.
+   * GitHub still applies branch protection: a missing required check or review refuses the merge with its reason.
+   * The repository's allowed merge methods are tried in turn, merge commit first.
+   */
+  async mergePullRequest(externalId: string, headSha: string, title: string) {
+    for (const method of ['merge', 'squash', 'rebase'] as const) {
+      try {
+        const merged = await this.api<{ sha: string; merged: boolean; message?: string }>('PUT', `/pulls/${encodeURIComponent(externalId)}/merge`, { sha: headSha, merge_method: method, ...(method === 'rebase' ? {} : { commit_title: title }) })
+        if (!merged.merged || !merged.sha) throw new AppError(409, `GitHub did not merge pull request #${externalId}: ${merged.message ?? 'no reason given'}`, 'host_merge_refused')
+        return { mergedSha: merged.sha, method }
+      } catch (error) {
+        // 405 is also what a disallowed merge method returns; only that case moves on to the next method.
+        if (error instanceof AppError && error.code === 'host_merge_refused' && /merge method|not allowed|not enabled/iu.test(error.message) && method !== 'rebase') continue
+        if (error instanceof AppError && error.code === 'code_host_conflict') throw new AppError(409, `The pull request's head is no longer the approved ${headSha.slice(0, 12)}; sync and review again`, 'merge_head_drift')
+        throw error
+      }
+    }
+    throw new AppError(409, `No merge method is allowed on ${this.descriptor.repository}`, 'host_merge_refused')
+  }
+
   /** Check runs and commit statuses on a revision, minus the platform's own gate status. */
   async listChecks(sha: string): Promise<HostCheck[]> {
     const runs = await this.api<{ check_runs: Array<{ name: string; status: string; conclusion: string | null }> }>('GET', `/commits/${sha}/check-runs?per_page=100`)
@@ -295,6 +316,8 @@ export class GithubCodeHost implements CodeHost {
       try {
         message = String((JSON.parse(text) as { message?: unknown }).message ?? message)
       } catch {}
+      // 405 and 409 are GitHub refusing a merge (branch protection, a moved head), not the API failing.
+      if (response.status === 405 || response.status === 409) throw new AppError(409, `GitHub refused ${method} ${path}: ${message}`, response.status === 409 ? 'code_host_conflict' : 'host_merge_refused')
       const code = response.status === 401 ? 'code_host_unauthorized' : response.status === 404 ? 'code_host_not_found' : response.status === 403 ? 'code_host_forbidden' : 'code_host_api_failed'
       throw new AppError(response.status === 404 ? 404 : 502, `GitHub API ${method} ${path || '/'} → ${response.status}: ${message}`, code)
     }

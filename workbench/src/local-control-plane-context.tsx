@@ -100,7 +100,7 @@ type LocalControlPlaneContextValue = {
   rejectChangeProposal: (proposal: LocalChangeProposal, reason: string) => Promise<void>
   assignReviewer: (proposalId: string, input: { assigneeActorId?: string; dueHours?: number; reason?: string }) => Promise<void>
   approveIntentVersion: (intentVersionId: string, comment: string) => Promise<void>
-  mergeChangeProposal: (proposalId: string) => Promise<LocalMergeEvidence>
+  mergeChangeProposal: (proposalId: string, options?: { onHost?: boolean }) => Promise<LocalMergeEvidence>
   reviseChangeProposal: (proposalId: string) => Promise<void>
   createReleaseCandidate: (proposalId: string) => Promise<void>
   approveReleaseCandidate: (candidateId: string, comment: string) => Promise<void>
@@ -461,8 +461,8 @@ export function LocalControlPlaneProvider({ children }: { children: ReactNode })
     await loadAuthenticatedData()
   }, [loadAuthenticatedData])
 
-  const mergeChangeProposal = useCallback(async (proposalId: string) => {
-    const result = await localControlPlaneClient.mergeChangeProposal(proposalId)
+  const mergeChangeProposal = useCallback(async (proposalId: string, options: { onHost?: boolean } = {}) => {
+    const result = await (options.onHost ? localControlPlaneClient.mergeChangeProposalOnHost(proposalId) : localControlPlaneClient.mergeChangeProposal(proposalId))
     await loadAuthenticatedData()
     return result.evidence
   }, [loadAuthenticatedData])

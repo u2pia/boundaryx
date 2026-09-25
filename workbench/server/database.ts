@@ -939,7 +939,7 @@ export class ControlPlaneDatabase {
    * outside the gate with its reasons, and announced by its own event, so the audit trail shows what branch protection
    * let through instead of pretending it did not happen.
    */
-  recordHostMerge(input: { proposalId: string; baseShaBefore?: string; mergedSha: string; host: Omit<HostMergeRecord, 'outsideGate' | 'outsideGateReasons'> }, actorId: string) {
+  recordHostMerge(input: { proposalId: string; baseShaBefore?: string; mergedSha: string; host: Omit<HostMergeRecord, 'outsideGate' | 'outsideGateReasons'> }, actorId: string, identity?: DecisionIdentity) {
     const proposal = this.getChangeProposal(input.proposalId)
     if (proposal.status === 'merged') throw new AppError(409, `Change proposal ${proposal.id} is already merged`, 'proposal_merged')
     const readiness = this.getReviewReadiness(input.proposalId)
@@ -962,7 +962,7 @@ export class ControlPlaneDatabase {
       this.db.prepare('INSERT INTO merge_evidence(id, change_proposal_id, base_ref, base_sha_before, approved_head_sha, merged_sha, strategy, approval_review_ids_json, check_ids_json, evidence_ids_json, proposal_event_chain_head, evidence_digest, merged_by_actor_id, merged_at, host_merge_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(evidence.id, evidence.changeProposalId, evidence.baseRef, evidence.baseShaBefore, evidence.approvedHeadSha, evidence.mergedSha, evidence.strategy, JSON.stringify(evidence.approvalReviewIds), JSON.stringify(evidence.checkIds), JSON.stringify(evidence.evidenceIds), evidence.proposalEventChainHead, evidence.evidenceDigest, evidence.mergedByActorId, evidence.mergedAt, JSON.stringify(hostMerge))
       this.db.prepare("UPDATE change_proposals SET status = 'merged', updated_at = ? WHERE id = ?").run(timestamp, input.proposalId)
       this.db.prepare("UPDATE work_items SET status = 'done', updated_at = ? WHERE id = ?").run(timestamp, proposal.workItemId)
-      this.appendEvent({ aggregateType: 'change_proposal', aggregateId: input.proposalId, eventType: 'change_proposal.merged', actorId, payload: { mergeEvidenceId: evidence.id, baseRef: evidence.baseRef, baseShaBefore: evidence.baseShaBefore, approvedHeadSha: evidence.approvedHeadSha, mergedSha: evidence.mergedSha, strategy: evidence.strategy, approvalReviewIds: evidence.approvalReviewIds, checkIds: evidence.checkIds, evidenceIds: evidence.evidenceIds, proposalEventChainHead: evidence.proposalEventChainHead, evidenceDigest: evidence.evidenceDigest, hostMerge } })
+      this.appendEvent({ aggregateType: 'change_proposal', aggregateId: input.proposalId, eventType: 'change_proposal.merged', actorId, payload: { mergeEvidenceId: evidence.id, baseRef: evidence.baseRef, baseShaBefore: evidence.baseShaBefore, approvedHeadSha: evidence.approvedHeadSha, mergedSha: evidence.mergedSha, strategy: evidence.strategy, approvalReviewIds: evidence.approvalReviewIds, checkIds: evidence.checkIds, evidenceIds: evidence.evidenceIds, proposalEventChainHead: evidence.proposalEventChainHead, evidenceDigest: evidence.evidenceDigest, hostMerge, ...(identity ? { identity } : {}) } })
       if (hostMerge.outsideGate) this.appendEvent({ aggregateType: 'change_proposal', aggregateId: input.proposalId, eventType: 'change_proposal.merged_outside_gate', actorId, payload: { mergeEvidenceId: evidence.id, previousStatus: proposal.status, readiness: readiness.status, reasons, url: hostMerge.url, mergedBy: hostMerge.mergedBy ?? null } })
       return evidence
     })

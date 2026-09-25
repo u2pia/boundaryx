@@ -524,6 +524,13 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         return sendJson(response, result.changed ? 201 : 200, result)
       }
 
+      const hostMergeRoute = routeMatch(path, /^\/api\/change-proposals\/(?<proposalId>[^/]+)\/host-merge$/u)
+      if (method === 'POST' && hostMergeRoute) {
+        requireIn(proposalProject(hostMergeRoute.proposalId), ['owner', 'maintainer'])
+        const result = await codeHostSyncer.mergeOnHost(hostMergeRoute.proposalId, actor.id)
+        return sendJson(response, result.changed ? 201 : 200, result)
+      }
+
       const reviseRoute = routeMatch(path, /^\/api\/change-proposals\/(?<proposalId>[^/]+)\/revise$/u)
       if (method === 'POST' && reviseRoute) {
         if (!agentRunner) throw new AppError(503, 'Local Agent Runner is not configured', 'agent_runner_unavailable')

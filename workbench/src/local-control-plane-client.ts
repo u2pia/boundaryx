@@ -132,7 +132,7 @@ export type LocalMergeEvidence = {
   approvedHeadSha: string
   mergedSha: string
   strategy: 'fast_forward' | 'host_merge'
-  hostMerge?: { provider: 'github'; externalId: string; url: string; mergedBy?: string; hostMergedAt?: string; contentCheck: 'ancestor' | 'tree_equal' | 'patch_equal' | 'mismatch'; hostHeadSha?: string; gateStateAtMerge: 'pending' | 'success' | 'failure' | 'unpublished'; outsideGate: boolean; outsideGateReasons: string[] }
+  hostMerge?: { provider: 'github'; externalId: string; url: string; mergedBy?: string; hostMergedAt?: string; contentCheck: 'ancestor' | 'tree_equal' | 'patch_equal' | 'mismatch'; hostHeadSha?: string; gateStateAtMerge: 'pending' | 'success' | 'failure' | 'unpublished'; requestedVia?: 'control_plane'; outsideGate: boolean; outsideGateReasons: string[] }
   approvalReviewIds: string[]
   checkIds: string[]
   evidenceIds: string[]
@@ -417,6 +417,8 @@ export const localControlPlaneClient = {
   assignReviewer: (proposalId: string, input: { assigneeActorId?: string; dueHours?: number; reason?: string }) => post<{ assignment: LocalReviewAssignment }>(`/api/change-proposals/${proposalId}/assignments`, input),
   rejectChangeProposal: (proposalId: string, input: { headSha: string; reason: string }) => post<{ decision: LocalGovernanceDecision }>(`/api/change-proposals/${proposalId}/reject`, input),
   mergeChangeProposal: (proposalId: string) => post<{ proposal: LocalChangeProposal; evidence: LocalMergeEvidence; changed: boolean }>(`/api/change-proposals/${proposalId}/merge`, {}),
+  /** host_protected projects: the server merges the pull request through GitHub's API with its own token. */
+  mergeChangeProposalOnHost: (proposalId: string) => post<{ proposal: LocalChangeProposal; evidence: LocalMergeEvidence; changed: boolean }>(`/api/change-proposals/${proposalId}/host-merge`, {}),
   reviseChangeProposal: (proposalId: string) => post<{ agentRun: LocalAgentRun }>(`/api/change-proposals/${proposalId}/revise`, {}),
   createReleaseCandidate: (proposalId: string) => post<{ releaseCandidate: LocalReleaseCandidate }>(`/api/change-proposals/${proposalId}/release-candidates`, {}),
   approveReleaseCandidate: (candidateId: string, comment: string) => post<{ releaseCandidate: LocalReleaseCandidate }>(`/api/release-candidates/${candidateId}/approve`, { comment }),

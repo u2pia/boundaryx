@@ -67,6 +67,9 @@ const checkRuns = new Map<string, Array<{ name: string; status: string; conclusi
 const commitStatuses = new Map<string, Array<{ context: string; state: string }>>()
 let requests = 0
 let pushAllowed = true
+// What GitHub's merge API does: refuse with branch protection's reason, or allow only some merge methods.
+let mergeRefusal: string | undefined
+let allowedMergeMethods = ['merge', 'squash', 'rebase']
 const pullJson = (pull: Pull) => {
   const headSha = pull.headShaAtMerge ?? remoteSha(pull.head) ?? ''
   // GitHub marks a pull request merged on its own when its head lands on the base branch by a push.
@@ -111,6 +114,16 @@ const fake = createServer(async (request, response) => {
     const pull = pulls[Number(pullRoute[1]) - 1]
     return pull ? send(200, pullJson(pull)) : send(404, { message: 'Not Found' })
   }
+  const mergeRoute = /^\/pulls\/(\d+)\/merge$/u.exec(path)
+  if (request.method === 'PUT' && mergeRoute) {
+    const pull = pulls[Number(mergeRoute[1]) - 1]
+    if (!pull || pull.state !== 'open') return send(405, { message: 'Pull Request is not mergeable' })
+    if (mergeRefusal) return send(405, { message: mergeRefusal })
+    if (!allowedMergeMethods.includes(body.merge_method)) return send(405, { message: `${body.merge_method} merges are not allowed on this repository.` })
+    if (body.sha !== remoteSha(pull.head)) return send(409, { message: 'Head branch was modified. Review and try the merge again.' })
+    mergeOnHost(pull.number, body.merge_method === 'merge' ? 'merge' : 'squash', 'aperture-bot')
+    return send(200, { sha: pull.mergeCommitSha, merged: true, message: 'Pull Request successfully merged' })
+  }
   const statusRoute = /^\/statuses\/([0-9a-f]{40})$/u.exec(path)
   if (request.method === 'POST' && statusRoute) {
     statuses.set(statusRoute[1], [{ state: body.state, context: body.context, description: body.description }, ...(statuses.get(statusRoute[1]) ?? [])])
@@ -131,7 +144,7 @@ const apiBase = `http://127.0.0.1:${(fake.address() as AddressInfo).port}`
 const gateOf = (sha: string) => statuses.get(sha)?.find((status) => status.context === 'aperture/gate')
 
 /** A merge made on GitHub: a merge commit or a squash, by someone who is not the platform. */
-function mergeOnHost(number: number, method: 'merge' | 'squash') {
+function mergeOnHost(number: number, method: 'merge' | 'squash', mergedBy = 'octocat') {
   const pull = pulls[number - 1]
   const work = join(root, `host-merge-${number}`)
   execFileSync('git', ['clone', '--quiet', remote, work], { stdio: 'ignore' })
@@ -145,7 +158,7 @@ function mergeOnHost(number: number, method: 'merge' | 'squash') {
     git(work, 'commit', '--quiet', '-m', `Squash #${number}`)
   }
   git(work, 'push', '--quiet', 'origin', pull.base)
-  Object.assign(pull, { state: 'closed', merged: true, mergeCommitSha: git(work, 'rev-parse', 'HEAD'), mergedBy: 'octocat', mergedAt: new Date().toISOString(), headShaAtMerge: headSha, commitsAtMerge: commits })
+  Object.assign(pull, { state: 'closed', merged: true, mergeCommitSha: git(work, 'rev-parse', 'HEAD'), mergedBy, mergedAt: new Date().toISOString(), headShaAtMerge: headSha, commitsAtMerge: commits })
   rmSync(work, { recursive: true, force: true })
 }
 
@@ -371,6 +384,33 @@ try {
   const flagged = database.listAggregateEvents('change_proposal', third.id).find((event) => event.eventType === 'change_proposal.merged_outside_gate')
   assert.deepEqual([flagged?.actorId, flagged?.payload.mergedBy], [SYSTEM_CODE_HOST_ACTOR_ID, 'octocat'])
 
+  // --- host_protected, merged from the platform: the server asks GitHub's API with its token; nobody opens GitHub. ---
+  const fourth = runProposal('agent/run-d')
+  await syncer.syncProject(project.id)
+  const hostMergePath = `/api/change-proposals/${fourth.id}/host-merge`
+  assert.deepEqual((await call(hostMergePath, { cookie: ownerCookie, body: {} })).body.error.code, 'merge_not_approved')
+  makeReady(fourth.id)
+  approve(fourth.id)
+  assert.equal((await call(hostMergePath, { cookie: bobCookie, body: {} })).status, 403, 'a reviewer cannot merge')
+  mergeRefusal = 'Required status check "ci" is expected.'
+  const refused = await call(hostMergePath, { cookie: ownerCookie, body: {} })
+  assert.deepEqual([refused.status, refused.body.error.code], [409, 'host_merge_refused'])
+  assert.match(refused.body.error.message, /Required status check "ci" is expected/u, "GitHub's reason reaches the reviewer")
+  assert.deepEqual([database.getChangeProposal(fourth.id).status, database.getMergeEvidenceOptional(fourth.id)], ['approved', undefined], 'a refused merge records nothing')
+  assert.equal(gateOf(fourth.headSha)?.state, 'success', 'the gate was published before GitHub was asked')
+  mergeRefusal = undefined
+  allowedMergeMethods = ['squash']
+  const viaApi = await call<{ evidence: { strategy: string; mergedSha: string; mergedByActorId: string; hostMerge: { requestedVia?: string; mergedBy?: string; outsideGate: boolean; contentCheck: string } } }>(hostMergePath, { cookie: ownerCookie, body: {} })
+  assert.equal(viaApi.status, 201, JSON.stringify(viaApi.body))
+  assert.deepEqual([viaApi.body.evidence.strategy, viaApi.body.evidence.mergedSha, viaApi.body.evidence.mergedByActorId], ['host_merge', remoteSha('main'), owner.id], 'merged on GitHub, recorded as the person who asked')
+  assert.deepEqual([viaApi.body.evidence.hostMerge.requestedVia, viaApi.body.evidence.hostMerge.mergedBy, viaApi.body.evidence.hostMerge.outsideGate, viaApi.body.evidence.hostMerge.contentCheck], ['control_plane', 'aperture-bot', false, 'tree_equal'], 'a repository that only squashes is merged by squash')
+  const mergedEvent = database.listAggregateEvents('change_proposal', fourth.id).findLast((event) => event.eventType === 'change_proposal.merged')
+  assert.deepEqual([mergedEvent?.actorId, (mergedEvent?.payload.identity as { login?: string } | undefined)?.login], [owner.id, 'owner'])
+  assert.deepEqual([database.getChangeProposal(fourth.id).status, linkOf(fourth.id).state], ['merged', 'merged'])
+  assert.equal((await syncer.syncProject(project.id)).merged, 0, 'the next sync does not record it again')
+  assert.equal((await call(hostMergePath, { cookie: ownerCookie, body: {} })).status, 200, 'asking again is a no-op')
+  allowedMergeMethods = ['merge', 'squash', 'rebase']
+
   // --- A proposal opened by hand from a branch pushed to GitHub, then closed there. ---
   branchOnSeed('feature/manual', 'manual.txt')
   git(seed, 'push', '--quiet', 'origin', 'feature/manual')
@@ -399,7 +439,7 @@ try {
   const scan = (path: string): string[] => statSync(path).isDirectory() ? readdirSync(path).flatMap((name) => scan(join(path, name))) : needles.some((needle) => readFileSync(path).includes(needle)) ? [path] : []
   assert.deepEqual(scan(dataDirectory), [], 'no file under the data directory holds the token')
   assert.ok(requests > 10, 'the fake GitHub was exercised')
-  console.log(`github code host smoke passed (${pulls.length} pull requests, ${requests} API calls)`)
+  console.log(`github code host smoke passed (${pulls.length} pull requests, ${requests} API calls, host_protected merge through the API)`)
 } finally {
   fake.close()
   rmSync(root, { recursive: true, force: true })
