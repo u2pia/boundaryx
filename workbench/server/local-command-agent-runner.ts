@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import type { ControlPlaneDatabase } from './database.ts'
 import { GitWorktreeAgentRunner, type AgentExecutionRuntime, type AgentRunPostprocessor, type AgentRuntimeContext } from './git-worktree-agent-runner.ts'
 import { sha256 } from './security.ts'
-import type { AgentProviderSettings, AgentRunRequest, AgentRunner, AgentRunnerDescriptor } from './types.ts'
+import type { AgentProviderSettings, AgentRun, AgentRunRequest, AgentRunner, AgentRunnerDescriptor } from './types.ts'
 
 /**
  * Translates the Control Plane's provider setting into the environment the builder wrapper reads. The
@@ -83,5 +83,9 @@ export class LocalCommandAgentRunner implements AgentRunner {
 
   run(request: AgentRunRequest, actorId: string) {
     return this.runner.run(request, actorId)
+  }
+
+  cleanUpWorktree(run: AgentRun, actorId?: string) {
+    return this.runner.cleanUpWorktree(run, actorId)
   }
 }

@@ -749,6 +749,27 @@ export class ControlPlaneDatabase {
     return (this.db.prepare("SELECT * FROM agent_runs WHERE status IN ('queued', 'running') ORDER BY started_at ASC").all() as Array<Record<string, SqlValue>>).map((row) => this.mapAgentRun(row))
   }
 
+  /**
+   * Finished runs whose worktree has not been reported as pruned yet. A run's `agent_run.worktree_pruned`
+   * event with `pruned: true` is the only thing that takes it off this list, so a cleanup that failed (or a
+   * run that ended before the cleanup existed) is retried on the next Control Plane start instead of leaking
+   * the checkout forever.
+   */
+  listTerminalAgentRunsWithWorktree(): AgentRun[] {
+    const rows = this.db.prepare(`
+      SELECT run.* FROM agent_runs run
+      WHERE run.status IN ('succeeded', 'failed', 'cancelled')
+        AND NOT EXISTS (
+          SELECT 1 FROM domain_events event
+          WHERE event.aggregate_type = 'agent_run' AND event.aggregate_id = run.id
+            AND event.event_type = 'agent_run.worktree_pruned'
+            AND json_extract(event.payload_json, '$.pruned') = 1
+        )
+      ORDER BY run.started_at ASC
+    `).all() as Array<Record<string, SqlValue>>
+    return rows.map((row) => this.mapAgentRun(row))
+  }
+
   completeAgentRun(input: { runId: string; status: 'succeeded' | 'failed' | 'cancelled'; actorId: string; changeProposalId?: string; exitCode?: number; stdoutDigest?: string; stderrDigest?: string; errorMessage?: string }) {
     const current = this.getAgentRun(input.runId)
     if (current.status !== 'running' && current.status !== 'queued') throw new AppError(409, `Agent run ${input.runId} is already terminal`, 'agent_run_terminal')

@@ -6,6 +6,7 @@ import type { ControlPlaneDatabase } from './database.ts'
 import { resolveProjectRepository } from './code-host/index.ts'
 import { LocalGitAuthority } from './local-git-authority.ts'
 import { applyProjectManifest, loadProjectManifest, type ProjectManifestBinding } from './project-manifest.ts'
+import { removeRunWorktree, runRootFor, type PruneOutcome } from './run-worktree-lifecycle.ts'
 import { sha256 } from './security.ts'
 import { AppError, type AgentRun, type AgentRunRequest, type AgentRunner, type AgentRunnerDescriptor, type ChangeProposal, type IntentVersion, type WorkItem } from './types.ts'
 
@@ -179,16 +180,16 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     const attestation = this.input.runtime.attest(runtimeContext)
     if (!this.input.database.claimAgentRun(runId, process.pid, actorId)) {
       this.input.database.recordAgentRunEvent(runId, 'agent_run.cancelled_before_start', { worktreePath }, actorId)
-      return this.input.database.completeAgentRun({ runId, status: 'cancelled', actorId, errorMessage: 'Agent run was cancelled before execution started' })
+      return this.terminal(runId, queued.repositoryPath, actorId, { status: 'cancelled', errorMessage: 'Agent run was cancelled before execution started' })
     }
     if (attestation.attestationDigest !== queued.runtimeAttestationDigest) {
       this.input.database.recordAgentRunEvent(runId, 'agent_run.runtime_attestation_mismatch', { admitted: queued.runtimeAttestationDigest ?? null, observed: attestation.attestationDigest }, actorId)
-      return this.input.database.completeAgentRun({ runId, status: 'failed', actorId, errorMessage: 'Runtime attestation changed between admission and execution' })
+      return this.terminal(runId, repositoryPath, actorId, { status: 'failed', errorMessage: 'Runtime attestation changed between admission and execution' })
     }
     const projectManifest = loadProjectManifest(repositoryPath, baseSha)
     if (projectManifest.digest !== this.input.database.listAggregateEvents('agent_run', runId).find((event) => event.eventType === 'agent_run.project_manifest_bound')?.payload.digest) {
       this.input.database.recordAgentRunEvent(runId, 'agent_run.project_manifest_drift', { observed: projectManifest.digest }, actorId)
-      return this.input.database.completeAgentRun({ runId, status: 'failed', actorId, errorMessage: 'Project manifest changed between admission and execution' })
+      return this.terminal(runId, repositoryPath, actorId, { status: 'failed', errorMessage: 'Project manifest changed between admission and execution' })
     }
 
     let exitCode: number | undefined
@@ -206,7 +207,7 @@ export class GitWorktreeAgentRunner implements AgentRunner {
         if (message.type === 'message') this.input.database.recordAgentRunEvent(runId, 'agent_run.message', { summary: message.summary }, actorId)
         else this.recordContextConsumption(runId, worktreePath, declaredContextPaths, message.path, actorId)
       }
-      if (this.input.database.isAgentRunCancellationRequested(runId)) return this.input.database.completeAgentRun({ runId, status: 'cancelled', actorId, exitCode, stdoutDigest, stderrDigest, errorMessage: 'Agent run was cancelled while the agent was generating' })
+      if (this.input.database.isAgentRunCancellationRequested(runId)) return this.terminal(runId, repositoryPath, actorId, { status: 'cancelled', exitCode, stdoutDigest, stderrDigest, errorMessage: 'Agent run was cancelled while the agent was generating' })
       if (result.error) throw new AppError((result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT' ? 408 : 422, `Agent runtime failed: ${result.error.message}`, 'agent_runtime_failed')
       if (result.status !== 0) throw new AppError(422, `Agent exited with status ${result.status ?? 'unknown'}`, 'agent_execution_failed')
       const changed = git(worktreePath, ['status', '--porcelain'])
@@ -220,13 +221,51 @@ export class GitWorktreeAgentRunner implements AgentRunner {
       changeProposalId = proposal.id
       this.input.database.recordAgentRunEvent(runId, revisionProposal ? 'agent_run.change_revised' : 'agent_run.change_proposed', { changeProposalId: proposal.id, previousHeadSha: revisionProposal?.headSha ?? null, headSha: proposal.headSha, changedFiles: proposal.changedFiles, additions: proposal.additions, deletions: proposal.deletions }, actorId)
       this.input.postprocessor?.process({ runId, actorId, adapterId: this.id, worktreePath, workItem, intent, projectManifest, startSha, revisionOfProposalId: revisionProposal?.id, proposal, attestation, stdoutDigest, stderrDigest })
-      return this.input.database.completeAgentRun({ runId, status: 'succeeded', actorId, changeProposalId: proposal.id, exitCode: result.status ?? 0, stdoutDigest, stderrDigest })
+      return this.terminal(runId, repositoryPath, actorId, { status: 'succeeded', changeProposalId: proposal.id, exitCode: result.status ?? 0, stdoutDigest, stderrDigest })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const cancelled = this.input.database.isAgentRunCancellationRequested(runId)
-      this.input.database.completeAgentRun({ runId, status: cancelled ? 'cancelled' : 'failed', actorId, changeProposalId, exitCode, stdoutDigest, stderrDigest, errorMessage: cancelled ? `Agent run was cancelled: ${message}` : message })
+      this.terminal(runId, repositoryPath, actorId, { status: cancelled ? 'cancelled' : 'failed', changeProposalId, exitCode, stdoutDigest, stderrDigest, errorMessage: cancelled ? `Agent run was cancelled: ${message}` : message })
       throw error
     }
+  }
+
+  /**
+   * Removes the worktree a Run created. Called when the run reaches a terminal state, and again by the
+   * reconciler for any run whose worker died without getting there. Idempotent, and safe to call for a
+   * run whose checkout is already gone.
+   */
+  cleanUpWorktree(run: AgentRun, actorId: string = run.startedByActorId) {
+    return this.pruneWorktree(run, run.repositoryPath, actorId)
+  }
+
+  /**
+   * Writes the terminal state and then removes the run's worktree. The order matters and the cleanup is
+   * outside the try: the run's conclusion is decided by the agent and its checks, never by whether a
+   * checkout could be deleted, and the event log must already say how the run ended when the cleanup is
+   * recorded. Failures are recorded as events (`agent_run.worktree_pruned` with `pruned: false`), so a
+   * cleanup that could not finish is visible instead of silently dropping the directory.
+   */
+  private terminal(runId: string, repositoryPath: string, actorId: string, input: { status: 'succeeded' | 'failed' | 'cancelled'; changeProposalId?: string; exitCode?: number; stdoutDigest?: string; stderrDigest?: string; errorMessage?: string }) {
+    const run = this.input.database.completeAgentRun({ runId, actorId, ...input })
+    this.pruneWorktree(run, repositoryPath, actorId)
+    return run
+  }
+
+  private pruneWorktree(run: AgentRun, repositoryPath: string, actorId: string): PruneOutcome {
+    const outcome = removeRunWorktree({ repositoryPath, worktreePath: run.worktreePath, runRoot: runRootFor(run.worktreePath, this.input.worktreeRoot) })
+    this.input.database.recordAgentRunEvent(run.id, 'agent_run.worktree_pruned', {
+      worktreePath: run.worktreePath,
+      branchRef: run.branchRef,
+      repositoryPath,
+      pruned: outcome.removed,
+      skippedPaths: outcome.skipped,
+      error: outcome.error ?? null,
+      // Stated explicitly because the whole point of the cleanup is that these survive it.
+      proposalBranchPreserved: true,
+      evidencePreserved: true,
+    }, actorId)
+    return outcome
   }
 
   private recordContextConsumption(runId: string, worktreePath: string, declaredContextPaths: string[], reportedPath: string, actorId: string) {

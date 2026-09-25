@@ -21,7 +21,7 @@ function joinDefault(...parts: string[]) {
 mkdirSync(dataDirectory, { recursive: true })
 const database = new ControlPlaneDatabase(databasePath, resolve(serverDirectory, 'migrations'))
 const configuredAgent = createConfiguredAgentRunner({ database, dataDirectory })
-const agentRunQueue = configuredAgent.runner ? new AgentRunQueue({ database, databasePath, dataDirectory, concurrency: Number(process.env.CONTROL_PLANE_RUN_CONCURRENCY ?? 2) }) : undefined
+const agentRunQueue = configuredAgent.runner ? new AgentRunQueue({ database, databasePath, dataDirectory, concurrency: Number(process.env.CONTROL_PLANE_RUN_CONCURRENCY ?? 2), runner: configuredAgent.runner }) : undefined
 const orphaned = agentRunQueue?.reconcile() ?? []
 const githubOAuth = githubOAuthConfigFromEnv(process.env, `http://127.0.0.1:${port}`)
 const codeHostSyncer = new CodeHostSyncer({ database, publicUrl: process.env.CONTROL_PLANE_PUBLIC_URL })
