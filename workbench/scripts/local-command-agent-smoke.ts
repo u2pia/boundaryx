@@ -40,7 +40,7 @@ git('add', '.aperture/project.json')
 git('commit', '-m', 'invalid exposed evaluation dataset')
 assert.throws(() => loadProjectManifest(repositoryPath, git('rev-parse', 'HEAD')), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'evaluation_dataset_context_exposed')
 git('reset', '--hard', initialSha)
-writeFileSync(agentScript, `import { readFileSync, writeFileSync } from 'node:fs'\nconst request = JSON.parse(readFileSync(process.env.APERTURE_RUN_REQUEST, 'utf8'))\nreadFileSync('README.md', 'utf8')\nconsole.log(JSON.stringify({ type: 'context_consumed', path: 'README.md' }))\nconsole.log(JSON.stringify({ type: 'context_consumed', path: '../outside.txt' }))\nconsole.log(JSON.stringify({ type: 'message', summary: 'Implemented the requested local change.' }))\nconst untilDeadline = Number(process.env.APERTURE_RUN_DEADLINE) - Date.now()\nconsole.log(JSON.stringify({ type: 'message', summary: untilDeadline > 0 && untilDeadline <= 10000 ? 'deadline ahead' : 'deadline missing' }))\nconst goal = request.intent.goal\nconst mode = goal.includes('缺失指标') ? 'missing' : goal.includes('低于阈值') ? 'below' : goal.includes('篡改数据集') ? 'tamper' : 'pass'\nif (mode !== 'pass') writeFileSync('evaluation-mode.txt', mode + '\\n')\nif (mode === 'tamper') writeFileSync('evals/dataset.jsonl', '{"id":"tampered"}\\n')\nwriteFileSync('feature.ts', 'export const generatedByAgent = ' + JSON.stringify(request.runId) + '\\n')\n`)
+writeFileSync(agentScript, `import { readFileSync, writeFileSync } from 'node:fs'\nconst request = JSON.parse(readFileSync(process.env.APERTURE_RUN_REQUEST, 'utf8'))\nreadFileSync('README.md', 'utf8')\nconsole.log(JSON.stringify({ type: 'context_consumed', path: 'README.md' }))\nconsole.log(JSON.stringify({ type: 'context_consumed', path: '../outside.txt' }))\nconsole.log(JSON.stringify({ type: 'message', summary: 'Implemented the requested local change.' }))\nconst untilDeadline = Number(process.env.APERTURE_RUN_DEADLINE) - Date.now()\nconsole.log(JSON.stringify({ type: 'message', summary: untilDeadline > 0 && untilDeadline <= 10000 ? 'deadline ahead' : 'deadline missing' }))\nconst goal = request.intent.goal\nif (goal.includes('时间预算') && !request.revision) console.log(JSON.stringify({ type: 'message', summary: 'Stopped at the time budget; feature.ts only.', stopped: 'time_budget' }))\nconst mode = goal.includes('缺失指标') ? 'missing' : goal.includes('低于阈值') ? 'below' : goal.includes('篡改数据集') ? 'tamper' : 'pass'\nif (mode !== 'pass') writeFileSync('evaluation-mode.txt', mode + '\\n')\nif (mode === 'tamper') writeFileSync('evals/dataset.jsonl', '{"id":"tampered"}\\n')\nwriteFileSync('feature.ts', 'export const generatedByAgent = ' + JSON.stringify(request.runId) + '\\n')\n`)
 writeFileSync(checkScript, `import { existsSync, readFileSync } from 'node:fs'\nif (!readFileSync('feature.ts', 'utf8').includes('generatedByAgent')) process.exit(1)\nconst mode = existsSync('evaluation-mode.txt') ? readFileSync('evaluation-mode.txt', 'utf8').trim() : 'pass'\nif (mode !== 'missing') console.log(JSON.stringify({ type: 'evaluation_metrics', metrics: { task_success_rate: mode === 'below' ? 0.5 : 1, tool_call_accuracy: 1 } }))\nconsole.log('feature evaluation completed')\n`)
 
 try {
@@ -98,6 +98,37 @@ try {
   assert.equal(evidencePackage.checks.find((check) => check.kind === 'evaluation')?.metrics?.task_success_rate, 1)
   assert.equal(evidencePackage.checks.find((check) => check.kind === 'evaluation')?.thresholdResults?.[0].passed, true)
   assert.equal(evidencePackage.checks.every((check) => check.conclusion === 'success'), true)
+
+  assert.equal(readiness.builderStop, null, 'a Builder that finished is not flagged')
+  assert.equal(evidencePackage.run.builderStopped, null)
+
+  // A Builder that ran out of time hands over a partial change: readiness names it, the evidence package records it,
+  // and approving it takes a written acknowledgement bound to that run. The next revision's own run clears it.
+  const partialWorkItem = database.createWorkItem({ title: '时间预算内交付部分变更', description: '验证部分变更的审批门禁。', productType: 'agent_system', ownerActorId: owner.id }, owner.id)
+  const partialIntent = database.createIntentVersion({ workItemId: partialWorkItem.id, goal: '在时间预算内生成变更', constraints: ['不得修改 main 工作区'], riskLevel: 'medium', acceptanceCriteria: [{ statement: '产生真实 Git commit', criticality: 'critical', verificationType: 'deterministic' }] }, owner.id)
+  database.approveIntentVersion(partialIntent.id, reviewer.id)
+  const partialRun = runner.run({ workItemId: partialWorkItem.id, intentVersionId: partialIntent.id, repositoryPath, baseRef: 'main', declaredContextPaths: [] }, owner.id)
+  assert.equal(partialRun.status, 'succeeded', 'a stopped Builder still hands over its worktree')
+  const partialProposal = database.getChangeProposal(partialRun.changeProposalId!)
+  const partialReadiness = database.getReviewReadiness(partialProposal.id)
+  assert.deepEqual(partialReadiness.builderStop, { runId: partialRun.id, reason: 'time_budget', summary: 'Stopped at the time budget; feature.ts only.' })
+  assert.equal(partialReadiness.status, 'ready', 'a partial change is judged by its checks, not blocked outright')
+  const partialPackage = evidenceStore.read(partialReadiness.evidence[0].uri, partialReadiness.evidence[0].sha256)
+  assert.equal(partialPackage.run.builderStopped, 'time_budget')
+  assert.equal(partialReadiness.evidence[0].summary.builderStopped, 'time_budget')
+  assert.equal(database.listAggregateEvents('agent_run', partialRun.id).find((event) => event.eventType === 'agent_run.message' && event.payload.stopped)?.payload.stopped, 'time_budget')
+  assert.throws(() => database.recordReview({ proposalId: partialProposal.id, headSha: partialProposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: '  ' }), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'review_partial_change_unacknowledged')
+  database.recordReview({ proposalId: partialProposal.id, headSha: partialProposal.headSha, reviewerActorId: reviewer.id, decision: 'changes_requested', comment: 'Finish the change.' })
+  const partialRevision = runner.run({ workItemId: partialWorkItem.id, intentVersionId: partialIntent.id, repositoryPath, baseRef: 'main', declaredContextPaths: [], changeProposalId: partialProposal.id }, owner.id)
+  assert.equal(partialRevision.status, 'succeeded')
+  assert.equal(database.getReviewReadiness(partialProposal.id).builderStop, null, 'the stop belongs to the run that produced the old head')
+  const secondPartial = runner.run({ workItemId: partialWorkItem.id, intentVersionId: partialIntent.id, repositoryPath, baseRef: 'main', declaredContextPaths: [] }, owner.id)
+  const secondProposal = database.getChangeProposal(secondPartial.changeProposalId!)
+  const secondEvidence = database.getReviewReadiness(secondProposal.id).evidence[0]
+  database.recordEvidenceView(secondEvidence.id, reviewer.id, secondEvidence.sha256)
+  database.recordReview({ proposalId: secondProposal.id, headSha: secondProposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'feature.ts alone meets the criterion; the rest is not needed.' })
+  const acknowledged = database.listAggregateEvents('change_proposal', secondProposal.id).find((event) => event.eventType === 'review.approved')
+  assert.equal(acknowledged?.payload.partialChangeAcknowledged, secondPartial.id)
 
   const runBlockedEvaluation = (goal: string) => {
     const negativeWorkItem = database.createWorkItem({ title: goal, description: '验证 Agent System 评估负路径。', productType: 'agent_system', ownerActorId: owner.id }, owner.id)

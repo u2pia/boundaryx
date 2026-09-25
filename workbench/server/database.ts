@@ -6,7 +6,7 @@ import { createSessionToken, hashPassword, hashSessionToken, sha256, verifyPassw
 import { criterionStatus, mapCriteriaToChecks, type CriterionCoverage } from './criteria-coverage.ts'
 import { requestContext } from './request-context.ts'
 import { normalizeProjectHost, type ProjectHostInput } from './code-host/index.ts'
-import type { AcceptanceCriterionInput, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentVersion, MergeEvidence, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
+import type { AcceptanceCriterionInput, BuilderStopReason, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentVersion, MergeEvidence, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
 import { AppError } from './types.ts'
 
 type SqlValue = string | number | null
@@ -1086,6 +1086,9 @@ export class ControlPlaneDatabase {
     const policyFiles = readiness.policyFiles ?? []
     if (input.decision === 'approved' && policyFiles.length && reviewerRole !== 'owner') throw new AppError(403, `This change modifies policy files (${policyFiles.join(', ')}); only an owner can approve it`, 'review_policy_change_requires_owner')
     if (input.decision === 'approved' && policyFiles.length && !input.comment.trim()) throw new AppError(409, `This change modifies policy files (${policyFiles.join(', ')}); the approval comment must record why the new rules are acceptable`, 'review_policy_change_unacknowledged')
+    // A Builder stopped at its budget handed over whatever it had; the checks say what works, not what is missing, so
+    // the reviewer has to say why the change is acceptable as it stands.
+    if (input.decision === 'approved' && readiness.builderStop && !input.comment.trim()) throw new AppError(409, `The Builder was stopped at its ${readiness.builderStop.reason === 'time_budget' ? 'time' : 'step'} budget, so this change may be partial; the approval comment must record why it is acceptable as it stands`, 'review_partial_change_unacknowledged')
     if (input.decision === 'approved' && intent.riskLevel !== 'low' && readiness.status !== 'ready') throw new AppError(409, 'Medium and high risk changes require complete checks and evidence', 'review_evidence_incomplete')
     if (input.decision === 'approved' && intent.riskLevel !== 'low' && !evidenceViewed) throw new AppError(409, 'Reviewer must view the current evidence package before approval', 'review_evidence_not_viewed')
     // A comment decides nothing, so it is open to any session; the two terminal decisions carry a frozen identity.
@@ -1104,7 +1107,7 @@ export class ControlPlaneDatabase {
       // An approval by someone who never opened the evidence is the direct observable of a rubber stamp; it is allowed
       // on the low risk light path but always flagged.
       const evidenceOpenedBeforeDecision = assignment ? Boolean(assignment.evidenceOpenedAt) : evidenceViewed
-      this.appendEvent({ aggregateType: 'change_proposal', aggregateId: input.proposalId, eventType: `review.${input.decision}`, actorId: input.reviewerActorId, payload: { reviewId, headSha: input.headSha, comment: input.comment.trim(), decisionLatencySeconds, supersededDecisionCount: superseded, resultingStatus: status, riskLevel: intent.riskLevel, evidenceReadiness: readiness.status, evidenceViewed, checkIds: readiness.checks.map((check) => check.id), evidenceIds: readiness.evidence.map((evidence) => evidence.id), blockers: readiness.blockers, criteria: readiness.criteria.map((item) => ({ criterionId: item.criterionId, status: item.status, overrideDecisionId: item.override?.decisionId ?? null })), waivedCheckCount: readiness.waivedCheckCount, humanCriteriaSignedOff: input.decision === 'approved' ? humanCriteria.map((item) => item.criterionId) : [], policyFilesAcknowledged: input.decision === 'approved' ? policyFiles : [], assignmentId: decidesAssignment ? assignment.id : null, evidenceOpenedBeforeDecision, unopenedApproval: input.decision === 'approved' && !evidenceOpenedBeforeDecision, identity } })
+      this.appendEvent({ aggregateType: 'change_proposal', aggregateId: input.proposalId, eventType: `review.${input.decision}`, actorId: input.reviewerActorId, payload: { reviewId, headSha: input.headSha, comment: input.comment.trim(), decisionLatencySeconds, supersededDecisionCount: superseded, resultingStatus: status, riskLevel: intent.riskLevel, evidenceReadiness: readiness.status, evidenceViewed, checkIds: readiness.checks.map((check) => check.id), evidenceIds: readiness.evidence.map((evidence) => evidence.id), blockers: readiness.blockers, criteria: readiness.criteria.map((item) => ({ criterionId: item.criterionId, status: item.status, overrideDecisionId: item.override?.decisionId ?? null })), waivedCheckCount: readiness.waivedCheckCount, humanCriteriaSignedOff: input.decision === 'approved' ? humanCriteria.map((item) => item.criterionId) : [], policyFilesAcknowledged: input.decision === 'approved' ? policyFiles : [], partialChangeAcknowledged: input.decision === 'approved' && readiness.builderStop ? readiness.builderStop.runId : null, assignmentId: decidesAssignment ? assignment.id : null, evidenceOpenedBeforeDecision, unopenedApproval: input.decision === 'approved' && !evidenceOpenedBeforeDecision, identity } })
       return { id: reviewId, ...input, decisionLatencySeconds, createdAt: timestamp }
     })
   }
@@ -1454,7 +1457,14 @@ export class ControlPlaneDatabase {
       criteria,
       blockers,
       policyFiles: proposal.policyFiles ?? null,
+      builderStop: proposal.runId ? this.builderStop(proposal.runId) : null,
     }
+  }
+
+  /** The Builder's own report that it was stopped at a budget, from the run that produced the head under review. */
+  private builderStop(runId: string): ReviewReadiness['builderStop'] {
+    const report = this.listAggregateEvents('agent_run', runId).filter((event) => event.eventType === 'agent_run.message' && typeof event.payload.stopped === 'string').at(-1)
+    return report ? { runId, reason: report.payload.stopped as BuilderStopReason, summary: String(report.payload.summary ?? '') } : null
   }
 
   listReviewReadiness(projectIds?: string[]): ReviewReadiness[] {

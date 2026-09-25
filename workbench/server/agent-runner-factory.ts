@@ -13,6 +13,14 @@ function parseStringArray(value: string | undefined, name: string) {
   return parsed as string[]
 }
 
+/** How long a Builder may run before the runner kills it; the Builder is told the resulting deadline. Default 10 minutes. */
+function parseTimeout(value: string | undefined) {
+  if (!value) return undefined
+  const timeoutMs = Number(value)
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 10_000 || timeoutMs > 2 * 60 * 60 * 1000) throw new Error('CONTROL_PLANE_AGENT_TIMEOUT_MS must be an integer between 10000 and 7200000')
+  return timeoutMs
+}
+
 export function createConfiguredAgentRunner(input: { database: ControlPlaneDatabase; dataDirectory: string; env?: NodeJS.ProcessEnv }) {
   const env = input.env ?? process.env
   const worktreeRoot = resolve(input.dataDirectory, 'agent-runs')
@@ -25,11 +33,12 @@ export function createConfiguredAgentRunner(input: { database: ControlPlaneDatab
   const processArgs = parseStringArray(env.CONTROL_PLANE_AGENT_ARGS_JSON, 'CONTROL_PLANE_AGENT_ARGS_JSON')
   const processEnvironmentAllowlist = parseStringArray(env.CONTROL_PLANE_AGENT_ENV_ALLOWLIST_JSON, 'CONTROL_PLANE_AGENT_ENV_ALLOWLIST_JSON')
   const allowProcessFallback = env.CONTROL_PLANE_ALLOW_PROCESS_FALLBACK === 'true'
+  const timeoutMs = parseTimeout(env.CONTROL_PLANE_AGENT_TIMEOUT_MS)
 
   if (engineExecutable && imageRef && containerCommand.length) {
     const probe = probeContainerEngine(engineExecutable)
     if (probe.available) {
-      const runner = new ContainerAgentRunner({ database: input.database, worktreeRoot, postprocessor, runtime: { engineExecutable, imageRef, command: containerCommand, cpuLimit: env.CONTROL_PLANE_CONTAINER_CPUS, memoryLimit: env.CONTROL_PLANE_CONTAINER_MEMORY, pidsLimit: env.CONTROL_PLANE_CONTAINER_PIDS ? Number(env.CONTROL_PLANE_CONTAINER_PIDS) : undefined, user: env.CONTROL_PLANE_CONTAINER_USER, tmpfsSize: env.CONTROL_PLANE_CONTAINER_TMPFS } })
+      const runner = new ContainerAgentRunner({ database: input.database, worktreeRoot, timeoutMs, postprocessor, runtime: { engineExecutable, imageRef, command: containerCommand, cpuLimit: env.CONTROL_PLANE_CONTAINER_CPUS, memoryLimit: env.CONTROL_PLANE_CONTAINER_MEMORY, pidsLimit: env.CONTROL_PLANE_CONTAINER_PIDS ? Number(env.CONTROL_PLANE_CONTAINER_PIDS) : undefined, user: env.CONTROL_PLANE_CONTAINER_USER, tmpfsSize: env.CONTROL_PLANE_CONTAINER_TMPFS } })
       return { runner, descriptor: runner.descriptor, evidenceStore }
     }
     if (!allowProcessFallback || !processExecutable) return { runner: undefined, descriptor: { id: 'container-agent@0.1', isolation: 'container', status: 'unavailable', productionEligible: false, networkEgress: 'denied', imageRef, reason: `Container configured but unavailable: ${probe.reason}` } satisfies AgentRunnerDescriptor, evidenceStore }
@@ -39,7 +48,7 @@ export function createConfiguredAgentRunner(input: { database: ControlPlaneDatab
     // The provider is read here rather than at process start so that saving it in the workbench takes
     // effect on the next run: the worker process builds its own runner through this same factory.
     const provider = input.database.getAgentProviderSettings()
-    const runner = new LocalCommandAgentRunner({ database: input.database, executable: processExecutable, args: processArgs, environmentAllowlist: processEnvironmentAllowlist, provider, worktreeRoot, postprocessor })
+    const runner = new LocalCommandAgentRunner({ database: input.database, executable: processExecutable, args: processArgs, environmentAllowlist: processEnvironmentAllowlist, provider, worktreeRoot, timeoutMs, postprocessor })
     return { runner, descriptor: { ...runner.descriptor, reason: engineExecutable ? 'Container unavailable; explicit process fallback is active.' : runner.descriptor.reason, model: provider?.model, modelProvider: provider?.providerId }, evidenceStore }
   }
 

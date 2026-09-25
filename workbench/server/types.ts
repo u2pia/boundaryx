@@ -320,6 +320,9 @@ export type ReviewEvidenceRecord = {
   createdAt: string
 }
 
+/** Why a Builder was made to stop before it considered the change done. */
+export type BuilderStopReason = 'time_budget' | 'step_budget'
+
 export type ReviewReadiness = {
   changeProposalId: string
   headSha: string
@@ -338,6 +341,8 @@ export type ReviewReadiness = {
   blockers: string[]
   /** `.aperture/` files the head changes; approving them needs an owner and a reason. Null: not scanned yet (refresh). */
   policyFiles: string[] | null
+  /** The run that produced the current head was stopped at its budget, so the change may be partial; approving it needs a reason. */
+  builderStop: { runId: string; reason: BuilderStopReason; summary: string } | null
 }
 
 export type CriterionOverride = {

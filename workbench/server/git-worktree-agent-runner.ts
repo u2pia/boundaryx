@@ -8,7 +8,7 @@ import { LocalGitAuthority } from './local-git-authority.ts'
 import { applyProjectManifest, loadProjectManifest, type ProjectManifestBinding } from './project-manifest.ts'
 import { removeRunWorktree, runRootFor, type PruneOutcome } from './run-worktree-lifecycle.ts'
 import { sha256 } from './security.ts'
-import { AppError, type AgentRun, type AgentRunRequest, type AgentRunner, type AgentRunnerDescriptor, type ChangeProposal, type IntentVersion, type WorkItem } from './types.ts'
+import { AppError, type AgentRun, type AgentRunRequest, type AgentRunner, type AgentRunnerDescriptor, type BuilderStopReason, type ChangeProposal, type IntentVersion, type WorkItem } from './types.ts'
 
 export type AgentRuntimeAttestation = {
   runtimeId: string
@@ -67,13 +67,16 @@ export type AgentRunPostprocessorInput = {
   attestation: AgentRuntimeAttestation
   stdoutDigest?: string
   stderrDigest?: string
+  /** Set when the Builder reported that it was stopped at its budget rather than finishing. */
+  builderStopped?: BuilderStopReason
 }
 
 export interface AgentRunPostprocessor {
   process(input: AgentRunPostprocessorInput): unknown
 }
 
-type AgentProtocolMessage = { type: 'context_consumed'; path: string } | { type: 'message'; summary: string }
+type AgentProtocolMessage = { type: 'context_consumed'; path: string } | { type: 'message'; summary: string; stopped?: BuilderStopReason }
+const builderStopReasons: readonly string[] = ['time_budget', 'step_budget'] satisfies BuilderStopReason[]
 
 function git(repositoryPath: string, args: string[]) {
   try {
@@ -90,7 +93,7 @@ function parseProtocol(stdout: string) {
     try {
       const value = JSON.parse(line) as Record<string, unknown>
       if (value.type === 'context_consumed' && typeof value.path === 'string') messages.push({ type: 'context_consumed', path: value.path })
-      if (value.type === 'message' && typeof value.summary === 'string') messages.push({ type: 'message', summary: value.summary.slice(0, 1000) })
+      if (value.type === 'message' && typeof value.summary === 'string') messages.push({ type: 'message', summary: value.summary.slice(0, 1000), ...(typeof value.stopped === 'string' && builderStopReasons.includes(value.stopped) ? { stopped: value.stopped as BuilderStopReason } : {}) })
     } catch {}
   }
   return messages
@@ -207,9 +210,13 @@ export class GitWorktreeAgentRunner implements AgentRunner {
       exitCode = result.status ?? undefined
       stdoutDigest = `sha256:${sha256(stdout)}`
       stderrDigest = `sha256:${sha256(stderr)}`
+      let builderStopped: BuilderStopReason | undefined
       for (const message of parseProtocol(stdout)) {
-        if (message.type === 'message') this.input.database.recordAgentRunEvent(runId, 'agent_run.message', { summary: message.summary }, actorId)
-        else this.recordContextConsumption(runId, worktreePath, declaredContextPaths, message.path, actorId)
+        if (message.type === 'message') {
+          // The agent's own report; review readiness reads `stopped` from the run behind the current head.
+          this.input.database.recordAgentRunEvent(runId, 'agent_run.message', { summary: message.summary, ...(message.stopped ? { stopped: message.stopped } : {}) }, actorId)
+          builderStopped = message.stopped ?? builderStopped
+        } else this.recordContextConsumption(runId, worktreePath, declaredContextPaths, message.path, actorId)
       }
       if (this.input.database.isAgentRunCancellationRequested(runId)) return this.terminal(runId, repositoryPath, actorId, { status: 'cancelled', exitCode, stdoutDigest, stderrDigest, errorMessage: 'Agent run was cancelled while the agent was generating' })
       if (result.error) throw new AppError((result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT' ? 408 : 422, `Agent runtime failed: ${result.error.message}`, 'agent_runtime_failed')
@@ -226,7 +233,7 @@ export class GitWorktreeAgentRunner implements AgentRunner {
         : authority.createChangeProposal({ workItemId: workItem.id, intentVersionId: intent.id, runId, repositoryPath, baseRef: queued.baseRef, headRef: branchRef, authorActorId: actorId }, actorId)
       changeProposalId = proposal.id
       this.input.database.recordAgentRunEvent(runId, revisionProposal ? 'agent_run.change_revised' : 'agent_run.change_proposed', { changeProposalId: proposal.id, previousHeadSha: revisionProposal?.headSha ?? null, headSha: proposal.headSha, changedFiles: proposal.changedFiles, additions: proposal.additions, deletions: proposal.deletions }, actorId)
-      this.input.postprocessor?.process({ runId, actorId, adapterId: this.id, worktreePath, workItem, intent, projectManifest, startSha, revisionOfProposalId: revisionProposal?.id, proposal, attestation, stdoutDigest, stderrDigest })
+      this.input.postprocessor?.process({ runId, actorId, adapterId: this.id, worktreePath, workItem, intent, projectManifest, startSha, revisionOfProposalId: revisionProposal?.id, proposal, attestation, stdoutDigest, stderrDigest, builderStopped })
       return this.terminal(runId, repositoryPath, actorId, { status: 'succeeded', changeProposalId: proposal.id, exitCode: result.status ?? 0, stdoutDigest, stderrDigest })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)

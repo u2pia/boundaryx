@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
+import { cliTimeoutMs, partialMessage, stoppedAtDeadline } from './run-deadline.mjs'
 
 const [codexExecutable, ...configuredArgs] = process.argv.slice(2)
 const requestPath = process.env.APERTURE_RUN_REQUEST
@@ -62,11 +63,17 @@ if (providerId) {
 if (process.env.APERTURE_AGENT_REASONING_EFFORT) providerArgs.push('-c', `model_reasoning_effort=${process.env.APERTURE_AGENT_REASONING_EFFORT}`)
 
 const lastMessagePath = resolve(dirname(requestPath), 'codex-last-message.txt')
-const result = spawnSync(codexExecutable, ['exec', '--approve-for-me', '--ephemeral', '--json', '-o', lastMessagePath, ...providerArgs, ...configuredArgs, '-'], { cwd: worktreePath, encoding: 'utf8', input: prompt, maxBuffer: 20 * 1024 * 1024 })
+const result = spawnSync(codexExecutable, ['exec', '--approve-for-me', '--ephemeral', '--json', '-o', lastMessagePath, ...providerArgs, ...configuredArgs, '-'], { cwd: worktreePath, encoding: 'utf8', input: prompt, maxBuffer: 20 * 1024 * 1024, timeout: cliTimeoutMs() })
 
 if (result.stdout) process.stdout.write(result.stdout)
 if (result.stderr) process.stderr.write(result.stderr)
-if (existsSync(lastMessagePath)) console.log(JSON.stringify({ type: 'message', summary: readFileSync(lastMessagePath, 'utf8').trim().slice(0, 1000) }))
+const lastMessage = existsSync(lastMessagePath) ? readFileSync(lastMessagePath, 'utf8').trim() : undefined
+// Stopped before the runner's deadline: what Codex wrote so far goes to the checks instead of being thrown away.
+if (stoppedAtDeadline(result)) {
+  console.log(partialMessage('Codex', lastMessage ? `Its last message: ${lastMessage}` : ''))
+  process.exit(0)
+}
+if (lastMessage !== undefined) console.log(JSON.stringify({ type: 'message', summary: lastMessage.slice(0, 1000) }))
 if (result.error) {
   console.error(result.error.message)
   process.exit(1)

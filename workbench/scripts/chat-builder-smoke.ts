@@ -101,7 +101,7 @@ try {
   assert.equal(existsSync(join(workspace, '.git/hooks/pre-commit')), false)
   assert.equal(spawnSync('git', ['-C', workspace, 'rev-parse', '--verify', '--quiet', 'HEAD']).status !== 0, true, 'no commit was made')
   assert.match(result.stdout, /"type":"context_consumed","path":"README\.md"/u)
-  assert.match(result.stdout, /"type":"message","summary":"Created src\/generated\.ts\."/u)
+  assert.match(result.stdout, /"type":"message","summary":"Created src\/generated\.ts\."\}/u, 'a Builder that finished on its own is not marked as stopped')
   assert.equal(result.stdout.includes(secret) || result.stderr.includes(secret), false)
 
   // A provider error is surfaced with the provider's message and a failing exit.
@@ -118,7 +118,7 @@ try {
   assert.match(JSON.stringify(budgetRequests[2].messages), /You have 10 steps left/u)
   assert.equal(existsSync(join(workspace, 'ignored-command')), false, 'nothing but finish runs on the last step')
   assert.match(budget.stderr, /step 12 run_command touch ignored-command → rejected/u)
-  assert.match(budget.stdout, /"type":"message","summary":"Stopped at the step budget; README reviewed\."/u)
+  assert.match(budget.stdout, /"type":"message","summary":"Stopped at the step budget; README reviewed\.","stopped":"step_budget"/u)
 
   // Before the runner's deadline the model is warned, a command is cut short so it cannot eat into the time kept for the
   // summary, and then only finish is offered; the run exits in time with a summary marked as partial.
@@ -132,14 +132,14 @@ try {
   assert.match(String(slowCommand?.content), /ETIMEDOUT/u, clock.stderr)
   assert.equal(existsSync(join(workspace, 'late-command')), false)
   assert.match(clock.stderr, /asking for finish/u)
-  assert.match(clock.stdout, /"type":"message","summary":"Stopped at the time budget; the change may be partial\. README reviewed\."/u)
+  assert.match(clock.stdout, /"type":"message","summary":"Stopped at the time budget; the change may be partial\. README reviewed\.","stopped":"time_budget"/u)
 
   clockRequests.length = 0
   const stallStartedAt = Date.now()
   const stall = await run([join(agents, 'chat-builder.mjs')], { ...provider, APERTURE_AGENT_PROVIDER_BASE_URL: `http://127.0.0.1:${port}/stall`, APERTURE_AGENT_PROVIDER_WIRE_API: 'chat', APERTURE_RUN_DEADLINE: String(stallStartedAt + 4_000) })
   assert.equal(stall.status, 0, stall.stderr)
   assert.ok(Date.now() - stallStartedAt < 4_000, 'a model that never answers the last step does not hold the builder past the deadline')
-  assert.match(stall.stdout, /"type":"message","summary":"Stopped at the time budget before the Builder could summarise its work\. The change is partial/u)
+  assert.match(stall.stdout, /"type":"message","summary":"Stopped at the time budget before the Builder could summarise its work\. The change is partial[^"]*","stopped":"time_budget"/u)
 
   // "responses" needs Codex, Anthropic needs Claude Code; each is routed only when configured.
   const fakeCodex = join(root, 'fake-codex')

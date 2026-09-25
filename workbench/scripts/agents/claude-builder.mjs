@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
+import { cliTimeoutMs, partialMessage, stoppedAtDeadline } from './run-deadline.mjs'
 
 const [claudeExecutable, ...configuredArgs] = process.argv.slice(2)
 const requestPath = process.env.APERTURE_RUN_REQUEST
@@ -70,7 +71,7 @@ const result = spawnSync(claudeExecutable, [
   '--allowedTools', 'Read,Write,Edit,Glob,Grep',
   ...modelArgs,
   ...configuredArgs,
-], { cwd: worktreePath, encoding: 'utf8', input: prompt, maxBuffer: 20 * 1024 * 1024, env: { ...process.env, ...providerEnvironment } })
+], { cwd: worktreePath, encoding: 'utf8', input: prompt, maxBuffer: 20 * 1024 * 1024, timeout: cliTimeoutMs(), env: { ...process.env, ...providerEnvironment } })
 
 if (result.stderr) process.stderr.write(result.stderr)
 
@@ -84,6 +85,11 @@ if (result.stdout) {
   } catch {
     process.stderr.write('claude-builder could not parse --output-format json payload\n')
   }
+}
+// Stopped before the runner's deadline: what Claude Code wrote so far goes to the checks instead of being thrown away.
+if (stoppedAtDeadline(result)) {
+  console.log(partialMessage('Claude Code'))
+  process.exit(0)
 }
 if (summary) console.log(JSON.stringify({ type: 'message', summary: summary.trim().slice(0, 1000) }))
 

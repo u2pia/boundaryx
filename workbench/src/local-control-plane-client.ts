@@ -214,6 +214,7 @@ export type LocalReviewReadiness = {
   criteria: Array<{ criterionId: string; label: string; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; mapping: 'rule'; checkNames: string[]; independent?: boolean; unmappedReason?: string; status: 'passed' | 'self_graded' | 'failed' | 'pending' | 'unmapped' | 'awaiting_review' | 'overridden'; override?: LocalCriterionOverride }>
   blockers: string[]
   policyFiles: string[] | null
+  builderStop: { runId: string; reason: 'time_budget' | 'step_budget'; summary: string } | null
 }
 
 export type LocalEvidencePackageView = {

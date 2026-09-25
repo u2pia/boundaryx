@@ -190,6 +190,8 @@ let summary
 // Set once the working time is spent; from then on every step is a last step.
 let timeUp = false
 let wrapUpSent = false
+// Why the Builder was made to stop, if it did not finish on its own; the runner records it for review.
+let stopped
 try {
   for (let step = 1; step <= maxSteps && summary === undefined; step += 1) {
     // Near the end of either budget the model is told to wrap up; on the last step finish is the only tool it has,
@@ -205,6 +207,7 @@ try {
       console.error(`[chat-builder] step ${step} time budget spent; asking for finish`)
     }
     const last = step === maxSteps || timeUp
+    if (last) stopped = timeUp ? 'time_budget' : 'step_budget'
     if (last) messages.push({ role: 'user', content: timeUp ? 'Time is up: this is your last step. Call finish now with a summary of what you changed and what is left undone.' : 'This is your last step. Call finish now with a summary of what you changed and what is left undone.' })
     // Models do not all honour a narrowed tool list, so the last step also forces finish and runs nothing else.
     let message
@@ -221,6 +224,7 @@ try {
       // Not even the summary fits: the changes are handed over as they are, marked as partial.
       console.error(`[chat-builder] step ${step} ${error.message}; handing over the change without a model summary`)
       summary = 'Stopped at the time budget before the Builder could summarise its work. The change is partial: review it against every acceptance criterion.'
+      stopped = 'time_budget'
       break
     }
     const calls = message.tool_calls ?? []
@@ -262,4 +266,4 @@ if (summary === undefined) {
   console.error(`chat-builder stopped after ${maxSteps} steps without calling finish`)
   process.exit(1)
 }
-console.log(JSON.stringify({ type: 'message', summary: summary.slice(0, 1000) }))
+console.log(JSON.stringify({ type: 'message', summary: summary.slice(0, 1000), ...(stopped ? { stopped } : {}) }))

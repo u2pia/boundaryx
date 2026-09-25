@@ -77,6 +77,8 @@ process.env.CODEX_ENV_DUMP = environmentDumpPath
 const agentEnvironment = { ...process.env, CONTROL_PLANE_AGENT_EXECUTABLE: process.execPath, CONTROL_PLANE_AGENT_ARGS_JSON: JSON.stringify([agentScript]) }
 
 try {
+  // A mistyped run timeout fails at startup instead of quietly falling back to the default.
+  for (const value of ['9999', '7200001', '60s', '15000.5']) assert.throws(() => createConfiguredAgentRunner({ database, dataDirectory: root, env: { ...agentEnvironment, CONTROL_PLANE_AGENT_TIMEOUT_MS: value } }), /CONTROL_PLANE_AGENT_TIMEOUT_MS must be an integer between 10000 and 7200000/u, value)
   const bootstrap = createConfiguredAgentRunner({ database, dataDirectory: root, env: agentEnvironment })
   const request = makeRequester(createControlPlaneRequestHandler({ database, agentRunner: bootstrap.runner, agentRuntimeDescriptor: bootstrap.descriptor, evidenceStore: bootstrap.evidenceStore }))
 

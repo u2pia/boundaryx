@@ -127,9 +127,13 @@ npm run server:start
 内置引擎有两道预算，用完都会先交出阶段性结果，而不是被直接杀掉、连同改动一起丢弃：
 
 - **步数**：`APERTURE_BUILDER_MAX_STEPS`，默认 120 步。
-- **时间**：Runner 在启动 Agent 时通过 `APERTURE_RUN_DEADLINE`（epoch 毫秒）告诉它自己何时会被杀，默认是 10 分钟后。
+- **时间**：Runner 在启动 Agent 时通过 `APERTURE_RUN_DEADLINE`（epoch 毫秒）告诉它自己何时会被杀，默认是 10 分钟后；可用 `CONTROL_PLANE_AGENT_TIMEOUT_MS` 调整（10000–7200000 的整数，写错时服务拒绝启动）。
 
-从截止时间往回留出三段，按 10 分钟计：约 15 秒用于退出，约 90 秒用于最后一次写总结的模型调用，再往前约 2 分钟会提醒模型收尾。之后只提供 `finish`；`run_command` 和模型调用都会被截断，占不到这段预留时间。因时间停下的总结以 `Stopped at the time budget` 开头，标明改动可能不完整；连总结都来不及写时，引擎会代写一条。无论哪种情况，改动都会照常提交并跑完全部检查，再交给评审。`codex-builder` 和 `claude-builder` 目前还不读取这个截止时间。
+从截止时间往回留出三段，按 10 分钟计：约 15 秒用于退出，约 90 秒用于最后一次写总结的模型调用，再往前约 2 分钟会提醒模型收尾。之后只提供 `finish`；`run_command` 和模型调用都会被截断，占不到这段预留时间。因时间停下的总结以 `Stopped at the time budget` 开头，标明改动可能不完整；连总结都来不及写时，引擎会代写一条。无论哪种情况，改动都会照常提交并跑完全部检查，再交给评审。
+
+`codex-builder` 和 `claude-builder` 没法让外部 CLI 收尾，因此它们在截止时间前（留出 10%，最多 30 秒）直接停掉 CLI，把 worktree 里已有的改动照常交出，总结同样以 `Stopped at the time budget` 开头；Codex 最后一条消息会附在后面。
+
+停下的原因（`time_budget` 或 `step_budget`）随 `agent_run.message` 事件记录，写进证据包的 `run.builderStopped`，并出现在当前 Head 的 Review Readiness（`builderStop`）里。评审页会把这类提案标为「部分变更」；批准时必须在审查意见里写明为什么接受它（否则返回 `409 review_partial_change_unacknowledged`），批准事件记录 `partialChangeAcknowledged`。之后由完整跑完的 Run 产生的新 Revision 不再带这个标记。
 
 也可以直接指定单个包装器：
 `scripts/agents/*.mjs` 是 Builder Agent 包装器，不是可执行文件：它们没有 shebang 也没有执行位，必须由 `node` 调用，包装器的第一个参数才是真实 Agent CLI。因此 Codex 的启动形式是 `node <wrapper> <codex>`：
