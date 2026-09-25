@@ -101,8 +101,12 @@ try {
   assert.throws(() => database.setProjectMember({ projectId: beta.id, actorId: bob.id, role: 'reviewer' }, alice.id), failsWith('project_admin_forbidden'))
 
   assert.deepEqual(new Set(database.visibleProjectIds(owner.id)), new Set([DEFAULT_PROJECT_ID, alpha.id, beta.id]), 'an owner sees every project')
-  assert.deepEqual(new Set(database.visibleProjectIds(alice.id)), new Set([alpha.id, beta.id]))
-  assert.deepEqual(database.visibleProjectIds(bob.id), [alpha.id])
+  // Everyone is in the default project, which holds the sample data, on top of the projects they were given.
+  assert.deepEqual(new Set(database.visibleProjectIds(alice.id)), new Set([DEFAULT_PROJECT_ID, alpha.id, beta.id]))
+  assert.deepEqual(new Set(database.visibleProjectIds(bob.id)), new Set([DEFAULT_PROJECT_ID, alpha.id]))
+  assert.throws(() => database.removeProjectMember({ projectId: DEFAULT_PROJECT_ID, actorId: bob.id }, owner.id), failsWith('default_project_member_fixed'))
+  assert.throws(() => database.archiveProject(DEFAULT_PROJECT_ID, owner.id), failsWith('default_project_fixed'))
+  assert.equal(database.setProjectMember({ projectId: DEFAULT_PROJECT_ID, actorId: bob.id, role: 'reviewer' }, owner.id).role, 'reviewer', 'the role there can still change')
   assert.deepEqual([database.projectRole(alice.id, alpha.id), database.projectRole(alice.id, beta.id), database.projectRole(bob.id, beta.id)], ['developer', 'reviewer', undefined])
 
   // --- The repository comes from the work item's project. ---
@@ -168,8 +172,9 @@ try {
   const [ownerCookie, aliceCookie, bobCookie] = [await login('owner'), await login('alice'), await login('bob')]
 
   const bobProjects = await call<{ projects: Array<{ id: string }>; roles: Record<string, string> }>('/api/projects', { cookie: bobCookie })
-  assert.deepEqual([bobProjects.body.projects.map((project) => project.id), bobProjects.body.roles], [[alpha.id], { [alpha.id]: 'reviewer' }])
-  assert.deepEqual((await call<{ workItems: Array<{ id: string }> }>('/api/work-items', { cookie: bobCookie })).body.workItems.map((item) => item.id), [alphaWork.workItem.id])
+  assert.deepEqual([bobProjects.body.projects.map((project) => project.id), bobProjects.body.roles], [[DEFAULT_PROJECT_ID, alpha.id], { [DEFAULT_PROJECT_ID]: 'reviewer', [alpha.id]: 'reviewer' }])
+  const bobWorkItems = (await call<{ workItems: Array<{ id: string; projectId: string }> }>('/api/work-items', { cookie: bobCookie })).body.workItems
+  assert.deepEqual(bobWorkItems.filter((item) => item.projectId !== DEFAULT_PROJECT_ID).map((item) => item.id), [alphaWork.workItem.id], 'beta stays hidden; the shared default project is visible')
   assert.equal((await call('/api/work-items?projectId=' + beta.id, { cookie: bobCookie })).body.error.code, 'project_not_found')
   for (const path of [`/api/work-items/${betaWork.workItem.id}`, `/api/change-proposals/${betaWork.proposal.id}`, `/api/projects/${beta.id}`]) {
     const response = await call(path, { cookie: bobCookie })
@@ -244,11 +249,13 @@ try {
   assert.deepEqual(['WI-0', 'WI-2', 'WI-1', 'WI-orphan'].map((workItemId) => upgraded.getWorkItem(workItemId).sequence), [1, 2, 1, 1], 'existing work items are numbered per project in creation order')
   assert.deepEqual(backfilled.map((project) => upgraded.projectRole('ACT-R', project.id)), ['reviewer', 'reviewer'], 'existing members keep their access')
   assert.equal(upgraded.projectRole('ACT-O', projectOf(betaRepository)), 'owner')
+  assert.equal((upgraded.db.prepare("SELECT role FROM project_members WHERE project_id = ? AND actor_id = 'ACT-R'").get(DEFAULT_PROJECT_ID) as { role: string } | undefined)?.role, 'reviewer', '022 puts existing members in the default project')
+  assert.equal(upgraded.db.prepare("SELECT 1 FROM project_members WHERE actor_id = 'ACT-O'").get(), undefined, 'owners stay implicit members')
   assert.equal((upgraded.db.prepare("SELECT project_id FROM domain_events WHERE id = 'EVT-L'").get() as { project_id: string }).project_id, projectOf(betaRepository), 'past events are routed to their project')
   assert.throws(() => upgraded.db.prepare("UPDATE domain_events SET event_type = 'x' WHERE id = 'EVT-L'").run(), /append-only/u, 'the append-only guard is back after the backfill')
   upgraded.close()
 
-  console.log('project scope smoke passed · non-members see nothing · roles per project · reviewers picked from members · repository from the project · local paths validated · 019 backfill splits by repository · work items numbered per project')
+  console.log('project scope smoke passed · non-members see nothing · roles per project · reviewers picked from members · repository from the project · local paths validated · 019 backfill splits by repository · everyone sees the default project · work items numbered per project')
 } finally {
   database.close()
   rmSync(root, { recursive: true, force: true })

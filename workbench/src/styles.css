@@ -610,6 +610,8 @@ nav::-webkit-scrollbar { display: none; }
 .demo-region-bar p { margin: 2px 0 0; color: var(--text-dim); font-size: var(--text-sm); }
 .demo-region-tag { flex: 0 0 auto; padding: 3px 8px; border: 1px solid rgba(228,168,74,.4); border-radius: var(--radius-sm); color: var(--amber-text); background: rgba(228,168,74,.07); font-size: var(--text-xs); font-weight: 600; }
 .demo-region-bar .secondary-button { min-height: 32px; flex: 0 0 auto; }
+.demo-region-elsewhere { background: transparent; }
+.project-demo-tag { margin-left: 6px; padding: 1px 6px; border: 1px solid rgba(228,168,74,.4); border-radius: var(--radius-sm); color: var(--amber-text); background: rgba(228,168,74,.07); font-size: var(--text-xs); font-style: normal; font-weight: 600; vertical-align: middle; }
 .demo-region-chevron { transition: transform .15s ease; }
 .demo-region-chevron.open { transform: rotate(180deg); }
 .demo-region-body { padding: 4px 14px 14px; border-top: 1px dashed rgba(228,168,74,.28); }

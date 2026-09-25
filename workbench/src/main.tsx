@@ -72,6 +72,7 @@ import type { WorkbenchState } from './store-model'
 import { useWorkbench } from './use-workbench'
 import { useLocalControlPlane } from './local-control-plane-context'
 import type { LocalActor, LocalActorUpdate, LocalAgentRunDetail, LocalAgentRuntimeDescriptor, LocalWorkItem, LocalCodeHostConnection, LocalProject, LocalProjectInput, LocalProjectRole, LocalIdentityMode, LocalChangeProposal, LocalEvidencePackageView, LocalIntentVersion, LocalReviewAssignment, LocalReviewReadiness } from './local-control-plane-client'
+import { DEMO_PROJECT_ID } from './local-control-plane-client'
 import './styles.css'
 
 type Page = '总览' | 'Intents' | '上下文' | 'Agent Runs' | '评审队列' | '发布' | '评估' | '证据中心' | '追溯' | '策略' | '反馈闭环' | '集成' | '项目' | '团队' | '度量'
@@ -244,8 +245,10 @@ function createEvidencePackage(run: NonNullable<WorkbenchState['liveRun']>) {
 }
 
 function App() {
-  const { notifications, dismissNotification } = useWorkbench()
+  const { notifications: demoNotifications, dismissNotification } = useWorkbench()
   const localControlPlane = useLocalControlPlane()
+  // The prototype store's notifications are sample data too, so they stay with the rest of it.
+  const notifications = useDemoScope() ? demoNotifications : []
   const [page, setPage] = useState<Page>(() => hashToPage[window.location.hash.replace('#/', '')] ?? '总览')
   const routeMounted = useRef(false)
   const [selectedReview, setSelectedReview] = useState<ReviewItem | null>(null)
@@ -468,12 +471,12 @@ function ProjectSwitcher({ onManage }: { onManage: () => void }) {
   return <div className="project-switcher-wrap">
     <button className="project-switcher" onClick={() => setOpen((value) => !value)} aria-haspopup="listbox" aria-expanded={open} disabled={switching}>
       <span className="project-icon">{(project?.slug ?? '—').slice(0, 2).toUpperCase()}</span>
-      <span><strong>{project?.name ?? '没有可用项目'}</strong><small>{project ? `${codeHostLabels[project.codeHost]} · ${projectRoleLabels[local.currentProjectRole ?? 'developer']}${project.status === 'archived' ? ' · 已归档' : ''}` : '请 Owner 把你加入项目'}</small></span>
+      <span><strong>{project?.name ?? '没有可用项目'}{project?.id === DEMO_PROJECT_ID && <em className="project-demo-tag">演示</em>}</strong><small>{project ? `${codeHostLabels[project.codeHost]} · ${projectRoleLabels[local.currentProjectRole ?? 'developer']}${project.status === 'archived' ? ' · 已归档' : ''}` : '请 Owner 把你加入项目'}</small></span>
       <ChevronDown size={15} />
     </button>
     {open && <div className="project-menu" role="listbox" aria-label="切换项目">
       {local.projects.map((item) => <button key={item.id} role="option" aria-selected={item.id === local.currentProjectId} className={item.id === local.currentProjectId ? 'active' : undefined} onClick={() => void pick(item.id)}>
-        <FolderGit2 size={13} /><span><strong>{item.name}</strong><small>{item.slug} · {codeHostLabels[item.codeHost]} · {projectRoleLabels[local.projectRoles[item.id] ?? 'developer']}{item.status === 'archived' ? ' · 已归档' : ''}</small></span>{item.id === local.currentProjectId && <Check size={13} />}
+        <FolderGit2 size={13} /><span><strong>{item.name}{item.id === DEMO_PROJECT_ID && <em className="project-demo-tag">演示</em>}</strong><small>{item.slug} · {codeHostLabels[item.codeHost]} · {projectRoleLabels[local.projectRoles[item.id] ?? 'developer']}{item.status === 'archived' ? ' · 已归档' : ''}</small></span>{item.id === local.currentProjectId && <Check size={13} />}
       </button>)}
       <button className="project-menu-manage" onClick={() => { setOpen(false); onManage() }}><Settings size={13} /><span>{local.actor?.role === 'owner' ? '管理项目与成员' : '查看项目'}</span></button>
     </div>}
@@ -511,14 +514,34 @@ function Sidebar({ page, onNavigate, open, collapsed, onToggle }: { page: Page; 
   )
 }
 
+/**
+ * Whether static sample data may be shown: only in the default project, which has no repository and so no real work
+ * to be confused with, and before sign-in, when there is no project at all.
+ */
+function useDemoScope() {
+  const local = useLocalControlPlane()
+  return !(local.status === 'ready' && local.actor) || local.currentProjectId === DEMO_PROJECT_ID
+}
+
 // Everything below a DemoRegion is static sample data. It used to share cards, check marks and scores with the
 // real sections above it, so a reviewer could not tell them apart at a glance; the region now carries its own frame,
-// neutralises the "passed" greens, and folds away once a real session exists.
+// neutralises the "passed" greens, and appears only in the default project, where it is open by default.
 function DemoRegion({ title, note, actions, children }: { title: string; note: string; actions?: React.ReactNode; children: React.ReactNode }) {
   const local = useLocalControlPlane()
+  const demoScope = useDemoScope()
   const [expanded, setExpanded] = useState<boolean>()
   const bodyId = useId()
-  const open = expanded ?? !(local.status === 'ready' && local.actor)
+  const open = expanded ?? true
+  const demoProject = local.projects.find((project) => project.id === DEMO_PROJECT_ID)
+  if (!demoScope) return (
+    <section className="demo-region demo-region-elsewhere" aria-label={`演示数据：${title}`}>
+      <header className="demo-region-bar">
+        <span className="demo-region-tag">演示数据</span>
+        <div><strong>{title}</strong><p>演示数据只在「{demoProject?.name ?? '默认项目'}」中显示；当前项目只展示真实数据。</p></div>
+        {demoProject && <button className="secondary-button" onClick={() => void local.selectProject(DEMO_PROJECT_ID)}>切换到演示项目</button>}
+      </header>
+    </section>
+  )
   return (
     <section className="demo-region" aria-label={`演示数据：${title}`}>
       <header className="demo-region-bar">
@@ -2171,7 +2194,7 @@ function ProjectsPage() {
     <div className="member-row"><span className="member-avatar">OW</span><div><strong>{local.actors.filter((actor) => actor.role === 'owner').map((actor) => actor.displayName).join('、')}</strong><small>平台 Owner · 隐式 Owner</small></div></div>
     {local.projectMembers.length === 0 && <p className="local-run-notice"><Users size={11} />除 Owner 外暂无成员。</p>}
     {local.projectMembers.map((member) => <div className="member-row" key={member.actorId}><span className="member-avatar">{member.displayName.slice(0, 2).toUpperCase()}</span><div><strong>{member.displayName}</strong><small>local:{member.username} · 加入于 {new Date(member.addedAt).toLocaleDateString()}</small></div>
-      {isOwner ? <><select value={member.role} disabled={busy === `member:${member.actorId}`} onChange={(event) => void run(`member:${member.actorId}`, () => local.setProjectMember(current.id, member.actorId, event.target.value as LocalProjectRole), `${member.displayName} 在 ${current.slug} 的角色已改为 ${projectRoleLabels[event.target.value as LocalProjectRole]}。`)}>{(['maintainer', 'reviewer', 'developer'] as const).map((value) => <option key={value} value={value}>{projectRoleLabels[value]}</option>)}</select><button className="secondary-button" disabled={busy === `member:${member.actorId}`} onClick={() => void run(`member:${member.actorId}`, () => local.removeProjectMember(current.id, member.actorId), `${member.displayName} 已移出 ${current.slug}。`)}><X size={12} />移出</button></> : <span className="online">{projectRoleLabels[member.role]}</span>}
+      {isOwner ? <><select value={member.role} disabled={busy === `member:${member.actorId}`} onChange={(event) => void run(`member:${member.actorId}`, () => local.setProjectMember(current.id, member.actorId, event.target.value as LocalProjectRole), `${member.displayName} 在 ${current.slug} 的角色已改为 ${projectRoleLabels[event.target.value as LocalProjectRole]}。`)}>{(['maintainer', 'reviewer', 'developer'] as const).map((value) => <option key={value} value={value}>{projectRoleLabels[value]}</option>)}</select><button className="secondary-button" title={current.id === DEMO_PROJECT_ID ? '所有成员都在演示项目中，不能移出' : undefined} disabled={busy === `member:${member.actorId}` || current.id === DEMO_PROJECT_ID} onClick={() => void run(`member:${member.actorId}`, () => local.removeProjectMember(current.id, member.actorId), `${member.displayName} 已移出 ${current.slug}。`)}><X size={12} />移出</button></> : <span className="online">{projectRoleLabels[member.role]}</span>}
     </div>)}
     {isOwner && <div className="local-provider-actions"><select value={memberChoice.actorId} onChange={(event) => setMemberChoice((value) => ({ ...value, actorId: event.target.value }))}><option value="">{candidates.length ? '选择成员加入本项目' : '所有成员都已加入'}</option>{candidates.map((actor) => <option key={actor.id} value={actor.id}>{actor.displayName} · local:{actor.username}</option>)}</select><select value={memberChoice.role} onChange={(event) => setMemberChoice((value) => ({ ...value, role: event.target.value as LocalProjectRole }))}>{assignableRoleOptions}</select><button className="primary-button" disabled={!memberChoice.actorId || busy === 'member:add'} onClick={() => void run('member:add', async () => { await local.setProjectMember(current.id, memberChoice.actorId, memberChoice.role); setMemberChoice((value) => ({ ...value, actorId: '' })) }, '成员已加入。')}><Plus size={12} />加入项目</button></div>}
     {isOwner && <>
@@ -2211,7 +2234,7 @@ function ProjectsPage() {
         return <article key={project.id} className={`panel project-card ${project.id === local.currentProjectId ? 'current' : ''} ${project.status} ${open ? 'open' : 'collapsed'}`}>
           <button type="button" className="project-card-heading" aria-expanded={open} aria-controls={`project-body-${project.id}`} disabled={Boolean(editing)} onClick={toggle}>
             <span className="project-icon">{project.slug.slice(0, 2).toUpperCase()}</span>
-            <div><h2>{project.name}</h2><small>{project.slug} · {codeHostLabels[project.codeHost]} · {mergeModeLabels[project.mergeMode]} · 你的角色 {projectRoleLabels[local.projectRoles[project.id] ?? 'developer']}{project.id === local.currentProjectId ? ' · 当前项目' : ''}</small></div>
+            <div><h2>{project.name}{project.id === DEMO_PROJECT_ID && <em className="project-demo-tag">演示</em>}</h2><small>{project.slug} · {codeHostLabels[project.codeHost]} · {mergeModeLabels[project.mergeMode]} · 你的角色 {projectRoleLabels[local.projectRoles[project.id] ?? 'developer']}{project.id === local.currentProjectId ? ' · 当前项目' : ''}</small></div>
             <span className={`local-status ${project.status === 'active' ? 'approved' : 'closed'}`}>{project.status === 'active' ? '活跃' : '已归档'}</span>
             {open ? <ChevronDown size={16} className="project-card-chevron" /> : <ChevronRight size={16} className="project-card-chevron" />}
           </button>
@@ -2224,7 +2247,7 @@ function ProjectsPage() {
             {project.codeHost === 'github' && project.status === 'active' && (isOwner || local.projectRoles[project.id] === 'maintainer') && <button className="secondary-button" disabled={busy === `sync:${project.id}`} title="推送提案分支、开 PR、导入 GitHub Checks、回写 aperture/gate；服务端也会定时同步" onClick={() => void run(`sync:${project.id}`, async () => { const report = await local.syncProject(project.id); if (report.errors.length) throw new Error(`同步完成但有 ${report.errors.length} 个错误：${report.errors.map((item) => `${item.proposalId ? `${item.proposalId} ` : ''}${item.code}`).join('；')}`); setNotice(`${project.slug} 已同步：发布 ${report.published} · 导入检查 ${report.checksImported} · 门禁更新 ${report.gateUpdates} · 合并 ${report.merged} · 关闭 ${report.closed}`) })}><RefreshCw size={12} />{busy === `sync:${project.id}` ? '同步中' : '立即同步'}</button>}
             {isOwner && project.status === 'active' && !editing && <button className="secondary-button" onClick={() => { setEditingId(project.id); setEditForm(projectFormFrom(project)) }}><Settings size={12} />编辑配置</button>}
             {isOwner && editing && <><button className="primary-button" disabled={busy === `edit:${project.id}` || !editForm.name.trim()} onClick={() => void run(`edit:${project.id}`, async () => { await local.updateProject(project.id, projectInputFrom(editForm)); setEditingId(undefined) }, `${project.slug} 已更新，配置变更已记入事件日志。`)}><Save size={12} />保存</button><button className="secondary-button" onClick={() => setEditingId(undefined)}><X size={12} />取消</button></>}
-            {isOwner && project.status === 'active' && project.id !== 'PRJ-DEFAULT' && <button className="secondary-button danger" disabled={busy === `archive:${project.id}`} onClick={() => { if (window.confirm(`归档 ${project.name}？归档后不能再创建 Work Item 或启动 Run。`)) void run(`archive:${project.id}`, () => local.archiveProject(project.id), `${project.slug} 已归档。`) }}><Archive size={12} />归档</button>}
+            {isOwner && project.status === 'active' && project.id !== DEMO_PROJECT_ID && <button className="secondary-button danger" disabled={busy === `archive:${project.id}`} onClick={() => { if (window.confirm(`归档 ${project.name}？归档后不能再创建 Work Item 或启动 Run。`)) void run(`archive:${project.id}`, () => local.archiveProject(project.id), `${project.slug} 已归档。`) }}><Archive size={12} />归档</button>}
           </div>
           {project.id === current?.id ? membersPanel : <p className="local-run-notice" role="status"><RefreshCw size={11} />正在切换到此项目…</p>}
           </div>}

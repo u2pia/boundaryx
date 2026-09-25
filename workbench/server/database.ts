@@ -160,7 +160,8 @@ export class ControlPlaneDatabase {
     if (!actor.username || !actor.displayName) throw new AppError(400, 'Username and display name are required', 'invalid_actor')
     // Granting a role is granting capabilities, so it is a decision like any other (DOMAIN_MODEL.md §5).
     const identity = createdByActorId ? this.decisionIdentity(createdByActorId) : undefined
-    const projectIds = actor.role === 'owner' ? [] : input.projectIds ?? this.listProjects().filter((project) => project.status === 'active').map((project) => project.id)
+    // The default project carries the sample data everyone may look at, so every member joins it whatever else they join.
+    const projectIds = actor.role === 'owner' ? [] : [...new Set([DEFAULT_PROJECT_ID, ...(input.projectIds ?? this.listProjects().filter((project) => project.status === 'active').map((project) => project.id))])]
     for (const projectId of projectIds) this.getProject(projectId)
     return this.inTransaction(() => {
       this.db.prepare('INSERT INTO actors(id, username, display_name, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(actor.id, actor.username, actor.displayName, actor.role, actor.status, actor.createdAt)
@@ -312,6 +313,7 @@ export class ControlPlaneDatabase {
     this.assertDecisionActor(actorId, ['owner'], 'project_admin_forbidden')
     const current = this.getProject(projectId)
     if (current.status === 'archived') return current
+    if (projectId === DEFAULT_PROJECT_ID) throw new AppError(409, 'The default project holds the sample data and cannot be archived', 'default_project_fixed')
     if (this.projectHasOpenWork(projectId)) throw new AppError(409, 'Finish or close the open proposals and runs before archiving the project', 'project_has_open_work')
     const identity = this.decisionIdentity(actorId)
     return this.inTransaction(() => {
@@ -344,6 +346,7 @@ export class ControlPlaneDatabase {
     const target = this.db.prepare('SELECT role FROM actors WHERE id = ?').get(input.actorId) as { role: TeamRole } | undefined
     if (!target) throw new AppError(404, `Actor ${input.actorId} not found`, 'actor_not_found')
     if (target.role === 'owner') throw new AppError(409, 'Owners are members of every project and cannot be removed', 'owner_is_implicit_member')
+    if (input.projectId === DEFAULT_PROJECT_ID) throw new AppError(409, 'Everyone is a member of the default project, which holds the sample data; change the role instead', 'default_project_member_fixed')
     const current = (this.db.prepare('SELECT role FROM project_members WHERE project_id = ? AND actor_id = ?').get(input.projectId, input.actorId) as { role: ProjectRole } | undefined)?.role
     if (!current) throw new AppError(404, 'Actor is not a member of this project', 'project_member_not_found')
     const identity = this.decisionIdentity(removedByActorId)

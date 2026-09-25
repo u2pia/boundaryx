@@ -30,6 +30,9 @@ export type LocalMergeMode = 'control_plane' | 'host_protected'
 export type LocalProjectRole = 'maintainer' | 'reviewer' | 'developer'
 
 /** One repository under one code host, and the unit of access. The host config never holds a secret, only env var names. */
+/** The project every install starts with. It has no repository, so it holds the workbench's static sample data. */
+export const DEMO_PROJECT_ID = 'PRJ-DEFAULT'
+
 export type LocalProject = {
   id: string
   slug: string
