@@ -66,7 +66,7 @@
 - **不展示无来源的数字。** 演示数据必须带演示标注；侧栏曾硬编码导航计数和「本月 Agent 额度 68%」，在每个页面上无标注地出现，已删除。这是一个管证据的平台，界面自己不能编数；
 - 纯图标按钮必须有 `aria-label`，`title` 只在悬停时出现，不算可访问名称；
 - 表单错误用 `role="alert"`，异步进度提示用 `role="status"`，不抢焦点；
-- **演示内容放进 `<DemoRegion>`，不另起标签。** 它带虚线外框和「演示数据」标记，只在默认项目（`PRJ-DEFAULT`，没有仓库，项目切换器里标「演示」）和未登录时展开显示；在其他项目里只剩一行说明和「切换到演示项目」，右上角的原型通知也一并隐藏，真实项目的页面只展示真实数据；在它内部 `--green` / `--green-text` / `--green-rgb` 被重定义为中性灰，所以演示数据不会显示「通过」的绿色。这依赖绿色一律走 token——新的状态绿请用 `var(--green-text)` 或 `rgba(var(--green-rgb), …)`，写死的色值会漏出这个作用域；
+- **演示内容放进 `<DemoRegion>`，不另起标签。** 它带虚线外框和「演示数据」标记，只在默认项目（`PRJ-DEFAULT`，项目切换器里标「演示」，所有成员都在其中且不能移出、项目不能归档）和未登录时展开显示；在其他项目里只剩一行说明和「切换到演示项目」，右上角的原型通知也一并隐藏，真实项目的页面只展示真实数据；在它内部 `--green` / `--green-text` / `--green-rgb` 被重定义为中性灰，所以演示数据不会显示「通过」的绿色。这依赖绿色一律走 token——新的状态绿请用 `var(--green-text)` 或 `rgba(var(--green-rgb), …)`，写死的色值会漏出这个作用域；
 - 页头的主操作位只放真实可执行的操作。演示操作（如「播放演示 Run」）放在对应 `DemoRegion` 的 `actions` 里，未接入的原型按钮不放进页头；
 - 小标题（`.eyebrow`）只在携带信息时出现，例如区分「真实数据」与演示数据，不做装饰；不用全大写英文，也不加宽字距；
 - 每个输入框都要有可访问名称（可见 label 或 `aria-label`），不能只靠 placeholder；登录与初始化的密码框分别标 `autoComplete="current-password"` / `"new-password"`。
@@ -103,6 +103,8 @@ npm install
 npm run build
 npm run server:start
 ```
+
+完成首次初始化（创建 Owner）后，`npm run seed:demo` 给默认项目写入一套演示：在数据目录下建一个发票服务示例仓库并接到默认项目，由一个脚本化 Builder（不调模型、不联网）走真实流水线——Run、仓库声明的 Check、`@baseline` 复跑、证据包、审查与合并——留下五条工作项：已合并、待审查、被失败测试阻塞、到时间预算交出的部分变更（批准需书面确认）、Intent 待批准。演示成员（`demo-*`）用随机密码创建、写完即停用，没人能以它们登录；待审查那条留给真实成员来审。默认项目已有工作项时脚本什么都不做；`npm run test:seed-demo` 在临时库上验证这套结果。
 
 真实案例驱动脚本为 `npm run case:real`。它需要显式提供 Owner、Reviewer 密码与目标仓库路径，并要求服务已配置 `CONTROL_PLANE_AGENT_EXECUTABLE` 和 `CONTROL_PLANE_AGENT_ARGS_JSON`。Check、Context 与项目执行策略不再由服务启动变量提供，而是从目标仓库基线 Revision 的 `.aperture/project.json` 加载。脚本不保存明文密码。
 
@@ -148,7 +150,7 @@ npm run server:start
 
 ## LLM Provider 配置
 
-Builder Agent 使用哪个模型由控制面决定，不由操作者本机的 CLI 配置决定。集成页的 `BUILDER AGENT LLM PROVIDER` 表单中手动填写 Provider ID、Model、Base URL、Wire API、Reasoning Effort 与 API Key 后保存即可，无需重启服务：Worker 进程在领取每个 Run 时从数据库重建 Runner。
+Builder Agent 使用哪个模型由控制面决定，不由操作者本机的 CLI 配置决定。集成页的 `BUILDER AGENT LLM PROVIDER` 表单中手动填写 Provider ID、Model、Base URL、Wire API、Reasoning Effort 与 API Key 后保存即可，无需重启服务：Runner 在准入与执行时各自从数据库读取当前 Provider，两次 Attestation 一致（服务启动时构建的 Runner 也不会沿用旧 Provider）。
 
 - 只有 Owner 可以修改；Owner、Maintainer、Developer 可以读取；Reviewer 无权读取，表单对其隐藏。
 - API Key 只写不读。读接口只返回是否持有密钥；留空表示保留已存密钥，显式清空表示删除。密钥以明文存于本地 SQLite——本地测试阶段接受这一取舍，但它是显式的技术债：进入多人或生产部署前必须换成操作系统密钥链或 KMS 封装，不能默认它安全。
@@ -172,6 +174,7 @@ Intent 页的表单按 `PRODUCT_CHARTER.md` 的定义补三样东西：验收标
 | `[人工]` / `[human]` | 必须由人判断 |
 | `[关键]` / `[critical]` | 关键项（默认）。未被证明或证据失败时不得进入 Approved，见下文「验收标准证据门禁」 |
 | `[参考]` / `[normal]` | 非关键项，不阻塞合并 |
+| 行尾 `[验证: node-tests, lint]` / `[verify: …]` | 起草人显式声明这条标准由哪些检查证明（`verifiedBy`），见下文。不能用于 `[人工]` 标准 |
 
 不写标注时默认按「关键 · 确定性」处理。**默认成 `critical` 是有意的**：`DOMAIN_MODEL.md` 规定"Critical 评估失败时不得进入 Approved"，若无标注的行默认成 `normal`，习惯直接敲纯文本的人会在不知情的情况下把审批门禁关掉。安全默认值必须是 `critical`，降级必须显式写 `[参考]`。遇到第一个未识别的方括号（如打错的 `[确定]`，或语句本身以 `[POST /api/import]`、`[边界]` 开头）就停止解析标注，把它**连同其后内容原样保留为语句**并给出告警。这两种情况在语法上无法区分，只能选不丢信息的一侧——被切掉的文字会进入 `contentDigest` 与 Agent prompt，Agent 看到的就不再是起草人写下的那句话。单条标准上限 300 字，超长通常意味着几条标准写在了一行里。
 
@@ -180,18 +183,20 @@ Intent 页的表单按 `PRODUCT_CHARTER.md` 的定义补三样东西：验收标
 硬拦截只有以下几条，全部在服务端执行：
 
 - `DOMAIN_MODEL.md` 的"高风险 Intent 必须定义人工审批要求"：`riskLevel` 为 `high` 时必须至少有一条**关键的** `[人工]` 标准。用一条自己声明"不阻塞合并"的 `[参考][人工]` 来满足它是自相矛盾的，所以不算；
+- 关键 `[人工]` 标准必须写清由谁判断什么：含 `<占位符>` 或少于 8 个字（如「人工审核通过」「ok」）的语句被拒绝（`human_criterion_not_substantive`）。模版里的 `[人工] <谁> 确认 <什么>` 必须改写后才能提交；
 - 中、高风险必须至少有一条关键标准。全部写成 `[参考]` 的 Intent 会在审批门禁开始读取 `criticality` 的那天静默绕过它；低风险允许，但会告警；
-- 枚举值合法、语句非空、单条不超过 300 字。
+- 枚举值合法、语句非空、单条不超过 300 字；`verifiedBy` 最多 8 个合法检查名，不能写 `@baseline`（独立性由平台判定，不由起草人声明）。
 
-**验收标准证据门禁**：审查与批准路径逐条读取 `criticality` / `verificationType`（实现在 `server/criteria-coverage.ts`，由 `getReviewReadiness` 与 `recordReview` 调用）。`DOMAIN_MODEL.md` 要求 AC → 检查的映射来自人或确定性规则、不能来自模型；Intent 目前还不携带显式映射，所以全部是规则映射（`mapping: 'rule'`）：
+**验收标准证据门禁**：审查与批准路径逐条读取 `criticality` / `verificationType`（实现在 `server/criteria-coverage.ts`，由 `getReviewReadiness` 与 `recordReview` 调用）。`DOMAIN_MODEL.md` 要求 AC → 检查的映射来自人或确定性规则、不能来自模型；写了 `[验证: …]` 的标准用人声明的映射（`mapping: 'declared'`），其余用规则映射（`mapping: 'rule'`）：
 
 - `[确定性]` 映射到 manifest 的 test / build / evaluation 检查（evaluation 的判定是阈值比较，本身是确定性的）。只靠 Run 自己可能写出来的测试通过的标准，状态是 `self_graded`（"仅自带测试"）：对关键标准它和"证据失败"一样阻塞批准。能解除它的是独立证据：`@baseline` 检查（把测试文件重置回 Base 后重跑）、manifest 声明了 `testPaths` 且 Agent 未改动这些文件，或经过完整性校验的隐藏评估数据集；
 - `[模型]` 只映射到 evaluation 检查，manifest 没有声明 evaluation 时标为"无可映射检查"并给出原因；
-- `[人工]` 由批准本身证明：存在关键人工标准时，批准**必须附带审查意见**写下判断，事件里记录 `humanCriteriaSignedOff`。界面不再自动填充默认意见，否则这条签署会被静默满足；
+- 声明映射只采信所列检查（及其 `@baseline`）；任一所列检查没有运行，标准为"无可映射检查"并写明是哪个，不会退回规则映射去找别的检查凑数；
+- `[人工]` 由批准本身证明：存在人工标准时，批准意见必须**逐条点名**每条人工标准的编号（`AC-2：已与安全负责人核对威胁模型`），缺哪条就拒绝哪条（`review_human_criteria_unsigned`），事件里记录 `humanCriteriaSignedOff`。一句「ok」不再能签署任何人工标准，界面也不自动填充默认意见；
 - 任一关键标准处于"待证据 / 证据失败 / 仅自带测试 / 无可映射检查"时，任何风险等级都不能批准（`review_blocked_by_criteria`），合并证据也随之被阻塞；请求修改始终允许。`neutral`（跳过）不算通过；
 - 高风险变更若全部关键标准都是 `[模型]`，就绪状态为 blocked——模型评估不得作为高风险的唯一关键证据。
 
-映射在 Run 后处理时写入 Evidence Package（`criteriaCoverage`），审查时按当前检查结果重新计算状态；没有打包映射的外部提案退回到"全部非 `@baseline` 检查视为 test"。**仍未实现**：由人显式声明某条标准由哪个检查证明（`verifiedBy`），需要一次 schema 迁移。
+映射在 Run 后处理时写入 Evidence Package（`criteriaCoverage`），审查时按当前检查结果重新计算状态；没有打包映射的外部提案退回到"全部非 `@baseline` 检查视为 test"。外部附加 Evidence 时，包的 headSha / Intent / Run 必须与该提案一致（`evidence_package_mismatch`），`criteriaCoverage` 只取自经摘要校验的包文件，请求体里声称的映射一律丢弃。`verifiedBy` 存在 `acceptance_criteria.verified_by_json`（迁移 023），参与 `contentDigest`；未写 `verifiedBy` 的标准规范化后与旧版本一致，已有摘要不变。
 
 这些校验都在 `server/database.ts` 的 `createIntentVersion` 里，而不是 HTTP 边界——smoke 脚本与 real-case 都直接调用这个方法，只在 HTTP 层校验会留下一个绕过口。前端只是提前显示同一条规则，避免用户提交后才撞到 400。
 
@@ -424,7 +429,7 @@ npm run check
 其中：
 
 - `npm run check:legibility` 校验 `src/styles.css` 的字号下限、文字对比度、控件边框对比度和 token 完整性（见"可读性约束"）；
-- `npm run test:criteria-gate` 验证逐条验收标准门禁：无可映射检查的关键模型标准阻塞批准但不阻塞请求修改、低风险无检查时为待证据、`neutral` 视为失败、打包映射识别独立证据，以及关键人工标准必须在批准意见里签署；
+- `npm run test:criteria-gate` 验证逐条验收标准门禁：无可映射检查的关键模型标准阻塞批准但不阻塞请求修改、低风险无检查时为待证据、`neutral` 视为失败、打包映射识别独立证据，人工标准必须在批准意见里逐条点名 AC 编号、高风险占位人工标准被拒，以及 `verifiedBy` 声明映射与其摘要规范化；
 - `npm run test:intent-approval` 验证低风险按规则批准、中风险需非作者批准、新版本取代旧批准，以及被拒绝的 Run 不留下 worktree；
 - `npm run test:policy-files` 验证 `.aperture/` 改动被写入提案、事件与 Readiness，批准需要 Owner 与理由，刷新会重新计算标记；
 - `npm run test:review-assignment` 验证作者不可被分配、按负载选人、只有被分配人能决策、重新分配需要理由并保留历史、新 Head 重置分配、未展开证据的批准被标记，以及策略改动只分配给 Owner；

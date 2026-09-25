@@ -117,8 +117,13 @@ try {
   const forgedEvidenceAttempt = await request<{ error: { code: string } }>(`/api/change-proposals/${proposal.id}/evidence`, { cookie: maintainerCookie, body: { runId: 'RUN-HTTP-001', headSha: proposal.headSha, uri: storedPackage.uri, sha256: 'sha256:forged-digest', summary: { passed: 1 } } })
   assert.equal(forgedEvidenceAttempt.status, 409)
 
-  const evidenceResponse = await request<{ evidence: { id: string } }>(`/api/change-proposals/${proposal.id}/evidence`, { cookie: maintainerCookie, body: { runId: 'RUN-HTTP-001', headSha: proposal.headSha, uri: storedPackage.uri, sha256: storedPackage.sha256, summary: { passed: 1 } } })
+  // An intact package still has to be about this proposal, and a hand-written coverage claim is discarded.
+  const otherRunAttempt = await request<{ error: { code: string } }>(`/api/change-proposals/${proposal.id}/evidence`, { cookie: maintainerCookie, body: { runId: 'RUN-HTTP-OTHER', headSha: proposal.headSha, uri: storedPackage.uri, sha256: storedPackage.sha256, summary: { passed: 1 } } })
+  assert.equal(otherRunAttempt.body?.error.code, 'evidence_package_mismatch')
+  const evidenceResponse = await request<{ evidence: { id: string; summary: Record<string, unknown> } }>(`/api/change-proposals/${proposal.id}/evidence`, { cookie: maintainerCookie, body: { runId: 'RUN-HTTP-001', headSha: proposal.headSha, uri: storedPackage.uri, sha256: storedPackage.sha256, summary: { passed: 1, criteriaCoverage: [{ criterionId: 'forged', checkNames: ['unit'], independent: true }] } } })
   assert.equal(evidenceResponse.status, 201)
+  assert.equal(evidenceResponse.body?.evidence.summary.criteriaCoverage, undefined)
+  assert.equal(evidenceResponse.body?.evidence.summary.passed, 1)
 
   const selfReview = await request<{ error: { code: string } }>(`/api/change-proposals/${proposal.id}/reviews`, { cookie: authorCookie, body: { headSha: proposal.headSha, decision: 'approved', comment: 'self approve' } })
   assert.equal(selfReview.status, 403)

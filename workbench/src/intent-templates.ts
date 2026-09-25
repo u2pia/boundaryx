@@ -15,6 +15,8 @@ export type ParsedCriterion = {
   statement: string
   criticality: Criticality
   verificationType: VerificationType
+  /** 行尾 `[验证: node-tests]` 点名的 Check（Project Manifest 里的名字）；不写则由规则映射。 */
+  verifiedBy?: string[]
   /** 逐条建议，永不阻塞提交：模糊度判断靠启发式，误报的代价必须由人承担而不是由门禁承担。 */
   warnings: string[]
 }
@@ -88,6 +90,20 @@ function findVagueTerms(statement: string) {
   return vagueTerms.filter((term) => lowered.includes(term.toLowerCase()))
 }
 
+const checkNamePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u
+
+/** 至少 8 字且没有 `<...>` 占位符。与 server/criteria-coverage.ts 同值，服务端同样拒绝。 */
+export function isSubstantiveHumanCriterion(statement: string) {
+  const text = statement.trim()
+  return !/[<＜][^<>＜＞]+[>＞]/u.test(text) && [...text].length >= 8
+}
+
+/** Mirrors the server: approving signs a human criterion only when the comment names its label (AC-2, ac 2, AC－2). */
+export function mentionsCriterion(comment: string, label: string) {
+  const ordinal = label.replace(/^AC-/u, '')
+  return new RegExp(`(?<![A-Za-z0-9])AC[-－‐ ]?${ordinal}(?!\\d)`, 'iu').test(comment)
+}
+
 export function inspectStatement(statement: string, verificationType: VerificationType) {
   const warnings: string[] = []
   const placeholders = statement.match(/[<＜][^<>＜＞]+[>＞]/g)
@@ -144,6 +160,10 @@ export function parseAcceptanceCriteria(text: string): ParsedCriterion[] {
       rest = rest.slice(tagMatch[0].length)
     }
 
+    // 行尾的 [验证: a, b] 由人点名证明这条标准的 Check，替代按类型的规则映射（DOMAIN_MODEL.md §5.6）。
+    const verifiedMatch = rest.match(/\s*[[［]\s*(?:验证|verify|verified by)\s*[:：]\s*([^\]］]*)[\]］]\s*$/iu)
+    const verifiedBy = verifiedMatch ? verifiedMatch[1].split(/[,，、\s]+/u).filter(Boolean) : undefined
+    if (verifiedMatch) rest = rest.slice(0, verifiedMatch.index)
     const statement = rest.trim()
     if (!statement) {
       criteria.push({ statement: '', criticality: criticality ?? defaultCriticality, verificationType: verificationType ?? defaultVerificationType, warnings: [...warnings, '只有标注没有语句'] })
@@ -159,6 +179,7 @@ export function parseAcceptanceCriteria(text: string): ParsedCriterion[] {
       statement,
       criticality: criticality ?? defaultCriticality,
       verificationType: resolvedVerification,
+      ...(verifiedBy ? { verifiedBy } : {}),
       warnings: [...warnings, ...inspectStatement(statement, resolvedVerification)],
     })
   }
@@ -184,6 +205,16 @@ export function lintIntentDraft(draft: IntentDraft): IntentDraftLint {
 
   const tooLong = draft.criteria.filter((criterion) => criterion.statement.length > maximumStatementLength).length
   if (tooLong > 0) blockers.push(`有 ${tooLong} 条标准超过 ${maximumStatementLength} 字，请拆成多条`)
+
+  // 与 server/criteria-coverage.ts 的 isSubstantiveHumanCriterion 同一条规则：关键 [人工] 标准是批准人签署的那句话，
+  // 「ok」「人工审核通过」签下去什么也没说。
+  const placeholderHuman = draft.criteria.filter((criterion) => criterion.statement.trim() && criterion.verificationType === 'human' && criterion.criticality === 'critical' && !isSubstantiveHumanCriterion(criterion.statement))
+  if (placeholderHuman.length > 0) blockers.push(`关键 [人工] 标准要写清批准人判断什么（至少 8 字、不含 <占位符>）：${placeholderHuman.map((criterion) => `「${criterion.statement.trim()}」`).join('、')}`)
+  const declared = draft.criteria.filter((criterion) => criterion.verifiedBy)
+  if (declared.some((criterion) => criterion.verificationType === 'human')) blockers.push('[人工] 标准由批准意见签署，不能再用 [验证: …] 点名 Check')
+  const badNames = declared.flatMap((criterion) => criterion.verifiedBy ?? []).filter((name) => !checkNamePattern.test(name))
+  if (declared.some((criterion) => !criterion.verifiedBy?.length)) blockers.push('[验证: …] 里没有写 Check 名')
+  if (badNames.length > 0) blockers.push(`[验证: …] 里的 ${badNames.join('、')} 不是合法的 Check 名（字母、数字、. _ -；不写 @baseline，基线复跑会自动跟随）`)
 
   // 以下两条与 server/database.ts 的同名不变量一致。前端只是提前显示，真正的拒绝在服务端，绕过前端也拦得住。
   //
@@ -271,4 +302,4 @@ export const intentTemplates: Record<ProductType, IntentTemplate> = {
 }
 
 /** 语法说明，表单和 README 共用一份文案。 */
-export const criteriaSyntaxHint = '行首可标注 [确定性] [模型] [人工] 声明如何验证，[参考] 表示不阻塞合并；不写标注默认按「关键 · 确定性」处理。'
+export const criteriaSyntaxHint = '行首可标注 [确定性] [模型] [人工] 声明如何验证，[参考] 表示不阻塞合并；不写标注默认按「关键 · 确定性」处理。行尾写 [验证: node-tests] 可点名由哪个 Check 证明，不写则按类型规则映射。'

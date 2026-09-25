@@ -28,10 +28,10 @@ function providerEnvironment(provider?: AgentProviderSettings) {
 
 class LocalProcessRuntime implements AgentExecutionRuntime {
   readonly descriptor: AgentRunnerDescriptor
-  private readonly input: { executable: string; args: string[]; environmentAllowlist: string[]; provider?: AgentProviderSettings }
+  private readonly input: { executable: string; args: string[]; environmentAllowlist: string[]; provider: () => AgentProviderSettings | undefined }
 
-  constructor(input: { executable: string; args?: string[]; environmentAllowlist?: string[]; provider?: AgentProviderSettings }) {
-    this.input = { executable: input.executable, args: input.args ?? [], environmentAllowlist: input.environmentAllowlist ?? [], provider: input.provider }
+  constructor(input: { executable: string; args?: string[]; environmentAllowlist?: string[]; provider?: () => AgentProviderSettings | undefined }) {
+    this.input = { executable: input.executable, args: input.args ?? [], environmentAllowlist: input.environmentAllowlist ?? [], provider: input.provider ?? (() => undefined) }
     this.descriptor = { id: 'local-command-agent@0.2', isolation: 'unisolated_process', status: 'degraded', productionEligible: false, networkEgress: 'unrestricted', reason: 'Process runtime has no container, egress or syscall boundary.' }
   }
 
@@ -41,7 +41,7 @@ class LocalProcessRuntime implements AgentExecutionRuntime {
     const secretEnvironmentKeys = environmentKeys.filter((key) => /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/u.test(key))
     // Which model produced the change is review information, so it is attested and hashed like the rest
     // of the runtime. The credential is represented by the name of the variable carrying it, never its value.
-    const provider = this.input.provider
+    const provider = this.input.provider()
     const model = provider ? { id: provider.model, providerId: provider.providerId, baseUrl: provider.baseUrl, wireApi: provider.wireApi, reasoningEffort: provider.reasoningEffort ?? null, apiKeySource: provider.apiKey ? `control_plane_setting:${providerApiKeyVariable}` : provider.apiKeyEnv ? `server_environment:${provider.apiKeyEnv}` : 'none', configuredAt: provider.updatedAt } : null
     const canonical = { runtimeId: this.descriptor.id, isolation: 'unisolated_process' as const, executablePath, executableDigest: `sha256:${sha256(readFileSync(executablePath))}`, args: this.input.args, networkEgress: 'unrestricted' as const, readonlyRoot: false, capDropAll: false, noNewPrivileges: false, ephemeral: false, secretMounts: [], environmentKeys, secretEnvironmentKeys, productionEligible: false, model }
     return { ...canonical, attestationDigest: `sha256:${sha256(JSON.stringify(canonical))}` }
@@ -69,8 +69,9 @@ class LocalProcessRuntime implements AgentExecutionRuntime {
     if (process.env.APERTURE_BUILDER_MAX_STEPS) allowed.add('APERTURE_BUILDER_MAX_STEPS')
     // An operator who keeps the key in the server environment instead of in the Control Plane still needs
     // that one variable to reach the agent, without widening the allowlist by hand.
-    if (this.input.provider?.apiKeyEnv && !this.input.provider.apiKey) allowed.add(this.input.provider.apiKeyEnv)
-    return { ...Object.fromEntries([...allowed].flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]!]])), ...providerEnvironment(this.input.provider) }
+    const provider = this.input.provider()
+    if (provider?.apiKeyEnv && !provider.apiKey) allowed.add(provider.apiKeyEnv)
+    return { ...Object.fromEntries([...allowed].flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]!]])), ...providerEnvironment(provider) }
   }
 }
 
@@ -79,7 +80,7 @@ export class LocalCommandAgentRunner implements AgentRunner {
   readonly descriptor: AgentRunnerDescriptor
   private readonly runner: GitWorktreeAgentRunner
 
-  constructor(input: { database: ControlPlaneDatabase; executable: string; args?: string[]; environmentAllowlist?: string[]; provider?: AgentProviderSettings; worktreeRoot: string; timeoutMs?: number; postprocessor?: AgentRunPostprocessor }) {
+  constructor(input: { database: ControlPlaneDatabase; executable: string; args?: string[]; environmentAllowlist?: string[]; provider?: () => AgentProviderSettings | undefined; worktreeRoot: string; timeoutMs?: number; postprocessor?: AgentRunPostprocessor }) {
     this.runner = new GitWorktreeAgentRunner({ database: input.database, runtime: new LocalProcessRuntime({ executable: input.executable, args: input.args, environmentAllowlist: input.environmentAllowlist, provider: input.provider }), worktreeRoot: input.worktreeRoot, timeoutMs: input.timeoutMs, postprocessor: input.postprocessor })
     this.id = this.runner.id
     this.descriptor = this.runner.descriptor

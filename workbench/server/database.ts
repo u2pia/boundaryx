@@ -3,7 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createSessionToken, hashPassword, hashSessionToken, sha256, verifyPassword } from './security.ts'
-import { criterionStatus, mapCriteriaToChecks, type CriterionCoverage } from './criteria-coverage.ts'
+import { criterionStatus, isSubstantiveHumanCriterion, mapCriteriaToChecks, mentionsCriterion, type CriterionCoverage } from './criteria-coverage.ts'
 import { requestContext } from './request-context.ts'
 import { normalizeProjectHost, type ProjectHostInput } from './code-host/index.ts'
 import type { AcceptanceCriterionInput, BuilderStopReason, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentVersion, MergeEvidence, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
@@ -547,13 +547,25 @@ export class ControlPlaneDatabase {
       if (criterion.statement.length > 300) throw new AppError(400, `Acceptance criterion statement exceeds 300 characters (${criterion.statement.length})`, 'invalid_acceptance_criteria')
       if (!['normal', 'critical'].includes(criterion.criticality)) throw new AppError(400, `Unknown acceptance criterion criticality ${criterion.criticality}`, 'invalid_acceptance_criteria')
       if (!['deterministic', 'model', 'human'].includes(criterion.verificationType)) throw new AppError(400, `Unknown acceptance criterion verification type ${criterion.verificationType}`, 'invalid_acceptance_criteria')
+      if (criterion.verifiedBy !== undefined) {
+        // A human criterion is proved by the approval, not by a check, so naming checks for it would be a second,
+        // contradictory answer to "who verifies this". `@baseline` re-runs follow their check and are not named.
+        if (criterion.verificationType === 'human') throw new AppError(400, 'A human-verified criterion is signed off in the approval; it cannot name checks', 'invalid_acceptance_criteria')
+        if (!Array.isArray(criterion.verifiedBy) || criterion.verifiedBy.length > 8 || criterion.verifiedBy.some((name) => typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(name))) throw new AppError(400, 'verifiedBy must list up to 8 check names from the project manifest (letters, digits, . _ -)', 'invalid_acceptance_criteria')
+      }
+      // 关键的人工标准由批准人签署，签的就是这句话；「ok」「人工审核」这类占位语句让签署变成空签。
+      if (criterion.verificationType === 'human' && criterion.criticality === 'critical' && !isSubstantiveHumanCriterion(criterion.statement)) {
+        throw new AppError(400, `A critical human-verified criterion must say what the approver judges; "${criterion.statement.trim()}" is a placeholder`, 'human_criterion_not_substantive')
+      }
     }
+    // Only the declared fields enter the digest and the table, in a fixed order, so extra keys a caller sends cannot
+    // change the digest and an Intent without verifiedBy hashes exactly as it did before verifiedBy existed.
+    const acceptanceCriteria: AcceptanceCriterionInput[] = input.acceptanceCriteria.map((criterion) => ({ statement: criterion.statement, criticality: criterion.criticality, verificationType: criterion.verificationType, ...(criterion.verifiedBy?.length ? { verifiedBy: [...new Set(criterion.verifiedBy)] } : {}) }))
     // DOMAIN_MODEL.md 的 Intent 不变量：高风险 Intent 必须定义人工审批要求。在当前模型里，承载这条要求的
     // 就是一条 verificationType 为 human 的验收标准——否则整个 Intent 声称自己可以全自动证明完毕。它必须是
     // critical：用一条自己声明「不阻塞合并」的 normal 标准来满足「必须有人工审批」是自相矛盾的。
     //
-    // 注意这里强制的只是「要求被声明了」。审查与批准路径目前不读 criticality / verificationType，
-    // 所以「这条人工标准被人签署过」尚未被任何门禁保证。
+    // 签署发生在批准时：recordReview 要求批准意见逐条点名每一条关键人工标准（AC-n）。
     if (input.riskLevel === 'high' && !input.acceptanceCriteria.some((criterion) => criterion.verificationType === 'human' && criterion.criticality === 'critical')) {
       throw new AppError(400, 'A high risk intent requires at least one critical human-verified acceptance criterion', 'high_risk_requires_human_verification')
     }
@@ -566,14 +578,14 @@ export class ControlPlaneDatabase {
       const version = Number((this.db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS version FROM intent_versions WHERE work_item_id = ?').get(input.workItemId) as { version: number }).version)
       const intentId = `${input.workItemId}:v${version}`
       const timestamp = nowIso()
-      const canonical = { workItemId: input.workItemId, version, goal: input.goal.trim(), constraints: input.constraints, riskLevel: input.riskLevel, acceptanceCriteria: input.acceptanceCriteria }
+      const canonical = { workItemId: input.workItemId, version, goal: input.goal.trim(), constraints: input.constraints, riskLevel: input.riskLevel, acceptanceCriteria }
       // V0.3 §10.1: a low risk Intent becomes Ready through the lightweight rule; anything riskier waits for a named approver.
       const lowRisk = input.riskLevel === 'low'
-      const intent: IntentVersion = { id: intentId, ...canonical, contentDigest: `sha256:${sha256(JSON.stringify(canonical))}`, createdBy: actorId, createdAt: timestamp, acceptanceCriteria: input.acceptanceCriteria.map((criterion, index) => ({ ...criterion, id: `${intentId}:AC-${index + 1}`, ordinal: index + 1 })), status: lowRisk ? 'approved' : 'draft', ...(lowRisk ? { approval: { basis: 'low_risk_rule' as const, approvedAt: timestamp } } : {}) }
+      const intent: IntentVersion = { id: intentId, ...canonical, contentDigest: `sha256:${sha256(JSON.stringify(canonical))}`, createdBy: actorId, createdAt: timestamp, acceptanceCriteria: acceptanceCriteria.map((criterion, index) => ({ ...criterion, id: `${intentId}:AC-${index + 1}`, ordinal: index + 1 })), status: lowRisk ? 'approved' : 'draft', ...(lowRisk ? { approval: { basis: 'low_risk_rule' as const, approvedAt: timestamp } } : {}) }
       const superseded = this.db.prepare("UPDATE intent_versions SET status = 'superseded' WHERE work_item_id = ? AND status != 'superseded'").run(input.workItemId)
       this.db.prepare('INSERT INTO intent_versions(id, work_item_id, version, goal, constraints_json, risk_level, content_digest, created_by, created_at, status, approved_at, approval_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(intent.id, intent.workItemId, intent.version, intent.goal, JSON.stringify(intent.constraints), intent.riskLevel, intent.contentDigest, actorId, timestamp, intent.status, lowRisk ? timestamp : null, lowRisk ? 'low_risk_rule' : null)
-      const insertCriterion = this.db.prepare('INSERT INTO acceptance_criteria(id, intent_version_id, statement, criticality, verification_type, ordinal) VALUES (?, ?, ?, ?, ?, ?)')
-      intent.acceptanceCriteria.forEach((criterion) => insertCriterion.run(criterion.id, intent.id, criterion.statement, criterion.criticality, criterion.verificationType, criterion.ordinal))
+      const insertCriterion = this.db.prepare('INSERT INTO acceptance_criteria(id, intent_version_id, statement, criticality, verification_type, ordinal, verified_by_json) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      intent.acceptanceCriteria.forEach((criterion) => insertCriterion.run(criterion.id, intent.id, criterion.statement, criterion.criticality, criterion.verificationType, criterion.ordinal, criterion.verifiedBy ? JSON.stringify(criterion.verifiedBy) : null))
       this.db.prepare("UPDATE work_items SET status = 'ready', updated_at = ? WHERE id = ?").run(timestamp, input.workItemId)
       this.appendEvent({ aggregateType: 'work_item', aggregateId: input.workItemId, eventType: 'intent.versioned', actorId, payload: { intentVersionId: intent.id, version, contentDigest: intent.contentDigest, acceptanceCriterionCount: intent.acceptanceCriteria.length, supersededCount: Number(superseded.changes) } })
       if (lowRisk) this.appendEvent({ aggregateType: 'work_item', aggregateId: input.workItemId, eventType: 'intent.approved', actorId, payload: { intentVersionId: intent.id, contentDigest: intent.contentDigest, basis: 'low_risk_rule' } })
@@ -611,7 +623,7 @@ export class ControlPlaneDatabase {
     const rows = this.db.prepare('SELECT * FROM intent_versions WHERE work_item_id = ? ORDER BY version DESC').all(workItemId) as Array<Record<string, SqlValue>>
     return rows.map((row) => {
       const criteria = this.db.prepare('SELECT * FROM acceptance_criteria WHERE intent_version_id = ? ORDER BY ordinal').all(String(row.id)) as Array<Record<string, SqlValue>>
-      return { id: String(row.id), workItemId: String(row.work_item_id), version: Number(row.version), goal: String(row.goal), constraints: parseJson<string[]>(String(row.constraints_json)), riskLevel: String(row.risk_level) as IntentVersion['riskLevel'], contentDigest: String(row.content_digest), createdBy: String(row.created_by), createdAt: String(row.created_at), status: String(row.status) as IntentVersion['status'], ...(row.approved_at ? { approval: { basis: String(row.approval_basis) as NonNullable<IntentVersion['approval']>['basis'], ...(row.approved_by ? { actorId: String(row.approved_by) } : {}), approvedAt: String(row.approved_at), ...(row.approval_comment ? { comment: String(row.approval_comment) } : {}) } } : {}), acceptanceCriteria: criteria.map((criterion) => ({ id: String(criterion.id), statement: String(criterion.statement), criticality: String(criterion.criticality) as AcceptanceCriterionInput['criticality'], verificationType: String(criterion.verification_type) as AcceptanceCriterionInput['verificationType'], ordinal: Number(criterion.ordinal) })) }
+      return { id: String(row.id), workItemId: String(row.work_item_id), version: Number(row.version), goal: String(row.goal), constraints: parseJson<string[]>(String(row.constraints_json)), riskLevel: String(row.risk_level) as IntentVersion['riskLevel'], contentDigest: String(row.content_digest), createdBy: String(row.created_by), createdAt: String(row.created_at), status: String(row.status) as IntentVersion['status'], ...(row.approved_at ? { approval: { basis: String(row.approval_basis) as NonNullable<IntentVersion['approval']>['basis'], ...(row.approved_by ? { actorId: String(row.approved_by) } : {}), approvedAt: String(row.approved_at), ...(row.approval_comment ? { comment: String(row.approval_comment) } : {}) } } : {}), acceptanceCriteria: criteria.map((criterion) => ({ id: String(criterion.id), statement: String(criterion.statement), criticality: String(criterion.criticality) as AcceptanceCriterionInput['criticality'], verificationType: String(criterion.verification_type) as AcceptanceCriterionInput['verificationType'], ...(criterion.verified_by_json ? { verifiedBy: parseJson<string[]>(String(criterion.verified_by_json)) } : {}), ordinal: Number(criterion.ordinal) })) }
     })
   }
 
@@ -1080,9 +1092,11 @@ export class ControlPlaneDatabase {
     // Approved, at any risk level. The light path for low risk skips the evidence-viewing requirement, not the criteria.
     const blockedCriteria = readiness.criteria.filter((item) => item.criticality === 'critical' && ['failed', 'self_graded', 'unmapped', 'pending'].includes(item.status))
     if (input.decision === 'approved' && blockedCriteria.length) throw new AppError(409, `Approval is blocked by critical acceptance criteria: ${blockedCriteria.map((item) => item.label).join(', ')}`, 'review_blocked_by_criteria')
-    // Human-verified criteria are evidenced by this approval, so the reviewer has to say what they judged.
+    // Human-verified criteria are evidenced by this approval, so the reviewer signs each one by name: a blanket "ok"
+    // under three human criteria says nothing about which of them was actually judged.
     const humanCriteria = readiness.criteria.filter((item) => item.verificationType === 'human' && item.criticality === 'critical')
-    if (input.decision === 'approved' && humanCriteria.length && !input.comment.trim()) throw new AppError(409, `Approving signs off human-verified criteria ${humanCriteria.map((item) => item.label).join(', ')}; the comment must record the judgement`, 'review_human_criteria_unsigned')
+    const unsignedHumanCriteria = humanCriteria.filter((item) => !mentionsCriterion(input.comment, item.label))
+    if (input.decision === 'approved' && unsignedHumanCriteria.length) throw new AppError(409, `Approving signs off human-verified criteria; the comment must name ${unsignedHumanCriteria.map((item) => item.label).join(', ')} and record the judgement on each`, 'review_human_criteria_unsigned')
     // DOMAIN_MODEL.md §9.1.1: a change to the files that govern runs goes through a stricter approval. Only an owner
     // may accept it, and the comment has to say so — the checks on this head ran under the base manifest, so nothing
     // in the evidence speaks to whether the new rules are acceptable.

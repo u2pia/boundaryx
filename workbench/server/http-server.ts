@@ -409,7 +409,7 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         const intentVersion = database.createIntentVersion({ workItemId: intentRoute.workItemId, goal: requireString(body, 'goal'), constraints: Array.isArray(body.constraints) ? body.constraints.filter((item): item is string => typeof item === 'string') : [], riskLevel: requireString(body, 'riskLevel') as 'low' | 'medium' | 'high', acceptanceCriteria: body.acceptanceCriteria.map((criterion) => {
           if (!criterion || typeof criterion !== 'object') throw new AppError(400, 'Invalid acceptance criterion', 'invalid_acceptance_criteria')
           const value = criterion as Record<string, unknown>
-          return { statement: requireString(value, 'statement'), criticality: requireString(value, 'criticality') as 'normal' | 'critical', verificationType: requireString(value, 'verificationType') as 'deterministic' | 'model' | 'human' }
+          return { statement: requireString(value, 'statement'), criticality: requireString(value, 'criticality') as 'normal' | 'critical', verificationType: requireString(value, 'verificationType') as 'deterministic' | 'model' | 'human', ...(value.verifiedBy === undefined ? {} : { verifiedBy: value.verifiedBy as string[] }) }
         }) }, actor.id)
         return sendJson(response, 201, { intentVersion })
       }
@@ -523,8 +523,15 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         const uri = requireString(body, 'uri')
         const digest = requireString(body, 'sha256')
         if (!input.evidenceStore) throw new AppError(503, 'Local evidence store is not configured', 'evidence_store_unavailable')
-        input.evidenceStore.read(uri, digest)
-        const evidence = database.recordEvidence({ proposalId: evidenceRoute.proposalId, runId: requireString(body, 'runId'), headSha: requireString(body, 'headSha'), uri, sha256: digest, summary: body.summary && typeof body.summary === 'object' && !Array.isArray(body.summary) ? body.summary as Record<string, unknown> : {} }, actor.id)
+        const runId = requireString(body, 'runId')
+        const headSha = requireString(body, 'headSha')
+        const stored = input.evidenceStore.read(uri, digest)
+        // The digest only proves the package is intact, not that it is about this proposal: a package from another
+        // run or revision would otherwise vouch for this one.
+        if (stored.git?.headSha !== headSha || stored.intent?.id !== proposal.intentVersionId || stored.run?.id !== runId) throw new AppError(409, 'The evidence package describes a different revision, intent or run than this change proposal', 'evidence_package_mismatch')
+        // Readiness trusts summary.criteriaCoverage, so it comes from the verified package, never from the request body.
+        const { criteriaCoverage: _claimed, ...summary } = body.summary && typeof body.summary === 'object' && !Array.isArray(body.summary) ? body.summary as Record<string, unknown> : {}
+        const evidence = database.recordEvidence({ proposalId: evidenceRoute.proposalId, runId, headSha, uri, sha256: digest, summary: Array.isArray(stored.criteriaCoverage) ? { ...summary, criteriaCoverage: stored.criteriaCoverage } : summary }, actor.id)
         return sendJson(response, 201, { evidence })
       }
 

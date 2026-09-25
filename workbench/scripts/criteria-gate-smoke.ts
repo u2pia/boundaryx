@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -100,7 +101,10 @@ try {
     assert.equal(readiness.status, 'ready')
     database.recordEvidenceView(evidence.id, reviewer.id, evidence.sha256)
     assert.throws(() => database.recordReview({ proposalId: proposal.id, headSha: proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: '  ' }), blockedBy('review_human_criteria_unsigned'))
-    database.recordReview({ proposalId: proposal.id, headSha: proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'threat model reviewed with security owner' })
+    // The approval signs each human criterion by label: a comment that names none of them signs none of them.
+    assert.throws(() => database.recordReview({ proposalId: proposal.id, headSha: proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'ok' }), blockedBy('review_human_criteria_unsigned'))
+    assert.throws(() => database.recordReview({ proposalId: proposal.id, headSha: proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'AC-20 and AC-12 look fine' }), blockedBy('review_human_criteria_unsigned'))
+    database.recordReview({ proposalId: proposal.id, headSha: proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'AC-2: threat model reviewed with security owner' })
     const approval = database.listAggregateEvents('change_proposal', proposal.id).findLast((event) => event.eventType === 'review.approved')
     assert.deepEqual(approval?.payload.humanCriteriaSignedOff, [`${intent.id}:AC-2`])
   }
@@ -129,7 +133,41 @@ try {
     assert.throws(() => database.recordReview({ proposalId: proposal.id, headSha: proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'tests pass' }), blockedBy('review_blocked_by_criteria'))
   }
 
-  console.log('criteria gate smoke passed · unmapped model criterion blocked · low risk needs evidence · human criteria signed off in the approval · self-graded tests blocked')
+  // F2.2: the human criterion a high risk Intent rests on has to say what the approver judges.
+  {
+    const workItem = database.createWorkItem({ title: 'placeholder', description: 'placeholder', ownerActorId: author.id }, owner.id)
+    const deterministic = { statement: 'revoked sessions are rejected', criticality: 'critical' as const, verificationType: 'deterministic' as const }
+    for (const statement of ['ok', '人工审核通过', '<谁> 确认 <什么>']) assert.throws(() => database.createIntentVersion({ workItemId: workItem.id, goal: 'g', constraints: [], riskLevel: 'high', acceptanceCriteria: [deterministic, { statement, criticality: 'critical', verificationType: 'human' }] }, owner.id), blockedBy('human_criterion_not_substantive'), statement)
+    // A normal human criterion signs nothing, so its wording is left to the linter's warnings.
+    database.createIntentVersion({ workItemId: workItem.id, goal: 'g', constraints: [], riskLevel: 'low', acceptanceCriteria: [deterministic, { statement: 'ok', criticality: 'normal', verificationType: 'human' }] }, owner.id)
+  }
+
+  // DOMAIN_MODEL.md §5.6: a person may name the checks that prove a criterion; the name replaces the rule.
+  {
+    const workItem = database.createWorkItem({ title: 'declared', description: 'declared', ownerActorId: author.id }, owner.id)
+    const criteria = [
+      { statement: 'imports reject malformed rows', criticality: 'critical' as const, verificationType: 'deterministic' as const, verifiedBy: ['import-tests'] },
+      { statement: 'the lint suite stays clean', criticality: 'critical' as const, verificationType: 'deterministic' as const, verifiedBy: ['lint'] },
+      { statement: 'rows are counted', criticality: 'critical' as const, verificationType: 'deterministic' as const },
+    ]
+    assert.throws(() => database.createIntentVersion({ workItemId: workItem.id, goal: 'g', constraints: [], riskLevel: 'medium', acceptanceCriteria: [{ statement: 'copy reads naturally to a reviewer', criticality: 'critical', verificationType: 'human', verifiedBy: ['unit'] }] }, owner.id), blockedBy('invalid_acceptance_criteria'), 'a human criterion is signed, not checked')
+    assert.throws(() => database.createIntentVersion({ workItemId: workItem.id, goal: 'g', constraints: [], riskLevel: 'medium', acceptanceCriteria: [{ ...criteria[0], verifiedBy: ['unit@baseline'] }] }, owner.id), blockedBy('invalid_acceptance_criteria'), 'baseline re-runs follow their check')
+    const intent = database.createIntentVersion({ workItemId: workItem.id, goal: 'g', constraints: [], riskLevel: 'medium', acceptanceCriteria: criteria }, owner.id)
+    assert.deepEqual(database.getIntentVersion(intent.id).acceptanceCriteria.map((item) => item.verifiedBy), [['import-tests'], ['lint'], undefined], 'stored and read back')
+    const coverage = mapCriteriaToChecks(intent, [{ name: 'import-tests', kind: 'test', provenance: 'all_tests' }, { name: 'import-tests@baseline', kind: 'test', provenance: 'pre_existing' }, { name: 'unit', kind: 'test', provenance: 'pre_existing' }])
+    assert.deepEqual(coverage.map((item) => [item.mapping, item.checkNames]), [['declared', ['import-tests', 'import-tests@baseline']], ['declared', []], ['rule', ['import-tests', 'import-tests@baseline', 'unit']]])
+    assert.equal(coverage[0].independent, true, 'the named check brings its baseline re-run')
+    assert.match(coverage[1].unmappedReason ?? '', /Declared check lint did not run/u, 'a named check that never ran does not fall back to the rule')
+    // The declaration is part of what the approver read, and an Intent without one hashes as it did before verifiedBy
+    // existed; keys a caller adds on top of the declared fields change nothing.
+    const hash = (value: unknown) => `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`
+    assert.equal(intent.contentDigest, hash({ workItemId: workItem.id, version: 1, goal: 'g', constraints: [], riskLevel: 'medium', acceptanceCriteria: criteria }))
+    const plain = criteria.map(({ verifiedBy: _verifiedBy, ...criterion }) => criterion)
+    const undeclared = database.createIntentVersion({ workItemId: workItem.id, goal: 'g', constraints: [], riskLevel: 'medium', acceptanceCriteria: plain.map((criterion) => ({ ...criterion, note: 'ignored' })) }, owner.id)
+    assert.equal(undeclared.contentDigest, hash({ workItemId: workItem.id, version: 2, goal: 'g', constraints: [], riskLevel: 'medium', acceptanceCriteria: plain }))
+  }
+
+  console.log('criteria gate smoke passed · unmapped model criterion blocked · low risk needs evidence · human criteria signed off by label · placeholder human criteria refused · declared verifiedBy replaces the rule · self-graded tests blocked')
 } finally {
   database.close()
   rmSync(root, { recursive: true, force: true })

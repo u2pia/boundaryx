@@ -12,7 +12,8 @@ type IntentBundleInput = {
   riskLevel: LocalIntentVersion['riskLevel']
   // 起草人声明每条标准如何被证明。这两个字段进入 contentDigest、Evidence Package 和 Builder Agent 的
   // prompt，所以不能由这一层代填——代填出来的「全部确定性关键」是一句谎话。
-  acceptanceCriteria: Array<{ statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human' }>
+  // verifiedBy 是起草人声明的「这条标准由哪些 check 证明」，同样进入 contentDigest。
+  acceptanceCriteria: Array<{ statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; verifiedBy?: string[] }>
 }
 
 // The repository is never named here: the server resolves it from the work item's project.

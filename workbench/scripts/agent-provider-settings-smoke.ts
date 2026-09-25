@@ -177,10 +177,9 @@ try {
   const workItemId = (await request<{ workItem: { id: string } }>('/api/work-items', { cookie: ownerCookie, body: { projectId: 'PRJ-DEFAULT', title: '验证 Provider 配置生效', description: 'Provider 设置必须进入运行环境与运行证明。', productType: 'application', ownerActorId: ownerId } })).body!.workItem.id
   const intentVersionId = (await request<{ intentVersion: { id: string } }>(`/api/work-items/${workItemId}/intent-versions`, { cookie: ownerCookie, body: { goal: '让 Builder 使用受控的 Provider', constraints: ['offline'], riskLevel: 'medium', acceptanceCriteria: [{ statement: '运行证明包含模型', criticality: 'critical', verificationType: 'deterministic' }] } })).body!.intentVersion.id
   await request(`/api/intent-versions/${encodeURIComponent(intentVersionId)}/approve`, { cookie: reviewerCookie, body: {} })
-  // Runs are admitted through a handler holding the freshly rebuilt runner, which is what the worker process
-  // does for every run it claims.
-  const runRequest = makeRequester(createControlPlaneRequestHandler({ database, agentRunner: configured.runner, agentRuntimeDescriptor: configured.descriptor, evidenceStore: configured.evidenceStore }))
-  const run = await runRequest<{ agentRun: { id: string; status: string; errorMessage?: string } }>('/api/agent-runs', { cookie: authorCookie, body: { workItemId, intentVersionId, baseRef: 'main', declaredContextPaths: ['README.md'] } })
+  // The run is admitted by the runner the server built at startup, before the provider was saved, and executed by
+  // one built afterwards, as the worker process does: both must attest the same provider or the run fails.
+  const run = await request<{ agentRun: { id: string; status: string; errorMessage?: string } }>('/api/agent-runs', { cookie: authorCookie, body: { workItemId, intentVersionId, baseRef: 'main', declaredContextPaths: ['README.md'] } })
   assert.equal(run.status, 201, run.text)
   assert.equal(run.body?.agentRun.status, 'succeeded', run.body?.agentRun.errorMessage)
   const runId = run.body!.agentRun.id

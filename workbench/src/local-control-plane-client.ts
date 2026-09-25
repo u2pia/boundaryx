@@ -30,7 +30,7 @@ export type LocalMergeMode = 'control_plane' | 'host_protected'
 export type LocalProjectRole = 'maintainer' | 'reviewer' | 'developer'
 
 /** One repository under one code host, and the unit of access. The host config never holds a secret, only env var names. */
-/** The project every install starts with. It has no repository, so it holds the workbench's static sample data. */
+/** The project every install starts with and every member belongs to: it holds the workbench's sample data and, after `npm run seed:demo`, a worked example from the real pipeline. */
 export const DEMO_PROJECT_ID = 'PRJ-DEFAULT'
 
 export type LocalProject = {
@@ -98,7 +98,7 @@ export type LocalIntentVersion = {
   /** Only an approved version can start a Run; low risk is approved by rule, medium and high by a non-author. */
   status: 'draft' | 'approved' | 'superseded'
   approval?: { basis: 'low_risk_rule' | 'named_approval'; actorId?: string; approvedAt: string; comment?: string }
-  acceptanceCriteria: Array<{ id: string; ordinal: number; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human' }>
+  acceptanceCriteria: Array<{ id: string; ordinal: number; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; verifiedBy?: string[] }>
 }
 
 export type LocalChangeProposal = {
@@ -214,7 +214,7 @@ export type LocalReviewReadiness = {
   pendingCheckCount: number
   invalidatedCheckCount: number
   invalidatedEvidenceCount: number
-  criteria: Array<{ criterionId: string; label: string; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; mapping: 'rule'; checkNames: string[]; independent?: boolean; unmappedReason?: string; status: 'passed' | 'self_graded' | 'failed' | 'pending' | 'unmapped' | 'awaiting_review' | 'overridden'; override?: LocalCriterionOverride }>
+  criteria: Array<{ criterionId: string; label: string; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; mapping: 'rule' | 'declared'; checkNames: string[]; independent?: boolean; unmappedReason?: string; status: 'passed' | 'self_graded' | 'failed' | 'pending' | 'unmapped' | 'awaiting_review' | 'overridden'; override?: LocalCriterionOverride }>
   blockers: string[]
   policyFiles: string[] | null
   builderStop: { runId: string; reason: 'time_budget' | 'step_budget'; summary: string } | null
@@ -385,7 +385,7 @@ export const localControlPlaneClient = {
   listWorkItems: (projectId?: string) => request<{ workItems: LocalWorkItem[] }>(scoped('/api/work-items', projectId)),
   getWorkItem: (workItemId: string) => request<{ workItem: LocalWorkItem; intentVersions: LocalIntentVersion[] }>(`/api/work-items/${workItemId}`),
   createWorkItem: (input: { title: string; description: string; productType: LocalWorkItem['productType']; ownerActorId?: string; projectId: string }) => post<{ workItem: LocalWorkItem }>('/api/work-items', input),
-  createIntentVersion: (workItemId: string, input: { goal: string; constraints: string[]; riskLevel: LocalIntentVersion['riskLevel']; acceptanceCriteria: Array<{ statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human' }> }) => post<{ intentVersion: LocalIntentVersion }>(`/api/work-items/${workItemId}/intent-versions`, input),
+  createIntentVersion: (workItemId: string, input: { goal: string; constraints: string[]; riskLevel: LocalIntentVersion['riskLevel']; acceptanceCriteria: Array<{ statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; verifiedBy?: string[] }> }) => post<{ intentVersion: LocalIntentVersion }>(`/api/work-items/${workItemId}/intent-versions`, input),
   approveIntentVersion: (intentVersionId: string, input: { comment: string }) => post<{ intentVersion: LocalIntentVersion }>(`/api/intent-versions/${encodeURIComponent(intentVersionId)}/approve`, input),
   listAgentRuns: (projectId?: string) => request<{ agentRuns: LocalAgentRun[] }>(scoped('/api/agent-runs', projectId)),
   startAgentRun: (input: { workItemId: string; intentVersionId: string; baseRef?: string; declaredContextPaths: string[]; changeProposalId?: string }) => post<{ agentRun: LocalAgentRun; queuePosition?: number }>('/api/agent-runs', input),

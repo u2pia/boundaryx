@@ -111,6 +111,8 @@ export type AcceptanceCriterionInput = {
   statement: string
   criticality: 'normal' | 'critical'
   verificationType: 'deterministic' | 'model' | 'human'
+  /** Check names (from the project manifest) a person declared as this criterion's proof; absent means the rule maps it. */
+  verifiedBy?: string[]
 }
 
 export type IntentVersion = {

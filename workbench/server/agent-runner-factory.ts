@@ -45,10 +45,11 @@ export function createConfiguredAgentRunner(input: { database: ControlPlaneDatab
   }
 
   if (processExecutable) {
-    // The provider is read here rather than at process start so that saving it in the workbench takes
-    // effect on the next run: the worker process builds its own runner through this same factory.
+    // The provider is read on every attestation, not once here: the server admits runs with the runner it built at
+    // startup and the worker executes them with a fresh one, so a provider saved in between must reach both or the
+    // two attestations disagree and the run fails.
     const provider = input.database.getAgentProviderSettings()
-    const runner = new LocalCommandAgentRunner({ database: input.database, executable: processExecutable, args: processArgs, environmentAllowlist: processEnvironmentAllowlist, provider, worktreeRoot, timeoutMs, postprocessor })
+    const runner = new LocalCommandAgentRunner({ database: input.database, executable: processExecutable, args: processArgs, environmentAllowlist: processEnvironmentAllowlist, provider: () => input.database.getAgentProviderSettings(), worktreeRoot, timeoutMs, postprocessor })
     return { runner, descriptor: { ...runner.descriptor, reason: engineExecutable ? 'Container unavailable; explicit process fallback is active.' : runner.descriptor.reason, model: provider?.model, modelProvider: provider?.providerId }, evidenceStore }
   }
 
