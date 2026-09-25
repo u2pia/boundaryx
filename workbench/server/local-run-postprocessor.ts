@@ -131,6 +131,7 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     // and is linked from the proposal instead.
     const project = this.input.database.getProject(input.proposal.projectId)
     const hosted = project.codeHost === 'github' ? { repository: `${project.codeHostConfig.owner}/${project.codeHostConfig.repo}`, webUrl: `${project.codeHostConfig.webBase}/${project.codeHostConfig.owner}/${project.codeHostConfig.repo}` } : { repository: project.repositoryPath ?? input.proposal.repositoryPath }
+    const eventChainHeads = { runEventChainHead: runEvents.at(-1)?.eventDigest ?? 'genesis', proposalEventChainHead: proposalEvents.at(-1)?.eventDigest ?? 'genesis' }
     const stored = this.input.evidenceStore.write({
       schemaVersion: 'aperture.evidence.v1',
       generatedAt: new Date().toISOString(),
@@ -149,10 +150,10 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
       // under the base revision's manifest, so none of them evaluates the new rules.
       policyChanges: { pathPrefix: POLICY_PATH_PREFIX, files: input.proposal.policyFiles ?? [], governedBy: `${input.projectManifest.path}@${input.projectManifest.baseSha}` },
       artifacts,
-      provenance: { runEventChainHead: runEvents.at(-1)?.eventDigest ?? 'genesis', proposalEventChainHead: proposalEvents.at(-1)?.eventDigest ?? 'genesis', generatedBy: 'local-run-postprocessor@0.1' },
+      provenance: { ...eventChainHeads, generatedBy: 'local-run-postprocessor@0.1' },
     })
     const failedChecks = checks.filter((check) => check.conclusion === 'failure' || check.conclusion === 'cancelled').length
-    const evidence = this.input.database.recordEvidence({ proposalId: input.proposal.id, runId: input.runId, headSha: input.proposal.headSha, uri: stored.uri, sha256: stored.sha256, summary: { status: failedChecks ? 'blocked' : checks.length ? 'ready' : 'incomplete', totalChecks: checks.length, failedChecks, testProvenance: headProvenance, independentTestSignal: testProvenance.baselineConclusions.length > 0 || headProvenance === 'pre_existing', agentModifiedTestFileCount: agentModifiedTestFiles.length, evaluationProfile: input.projectManifest.manifest.evaluation.profile, evaluationDatasetDigest: input.projectManifest.evaluationDatasetDigest, artifactCount: artifacts.length, policyFiles: input.proposal.policyFiles ?? [], builderStopped: input.builderStopped ?? null, criteriaCoverage, packageSchema: stored.value.schemaVersion, generatedAt: stored.value.generatedAt, trustMode: this.input.database.getIdentityMode() } }, input.actorId)
+    const evidence = this.input.database.recordEvidence({ proposalId: input.proposal.id, runId: input.runId, headSha: input.proposal.headSha, uri: stored.uri, sha256: stored.sha256, summary: { status: failedChecks ? 'blocked' : checks.length ? 'ready' : 'incomplete', totalChecks: checks.length, failedChecks, testProvenance: headProvenance, independentTestSignal: testProvenance.baselineConclusions.length > 0 || headProvenance === 'pre_existing', agentModifiedTestFileCount: agentModifiedTestFiles.length, evaluationProfile: input.projectManifest.manifest.evaluation.profile, evaluationDatasetDigest: input.projectManifest.evaluationDatasetDigest, artifactCount: artifacts.length, policyFiles: input.proposal.policyFiles ?? [], builderStopped: input.builderStopped ?? null, criteriaCoverage, eventChainHeads, packageSchema: stored.value.schemaVersion, generatedAt: stored.value.generatedAt, trustMode: this.input.database.getIdentityMode() } }, input.actorId)
     this.input.database.recordAgentRunEvent(input.runId, 'agent_run.evidence_packaged', { evidenceId: evidence.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, uri: stored.uri, sha256: stored.sha256, totalChecks: checks.length, failedChecks }, input.actorId)
     return { evidenceId: evidence.id, packageDigest: stored.sha256, checks }
   }

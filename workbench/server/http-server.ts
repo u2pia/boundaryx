@@ -530,8 +530,10 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         // run or revision would otherwise vouch for this one.
         if (stored.git?.headSha !== headSha || stored.intent?.id !== proposal.intentVersionId || stored.run?.id !== runId) throw new AppError(409, 'The evidence package describes a different revision, intent or run than this change proposal', 'evidence_package_mismatch')
         // Readiness trusts summary.criteriaCoverage, so it comes from the verified package, never from the request body.
-        const { criteriaCoverage: _claimed, ...summary } = body.summary && typeof body.summary === 'object' && !Array.isArray(body.summary) ? body.summary as Record<string, unknown> : {}
-        const evidence = database.recordEvidence({ proposalId: evidenceRoute.proposalId, runId, headSha, uri, sha256: digest, summary: Array.isArray(stored.criteriaCoverage) ? { ...summary, criteriaCoverage: stored.criteriaCoverage } : summary }, actor.id)
+        // So are the event chain heads the merge gate checks against the live chains.
+        const { criteriaCoverage: _claimed, eventChainHeads: _claimedHeads, ...summary } = body.summary && typeof body.summary === 'object' && !Array.isArray(body.summary) ? body.summary as Record<string, unknown> : {}
+        const heads = stored.provenance && typeof stored.provenance.runEventChainHead === 'string' && typeof stored.provenance.proposalEventChainHead === 'string' ? { eventChainHeads: { runEventChainHead: stored.provenance.runEventChainHead, proposalEventChainHead: stored.provenance.proposalEventChainHead } } : {}
+        const evidence = database.recordEvidence({ proposalId: evidenceRoute.proposalId, runId, headSha, uri, sha256: digest, summary: { ...summary, ...(Array.isArray(stored.criteriaCoverage) ? { criteriaCoverage: stored.criteriaCoverage } : {}), ...heads } }, actor.id)
         return sendJson(response, 201, { evidence })
       }
 

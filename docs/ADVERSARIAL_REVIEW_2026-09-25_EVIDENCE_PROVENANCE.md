@@ -16,7 +16,7 @@
 | --- | --- | --- | --- |
 | F1 | 高 | evaluation check 无 `@baseline` 等价防线，Builder 控制的评分器随便打分即可让 critical model 标准以 `independent` 通过 | 是（`/tmp/probe-eval.ts`）· **已修复**：`evaluation.harnessPaths` + `eval@baseline`（评分器重置回 Base 重跑）；independent 需 Dataset 校验**且**评分器 `pre_existing`；同一指标冲突值使 Check 失败。`test:evaluation-provenance` 覆盖。残余：同进程评分器可被被测代码篡改输出 |
 | F2 | 高 | `evidence_packages.summary`（含 `criteriaCoverage`）是自由 JSON，未与已校验的包内容绑定，却被 `getReviewReadiness` 直接采信 | 是（`/tmp/probe-summary.ts`）· **已修复**：HTTP evidence 路由要求包的 headSha / intent / run 与本 proposal 一致（`evidence_package_mismatch`），`criteriaCoverage` 只取自已校验的包，请求体里的一律丢弃；http-smoke 覆盖 |
-| F3 | 中 | 事件哈希链（`previous_event_digest`/`event_digest`、`proposalEventChainHead`）除 smoke 外无任何运行时消费者，门禁从不校验链 | 是（grep 全仓）· **已修复**：合并前校验 Proposal 与其证据 Run 的事件链（`event_chain_broken`，在分支移动前拒绝；host merge 记为绕过门禁原因）。包内记录的链头仍未回验 |
+| F3 | 中 | 事件哈希链（`previous_event_digest`/`event_digest`、`proposalEventChainHead`）除 smoke 外无任何运行时消费者，门禁从不校验链 | 是（grep 全仓）· **已修复**：合并前校验 Proposal 与其证据 Run 的事件链（`event_chain_broken`，在分支移动前拒绝；host merge 记为绕过门禁原因）；证据包记录的链头须仍在当前链上（防整链重算），Merge Evidence 读取时核对其链头（`merge_evidence_chain_mismatch`）。残余：同时持有数据库与证据文件者可一并重写；链头未外部锚定 |
 | F4 | 中 | `@baseline` 只把 `testPaths` 重置回 base，测试依赖的 base 外文件仍停在 head，"独立"结论可被 Builder 从旁路架空 | 否（据代码推定）· **部分处理**：Evidence 的 `testProvenance.filesAtHeadDuringBaseline` 列出 baseline 时停在 Head 的文件，文档要求 `testPaths` 覆盖全部测试输入；未强制 |
 | F5 | 低 | `productionEligible` / `isolation` 在审批 / 合并门禁无消费者；Builder 少报 `stopped` 可静默跳过部分变更告警 | 否（据代码推定）· **接受**：本地运行时永不 productionEligible，强制会阻断全部本地工作；待引入生产合并时再加门禁 |
 

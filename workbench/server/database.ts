@@ -1047,7 +1047,7 @@ export class ControlPlaneDatabase {
     const evidenceId = id('EVD')
     return this.inTransaction(() => {
       this.db.prepare('INSERT INTO evidence_packages(id, change_proposal_id, run_id, head_sha, uri, sha256, summary_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(evidenceId, input.proposalId, input.runId, input.headSha, input.uri, input.sha256, JSON.stringify(input.summary), timestamp)
-      this.appendEvent({ aggregateType: 'change_proposal', aggregateId: input.proposalId, eventType: 'evidence.recorded', actorId, payload: { evidenceId, runId: input.runId, headSha: input.headSha, uri: input.uri, sha256: input.sha256 } })
+      this.appendEvent({ aggregateType: 'change_proposal', aggregateId: input.proposalId, eventType: 'evidence.recorded', actorId, payload: { evidenceId, runId: input.runId, headSha: input.headSha, uri: input.uri, sha256: input.sha256, ...(input.summary.eventChainHeads ? { eventChainHeads: input.summary.eventChainHeads } : {}) } })
       return { id: evidenceId, ...input, createdAt: timestamp }
     })
   }
@@ -1505,12 +1505,25 @@ export class ControlPlaneDatabase {
   /**
    * Merging is the last moment the audit trail can still refuse something, so it re-verifies the hash chains the
    * decision rests on: the proposal's own events and those of every run that produced its evidence. Append-only
-   * triggers stop UPDATE and DELETE; this catches a row inserted around them (a forged approval, say).
+   * triggers stop UPDATE and DELETE; this catches a row inserted around them (a forged approval, say). A chain
+   * rewritten consistently from genesis still verifies, so each evidence package's recorded chain heads must also be
+   * events of the chains as they are now.
    */
   assertMergeEventChainsIntact(proposalId: string) {
-    const runIds = (this.db.prepare('SELECT DISTINCT run_id FROM evidence_packages WHERE change_proposal_id = ?').all(proposalId) as Array<{ run_id: string }>).map((row) => row.run_id)
+    const rows = this.db.prepare('SELECT id, run_id, summary_json FROM evidence_packages WHERE change_proposal_id = ?').all(proposalId) as Array<{ id: string; run_id: string; summary_json: string }>
+    const runIds = [...new Set(rows.map((row) => row.run_id))]
     const broken = [['change_proposal', proposalId], ...runIds.map((runId) => ['agent_run', runId])].filter(([type, aggregateId]) => !this.verifyAggregateEventChain(type, aggregateId)).map(([type, aggregateId]) => `${type} ${aggregateId}`)
+    for (const row of rows) {
+      const heads = parseJson<{ eventChainHeads?: { runEventChainHead?: unknown; proposalEventChainHead?: unknown } }>(row.summary_json).eventChainHeads
+      if (!heads) continue
+      if (!this.isOnEventChain('agent_run', row.run_id, heads.runEventChainHead)) broken.push(`agent_run ${row.run_id} (head recorded by ${row.id})`)
+      if (!this.isOnEventChain('change_proposal', proposalId, heads.proposalEventChainHead)) broken.push(`change_proposal ${proposalId} (head recorded by ${row.id})`)
+    }
     if (broken.length) throw new AppError(409, `The event chain of ${broken.join(', ')} does not verify; the audit trail was altered outside the Control Plane`, 'event_chain_broken')
+  }
+
+  private isOnEventChain(aggregateType: string, aggregateId: string, digest: unknown) {
+    return digest === 'genesis' || (typeof digest === 'string' && this.listAggregateEvents(aggregateType, aggregateId).some((event) => event.eventDigest === digest))
   }
 
   verifyAggregateEventChain(aggregateType: string, aggregateId: string) {
@@ -1582,6 +1595,7 @@ export class ControlPlaneDatabase {
   private verifyMergeEvidence(evidence: MergeEvidence) {
     const canonical = { changeProposalId: evidence.changeProposalId, baseRef: evidence.baseRef, baseShaBefore: evidence.baseShaBefore, approvedHeadSha: evidence.approvedHeadSha, mergedSha: evidence.mergedSha, strategy: evidence.strategy, approvalReviewIds: evidence.approvalReviewIds, checkIds: evidence.checkIds, evidenceIds: evidence.evidenceIds, proposalEventChainHead: evidence.proposalEventChainHead, mergedByActorId: evidence.mergedByActorId, mergedAt: evidence.mergedAt, ...(evidence.hostMerge ? { hostMerge: evidence.hostMerge } : {}) }
     if (evidence.evidenceDigest !== `sha256:${sha256(JSON.stringify(canonical))}`) throw new AppError(409, 'Merge evidence digest verification failed', 'merge_evidence_digest_mismatch')
+    if (!this.isOnEventChain('change_proposal', evidence.changeProposalId, evidence.proposalEventChainHead)) throw new AppError(409, 'Merge evidence names a proposal event chain head that is no longer on the chain', 'merge_evidence_chain_mismatch')
     return evidence
   }
 

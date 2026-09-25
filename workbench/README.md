@@ -411,7 +411,7 @@ Dataset 必须存在于 Base Revision，且不能列入 Builder Context。Contro
 
 仍然挡不住的：评分器与被测代码在同一进程里时，被测代码可以篡改评分器的输出本身；也挡不住 Builder 在 Run 中直接读取 worktree 里的 Dataset。前者要求评分器在子进程里调用被测代码，后者要求容器 Runtime 不挂载 Dataset，两者目前都靠项目自律。契约见 `../docs/AGENT_SYSTEM_EVALUATION_CONTRACT.md`。
 
-Change Proposal 获得独立批准后，只有 Owner 或 Maintainer 可以显式执行本地 fast-forward 合并。Control Plane 会复验 Base、Approved Head、Check、Evidence 和 Approval，要求实际目标分支 SHA 精确等于 Approved Head SHA，再生成不可更新、不可删除并带 Digest 的 Merge Evidence。合并前还会重算该 Proposal 以及产出其证据的每个 Run 的事件哈希链；有一条对不上（例如绕过平台直接 INSERT 进来的伪造批准事件）就拒绝合并（`event_chain_broken`），且在目标分支移动之前拒绝。`host_protected` 模式下合并已经发生，链校验失败会作为绕过门禁的原因记录。契约见 `../docs/MERGE_EVIDENCE_CONTRACT.md`。该能力不是自动合并，也不代表发布授权。
+Change Proposal 获得独立批准后，只有 Owner 或 Maintainer 可以显式执行本地 fast-forward 合并。Control Plane 会复验 Base、Approved Head、Check、Evidence 和 Approval，要求实际目标分支 SHA 精确等于 Approved Head SHA，再生成不可更新、不可删除并带 Digest 的 Merge Evidence。合并前还会重算该 Proposal 以及产出其证据的每个 Run 的事件哈希链；有一条对不上（例如绕过平台直接 INSERT 进来的伪造批准事件）就拒绝合并（`event_chain_broken`），且在目标分支移动之前拒绝。整条链从 genesis 重算一遍也能自洽，所以还要求每个 Evidence Package 生成时记录的链头（`eventChainHeads`，写入证据摘要和 `evidence.recorded` 事件，外部附加的证据取自包文件）仍在当前链上；Merge Evidence 读取时同样核对其 `proposalEventChainHead`（`merge_evidence_chain_mismatch`）。`host_protected` 模式下合并已经发生，链校验失败会作为绕过门禁的原因记录。契约见 `../docs/MERGE_EVIDENCE_CONTRACT.md`。该能力不是自动合并，也不代表发布授权。
 
 Reviewer 请求修改后，Proposal 作者或 Owner/Maintainer 可以启动 Agent Revision Run。新 Run 从被审查 Head SHA 开始，绑定当前 Reviewer Feedback，沿用原始基线 Manifest；完成后更新同一个 Proposal，并使旧 Review、Check、Evidence 失效。契约见 `../docs/AGENT_REVISION_RUN_CONTRACT.md`。
 

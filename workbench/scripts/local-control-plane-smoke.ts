@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -34,6 +35,25 @@ git('commit', '-m', 'agent change')
 
 const database = new ControlPlaneDatabase(databasePath, migrationDirectory)
 const authority = new LocalGitAuthority(database)
+
+/** Rewrites a proposal's events from genesis with every digest recomputed (UPDATE trigger dropped); returns the undo. */
+function rewriteProposalChain(database: ControlPlaneDatabase, forger: DatabaseSync, proposalId: string) {
+  const updateTrigger = forger.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'domain_events' AND sql LIKE '%UPDATE%'").get() as { name: string; sql: string }
+  const originals = forger.prepare("SELECT id, payload_json, previous_event_digest, event_digest FROM domain_events WHERE aggregate_type = 'change_proposal' AND aggregate_id = ? ORDER BY aggregate_version").all(proposalId) as Array<{ id: string; payload_json: string; previous_event_digest: string; event_digest: string }>
+  const update = () => forger.prepare('UPDATE domain_events SET payload_json = ?, previous_event_digest = ?, event_digest = ? WHERE id = ?')
+  forger.exec(`DROP TRIGGER ${updateTrigger.name}`)
+  let previousDigest = 'genesis'
+  for (const [index, event] of database.listAggregateEvents('change_proposal', proposalId).entries()) {
+    const payload = index === 0 ? { ...event.payload, rewritten: true } : event.payload
+    const eventDigest = `sha256:${createHash('sha256').update(JSON.stringify({ aggregateType: event.aggregateType, aggregateId: event.aggregateId, aggregateVersion: event.aggregateVersion, eventType: event.eventType, actorId: event.actorId ?? null, payload, previousEventDigest: previousDigest, occurredAt: event.occurredAt })).digest('hex')}`
+    update().run(JSON.stringify(payload), previousDigest, eventDigest, event.id)
+    previousDigest = eventDigest
+  }
+  return () => {
+    for (const original of originals) update().run(original.payload_json, original.previous_event_digest, original.event_digest, original.id)
+    forger.exec(updateTrigger.sql)
+  }
+}
 
 try {
   const owner = database.createActor({ username: 'owner', displayName: 'Local Owner', role: 'owner', password: 'owner-password-2026' })
@@ -107,7 +127,8 @@ try {
   assert.throws(() => authority.mergeChangeProposal(proposal.id, owner.id), (error) => error instanceof AppError && error.code === 'merge_not_approved')
 
   database.recordCheck({ proposalId: proposal.id, headSha: refresh.proposal.headSha, name: 'unit', status: 'completed', conclusion: 'success', evidenceRef: 'artifact://unit-v2.json' }, author.id)
-  const refreshedEvidence = database.recordEvidence({ proposalId: proposal.id, runId: 'RUN-LOCAL-001', headSha: refresh.proposal.headSha, uri: 'local://evidence/run-local-001-v2.json', sha256: 'sha256:test-evidence-v2', summary: { passed: 14, failed: 0 } }, author.id)
+  const recordedProposalHead = database.listAggregateEvents('change_proposal', proposal.id).at(-1)!.eventDigest
+  const refreshedEvidence = database.recordEvidence({ proposalId: proposal.id, runId: 'RUN-LOCAL-001', headSha: refresh.proposal.headSha, uri: 'local://evidence/run-local-001-v2.json', sha256: 'sha256:test-evidence-v2', summary: { passed: 14, failed: 0, eventChainHeads: { runEventChainHead: 'genesis', proposalEventChainHead: recordedProposalHead } } }, author.id)
   database.recordEvidenceView(refreshedEvidence.id, reviewer.id, refreshedEvidence.sha256)
   database.recordReview({ proposalId: proposal.id, headSha: refresh.proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'follow-up evidence verified' })
   git('checkout', 'main')
@@ -122,6 +143,13 @@ try {
   // Undoing the forgery takes dropping a trigger, which only someone with the database file can do.
   const deleteTrigger = forger.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'domain_events' AND sql LIKE '%DELETE%'").get() as { name: string; sql: string }
   forger.exec(`DROP TRIGGER ${deleteTrigger.name}; DELETE FROM domain_events WHERE id = 'EVT-FORGED'; ${deleteTrigger.sql};`)
+  // A chain rewritten from genesis with every digest recomputed verifies on its own; the head the evidence package
+  // recorded is what no longer matches.
+  const restoreChain = rewriteProposalChain(database, forger, proposal.id)
+  assert.equal(database.verifyAggregateEventChain('change_proposal', proposal.id), true, 'the rewritten chain is self-consistent')
+  assert.throws(() => authority.mergeChangeProposal(proposal.id, owner.id), (error) => error instanceof AppError && error.code === 'event_chain_broken' && /head recorded by/u.test(error.message))
+  assert.equal(git('rev-parse', 'main'), mainBefore)
+  restoreChain()
   forger.close()
   assert.equal(database.verifyAggregateEventChain('change_proposal', proposal.id), true)
   const merged = authority.mergeChangeProposal(proposal.id, owner.id)
@@ -137,6 +165,12 @@ try {
   assert.equal(repeatedMerge.changed, false)
   assert.equal(repeatedMerge.evidence.evidenceDigest, merged.evidence.evidenceDigest)
   assert.throws(() => database.db.prepare("UPDATE merge_evidence SET merged_sha = 'tampered' WHERE change_proposal_id = ?").run(proposal.id), /append-only/u)
+  // Merge evidence names the proposal chain head it was decided on; a rewritten chain no longer contains it.
+  const postMergeForger = new DatabaseSync(databasePath)
+  const restoreAfterMerge = rewriteProposalChain(database, postMergeForger, proposal.id)
+  assert.throws(() => database.getMergeEvidence(proposal.id), (error) => error instanceof AppError && error.code === 'merge_evidence_chain_mismatch')
+  restoreAfterMerge()
+  postMergeForger.close()
 
   assert.equal(database.verifyAggregateEventChain('work_item', workItem.id), true)
   assert.equal(database.verifyAggregateEventChain('change_proposal', proposal.id), true)
