@@ -88,7 +88,7 @@ function findVagueTerms(statement: string) {
   return vagueTerms.filter((term) => lowered.includes(term.toLowerCase()))
 }
 
-function inspectStatement(statement: string, verificationType: VerificationType) {
+export function inspectStatement(statement: string, verificationType: VerificationType) {
   const warnings: string[] = []
   const placeholders = statement.match(/[<＜][^<>＜＞]+[>＞]/g)
   if (placeholders) warnings.push(`还有未替换的模版占位符 ${placeholders.join('、')}`)

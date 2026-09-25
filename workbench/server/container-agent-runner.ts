@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process'
 import type { ControlPlaneDatabase } from './database.ts'
 import { GitWorktreeAgentRunner, type AgentExecutionRuntime, type AgentRunPostprocessor, type AgentRuntimeContext } from './git-worktree-agent-runner.ts'
 import { sha256 } from './security.ts'
-import { AppError, type AgentRunRequest, type AgentRunner, type AgentRunnerDescriptor } from './types.ts'
+import { AppError, type AgentRun, type AgentRunRequest, type AgentRunner, type AgentRunnerDescriptor } from './types.ts'
 
 export type ContainerRuntimeConfig = {
   engineExecutable: string
@@ -71,5 +71,9 @@ export class ContainerAgentRunner implements AgentRunner {
 
   run(request: AgentRunRequest, actorId: string) {
     return this.runner.run(request, actorId)
+  }
+
+  cleanUpWorktree(run: AgentRun, actorId?: string) {
+    return this.runner.cleanUpWorktree(run, actorId)
   }
 }

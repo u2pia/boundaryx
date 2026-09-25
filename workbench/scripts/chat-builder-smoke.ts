@@ -18,7 +18,7 @@ writeFileSync(join(root, 'outside.txt'), 'not yours\n')
 spawnSync('git', ['init', '--quiet', workspace])
 writeFileSync(requestPath, JSON.stringify({ runId: 'RUN-CHAT', workItem: { title: 'Build fixture', productType: 'application' }, intent: { goal: 'Create src/generated.ts', constraints: ['offline'], acceptanceCriteria: [{ statement: 'File exists', criticality: 'critical', verificationType: 'deterministic' }] }, declaredContextPaths: ['README.md'] }))
 
-type ChatRequest = { model: string; messages: Array<{ role: string; content: string | null; tool_call_id?: string }>; tools: Array<{ function: { name: string } }> }
+type ChatRequest = { model: string; messages: Array<{ role: string; content: string | null; tool_call_id?: string }>; tools: Array<{ function: { name: string } }>; tool_choice?: unknown }
 const call = (id: string, name: string, args: Record<string, unknown>) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } })
 // The model's side of the conversation, one reply per request.
 const script = [
@@ -27,11 +27,22 @@ const script = [
   { tool_calls: [call('c9', 'finish', { summary: 'Created src/generated.ts.' })] },
 ]
 const requests: ChatRequest[] = []
+const budgetRequests: ChatRequest[] = []
 const headers: IncomingMessage['headers'][] = []
 const server = createServer((request, response) => {
   let body = ''
   request.on('data', (chunk) => { body += chunk })
   request.on('end', () => {
+    // A model that never finishes on its own, to exercise the step budget.
+    if (request.url === '/budget/chat/completions') {
+      const parsed = JSON.parse(body) as ChatRequest
+      budgetRequests.push(parsed)
+      // Like DeepSeek, it ignores a narrowed tool list and only a forced tool_choice makes it call finish, and even
+      // then it tries one more command first.
+      const forced = JSON.stringify(parsed.tool_choice) === JSON.stringify({ type: 'function', function: { name: 'finish' } })
+      const reply = forced ? { tool_calls: [call('b-last', 'run_command', { command: 'touch ignored-command' }), call('b-finish', 'finish', { summary: 'Stopped at the step budget; README reviewed.' })] } : { tool_calls: [call(`b${budgetRequests.length}`, 'list_files', {})] }
+      return response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: null, ...reply } }] }))
+    }
     if (request.url !== '/v1/chat/completions') return response.writeHead(404).end()
     requests.push(JSON.parse(body) as ChatRequest)
     headers.push(request.headers)
@@ -85,6 +96,17 @@ try {
   assert.equal(unreachable.status, 1)
   assert.match(unreachable.stderr, /missing\/chat\/completions → 404/u)
 
+  // At the end of the step budget the model is warned, then offered only finish, so the run still ends with a summary.
+  const budget = await run([join(agents, 'chat-builder.mjs')], { ...provider, APERTURE_AGENT_PROVIDER_BASE_URL: `http://127.0.0.1:${port}/budget`, APERTURE_AGENT_PROVIDER_WIRE_API: 'chat', APERTURE_BUILDER_MAX_STEPS: '12' })
+  assert.equal(budget.status, 0, budget.stderr)
+  assert.equal(budgetRequests.length, 12)
+  assert.equal(budgetRequests.slice(0, 11).every((request) => request.tools.length === 6), true)
+  assert.deepEqual(budgetRequests[11].tools.map((tool) => tool.function.name), ['finish'])
+  assert.match(JSON.stringify(budgetRequests[2].messages), /You have 10 steps left/u)
+  assert.equal(existsSync(join(workspace, 'ignored-command')), false, 'nothing but finish runs on the last step')
+  assert.match(budget.stderr, /step 12 run_command touch ignored-command → rejected/u)
+  assert.match(budget.stdout, /"type":"message","summary":"Stopped at the step budget; README reviewed\."/u)
+
   // "responses" needs Codex, Anthropic needs Claude Code; each is routed only when configured.
   const fakeCodex = join(root, 'fake-codex')
   writeFileSync(fakeCodex, `#!/usr/bin/env node\nrequire('node:fs').writeFileSync('codex-ran', process.argv.slice(2).join(' '))\n`)
@@ -102,7 +124,7 @@ try {
   assert.equal(unconfigured.status, 2)
   assert.match(unconfigured.stdout, /No LLM provider is configured/u)
 
-  console.log('chat builder smoke passed · 3 model turns · worktree-confined tools · key kept from commands · engine routed by provider')
+  console.log('chat builder smoke passed · 3 model turns · worktree-confined tools · key kept from commands · engine routed by provider · step budget ends in finish')
 } finally {
   server.close()
   rmSync(root, { recursive: true, force: true })

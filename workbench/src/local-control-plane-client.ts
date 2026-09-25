@@ -69,6 +69,8 @@ export type LocalProjectInput = {
 export type LocalWorkItem = {
   id: string
   projectId: string
+  /** Number within the project, shown as #N; assigned at creation and never reused. */
+  sequence: number
   title: string
   description: string
   productType: 'application' | 'agent_system'
@@ -93,6 +95,7 @@ export type LocalIntentVersion = {
   /** Only an approved version can start a Run; low risk is approved by rule, medium and high by a non-author. */
   status: 'draft' | 'approved' | 'superseded'
   approval?: { basis: 'low_risk_rule' | 'named_approval'; actorId?: string; approvedAt: string; comment?: string }
+  acceptanceCriteria: Array<{ id: string; ordinal: number; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human' }>
 }
 
 export type LocalChangeProposal = {

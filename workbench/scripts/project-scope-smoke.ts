@@ -207,6 +207,10 @@ try {
   assert.equal((await call(`/api/projects/${madeByHttp.body.project.id}/archive`, { cookie: ownerCookie, body: {} })).body.project.status, 'archived')
   assert.throws(() => database.createWorkItem({ title: 'x', description: 'x', ownerActorId: owner.id, projectId: madeByHttp.body.project.id }, owner.id), failsWith('project_archived'))
 
+  // Work items are numbered within their project, each project counting from 1.
+  const alphaNext = database.createWorkItem({ title: 'second in alpha', description: 'd', ownerActorId: alice.id, projectId: alpha.id }, alice.id)
+  assert.deepEqual([alphaWork.workItem.sequence, alphaNext.sequence, betaWork.workItem.sequence, database.getWorkItem(alphaNext.id).sequence], [1, 2, 1, 2])
+
   // --- Migration 019 on a database written before projects existed. ---
   const legacyRoot = join(root, 'legacy')
   const legacyMigrations = join(legacyRoot, 'migrations')
@@ -237,13 +241,14 @@ try {
   assert.deepEqual(['CP-0', 'CP-1', 'CP-2'].map((proposalId) => upgraded.getChangeProposal(proposalId).projectId), [projectOf(alphaRepository), projectOf(betaRepository), projectOf(alphaRepository)])
   assert.equal(upgraded.getWorkItem('WI-1').projectId, projectOf(betaRepository), 'work items follow their proposals')
   assert.equal(upgraded.getWorkItem('WI-orphan').projectId, DEFAULT_PROJECT_ID)
+  assert.deepEqual(['WI-0', 'WI-2', 'WI-1', 'WI-orphan'].map((workItemId) => upgraded.getWorkItem(workItemId).sequence), [1, 2, 1, 1], 'existing work items are numbered per project in creation order')
   assert.deepEqual(backfilled.map((project) => upgraded.projectRole('ACT-R', project.id)), ['reviewer', 'reviewer'], 'existing members keep their access')
   assert.equal(upgraded.projectRole('ACT-O', projectOf(betaRepository)), 'owner')
   assert.equal((upgraded.db.prepare("SELECT project_id FROM domain_events WHERE id = 'EVT-L'").get() as { project_id: string }).project_id, projectOf(betaRepository), 'past events are routed to their project')
   assert.throws(() => upgraded.db.prepare("UPDATE domain_events SET event_type = 'x' WHERE id = 'EVT-L'").run(), /append-only/u, 'the append-only guard is back after the backfill')
   upgraded.close()
 
-  console.log('project scope smoke passed · non-members see nothing · roles per project · reviewers picked from members · repository from the project · local paths validated · 019 backfill splits by repository')
+  console.log('project scope smoke passed · non-members see nothing · roles per project · reviewers picked from members · repository from the project · local paths validated · 019 backfill splits by repository · work items numbered per project')
 } finally {
   database.close()
   rmSync(root, { recursive: true, force: true })

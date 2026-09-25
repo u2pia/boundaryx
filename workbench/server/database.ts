@@ -511,11 +511,12 @@ export class ControlPlaneDatabase {
     if (this.getProject(projectId).status === 'archived') throw new AppError(409, 'The project is archived', 'project_archived')
     const timestamp = nowIso()
     const workItemId = id('WI')
-    const workItem: WorkItem = { id: workItemId, projectId, title: input.title.trim(), description: input.description.trim(), productType: input.productType ?? 'application', status: 'draft', ownerActorId: input.ownerActorId, authorityProvider: 'local-authority@0.1', authorityRef: `local://work-items/${workItemId}`, createdAt: timestamp, updatedAt: timestamp }
+    const workItem: WorkItem = { id: workItemId, projectId, sequence: 0, title: input.title.trim(), description: input.description.trim(), productType: input.productType ?? 'application', status: 'draft', ownerActorId: input.ownerActorId, authorityProvider: 'local-authority@0.1', authorityRef: `local://work-items/${workItemId}`, createdAt: timestamp, updatedAt: timestamp }
     if (!workItem.title) throw new AppError(400, 'Work item title is required', 'invalid_work_item')
     return this.inTransaction(() => {
-      this.db.prepare('INSERT INTO work_items(id, project_id, title, description, product_type, status, owner_actor_id, authority_provider, authority_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(workItem.id, projectId, workItem.title, workItem.description, workItem.productType, workItem.status, workItem.ownerActorId, workItem.authorityProvider, workItem.authorityRef, timestamp, timestamp)
-      this.appendEvent({ aggregateType: 'work_item', aggregateId: workItem.id, eventType: 'work_item.created', actorId, payload: { title: workItem.title, productType: workItem.productType, ownerActorId: workItem.ownerActorId, authorityRef: workItem.authorityRef } })
+      workItem.sequence = Number((this.db.prepare('SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM work_items WHERE project_id = ?').get(projectId) as { next: number }).next)
+      this.db.prepare('INSERT INTO work_items(id, project_id, sequence, title, description, product_type, status, owner_actor_id, authority_provider, authority_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(workItem.id, projectId, workItem.sequence, workItem.title, workItem.description, workItem.productType, workItem.status, workItem.ownerActorId, workItem.authorityProvider, workItem.authorityRef, timestamp, timestamp)
+      this.appendEvent({ aggregateType: 'work_item', aggregateId: workItem.id, eventType: 'work_item.created', actorId, payload: { sequence: workItem.sequence, title: workItem.title, productType: workItem.productType, ownerActorId: workItem.ownerActorId, authorityRef: workItem.authorityRef } })
       return workItem
     })
   }
@@ -747,6 +748,27 @@ export class ControlPlaneDatabase {
 
   listUnfinishedAgentRuns(): AgentRun[] {
     return (this.db.prepare("SELECT * FROM agent_runs WHERE status IN ('queued', 'running') ORDER BY started_at ASC").all() as Array<Record<string, SqlValue>>).map((row) => this.mapAgentRun(row))
+  }
+
+  /**
+   * Finished runs whose worktree has not been reported as pruned yet. A run's `agent_run.worktree_pruned`
+   * event with `pruned: true` is the only thing that takes it off this list, so a cleanup that failed (or a
+   * run that ended before the cleanup existed) is retried on the next Control Plane start instead of leaking
+   * the checkout forever.
+   */
+  listTerminalAgentRunsWithWorktree(): AgentRun[] {
+    const rows = this.db.prepare(`
+      SELECT run.* FROM agent_runs run
+      WHERE run.status IN ('succeeded', 'failed', 'cancelled')
+        AND NOT EXISTS (
+          SELECT 1 FROM domain_events event
+          WHERE event.aggregate_type = 'agent_run' AND event.aggregate_id = run.id
+            AND event.event_type = 'agent_run.worktree_pruned'
+            AND json_extract(event.payload_json, '$.pruned') = 1
+        )
+      ORDER BY run.started_at ASC
+    `).all() as Array<Record<string, SqlValue>>
+    return rows.map((row) => this.mapAgentRun(row))
   }
 
   completeAgentRun(input: { runId: string; status: 'succeeded' | 'failed' | 'cancelled'; actorId: string; changeProposalId?: string; exitCode?: number; stdoutDigest?: string; stderrDigest?: string; errorMessage?: string }) {
@@ -1489,7 +1511,7 @@ export class ControlPlaneDatabase {
   }
 
   private mapWorkItem(row: Record<string, SqlValue>): WorkItem {
-    return { id: String(row.id), projectId: String(row.project_id ?? DEFAULT_PROJECT_ID), title: String(row.title), description: String(row.description), productType: String(row.product_type ?? 'application') as WorkItem['productType'], status: String(row.status) as WorkItem['status'], ownerActorId: String(row.owner_actor_id), authorityProvider: String(row.authority_provider), authorityRef: String(row.authority_ref), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }
+    return { id: String(row.id), projectId: String(row.project_id ?? DEFAULT_PROJECT_ID), sequence: Number(row.sequence ?? 0), title: String(row.title), description: String(row.description), productType: String(row.product_type ?? 'application') as WorkItem['productType'], status: String(row.status) as WorkItem['status'], ownerActorId: String(row.owner_actor_id), authorityProvider: String(row.authority_provider), authorityRef: String(row.authority_ref), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }
   }
 
   private mapChangeProposal(row: Record<string, SqlValue>): ChangeProposal {

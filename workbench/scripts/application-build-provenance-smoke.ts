@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -58,7 +58,8 @@ try {
   assert.match(ready.evidence.artifacts?.[0].sha256 ?? '', /^sha256:[0-9a-f]{64}$/u)
   assert.equal(ready.evidence.artifacts?.[0].sourceCommitSha, ready.evidence.git.headSha)
   assert.equal(ready.evidence.artifacts?.[0].productionEligible, false)
-  assert.match(readFileSync(join(ready.run.worktreePath, 'dist/app.js'), 'utf8'), /governed source/u)
+  // The artifact is attested by digest; its bytes lived in the run's checkout, which is removed when the run ends.
+  assert.equal(existsSync(ready.run.worktreePath), false)
   const readyEvents = database.listAggregateEvents('agent_run', ready.run.id)
   assert.equal(readyEvents.some((event) => event.eventType === 'agent_run.project_manifest_bound' && (event.payload.artifact as { buildCheck?: string } | null)?.buildCheck === 'application-build'), true)
   assert.equal(readyEvents.some((event) => event.eventType === 'agent_run.artifacts_attested'), true)

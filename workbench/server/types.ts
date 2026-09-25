@@ -94,6 +94,8 @@ export type ProjectMember = {
 export type WorkItem = {
   id: string
   projectId: string
+  /** Number within the project, shown as #N; assigned at creation and never reused. */
+  sequence: number
   title: string
   description: string
   productType: 'application' | 'agent_system'
@@ -427,6 +429,12 @@ export interface AgentRunner {
   execute(runId: string): AgentRun
   /** prepare + execute in the calling process. */
   run(request: AgentRunRequest, actorId: string): AgentRun
+  /**
+   * Removes the worktree this Run created and prunes the administrative entry for it. Idempotent, so the
+   * queue can call it again for a run whose worker died before cleaning up. Optional because a runtime that
+   * does not create a worktree has nothing to remove.
+   */
+  cleanUpWorktree?(run: AgentRun, actorId?: string): unknown
 }
 
 export type DomainEvent = {

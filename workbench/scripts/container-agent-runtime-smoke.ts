@@ -65,7 +65,8 @@ try {
   assert.equal(run.productionEligible, true)
   assert.equal(run.runtimeImageRef, 'aperture-agent:fixture')
   assert.match(run.runtimeAttestationDigest ?? '', /^sha256:[0-9a-f]{64}$/u)
-  assert.match(readFileSync(join(run.worktreePath, 'container-feature.ts'), 'utf8'), /containerRun/u)
+  // The checkout is removed when the run ends; what the agent wrote is read from the committed branch.
+  assert.match(git('show', `${run.branchRef}:container-feature.ts`), /containerRun/u)
   const events = database.listAggregateEvents('agent_run', run.id)
   assert.equal(events.some((event) => event.eventType === 'agent_run.project_manifest_bound'), true)
   const attestation = events.find((event) => event.eventType === 'agent_run.runtime_attested')

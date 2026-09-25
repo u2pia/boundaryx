@@ -60,17 +60,18 @@ import {
   X,
   Zap,
   UserCheck,
+  ClipboardCopy,
 } from 'lucide-react'
 import { activity, intents, reviews, runs, type IntentItem, type ReviewItem } from './data'
 import type { AgentRunEvent, AutonomyDecisionInput } from './adapters/contracts'
 import { LocalAutonomyDecisionProvider } from './adapters/local-autonomy-provider'
 import { LocalOtlpFileExportProvider } from './adapters/local-otlp-file-export-provider'
 import { providerCatalog, summarizeProviderCatalog, type ProviderStage } from './provider-catalog'
-import { criteriaSyntaxHint, criticalityLabels, intentTemplates, lintIntentDraft, parseAcceptanceCriteria, splitLines, verificationLabels, type ProductType, type RiskLevel } from './intent-templates'
+import { criteriaSyntaxHint, criticalityLabels, inspectStatement, intentTemplates, lintIntentDraft, parseAcceptanceCriteria, splitLines, verificationLabels, type ProductType, type RiskLevel } from './intent-templates'
 import type { WorkbenchState } from './store-model'
 import { useWorkbench } from './use-workbench'
 import { useLocalControlPlane } from './local-control-plane-context'
-import type { LocalActor, LocalActorUpdate, LocalAgentRunDetail, LocalCodeHostConnection, LocalProject, LocalProjectInput, LocalProjectRole, LocalIdentityMode, LocalChangeProposal, LocalEvidencePackageView, LocalIntentVersion, LocalReviewAssignment, LocalReviewReadiness } from './local-control-plane-client'
+import type { LocalActor, LocalActorUpdate, LocalAgentRunDetail, LocalAgentRuntimeDescriptor, LocalWorkItem, LocalCodeHostConnection, LocalProject, LocalProjectInput, LocalProjectRole, LocalIdentityMode, LocalChangeProposal, LocalEvidencePackageView, LocalIntentVersion, LocalReviewAssignment, LocalReviewReadiness } from './local-control-plane-client'
 import './styles.css'
 
 type Page = '总览' | 'Intents' | '上下文' | 'Agent Runs' | '评审队列' | '发布' | '评估' | '证据中心' | '追溯' | '策略' | '反馈闭环' | '集成' | '项目' | '团队' | '度量'
@@ -126,6 +127,59 @@ const pageToHash: Record<Page, string> = {
 }
 
 const hashToPage = Object.fromEntries(Object.entries(pageToHash).map(([page, hash]) => [hash, page])) as Record<string, Page>
+
+/** A work item as the team refers to it: its number within the project, then its title. */
+function workItemLabel<T extends { sequence: number; title: string } | undefined>(item: T): T extends undefined ? string | undefined : string
+function workItemLabel(item?: { sequence: number; title: string }) {
+  if (!item) return undefined
+  return item.sequence ? `#${item.sequence} ${item.title}` : item.title
+}
+
+/**
+ * A failed run as plain text for whoever diagnoses it: identity, runtime, error, the agent's redacted stderr tail,
+ * what it left uncommitted, and the event log. Built only from what the API already returns, so it holds no secret
+ * the server did not already redact.
+ */
+function runDiagnosticReport(detail: LocalAgentRunDetail, workItem: LocalWorkItem | undefined, runtime: LocalAgentRuntimeDescriptor | undefined, projectSlug: string | undefined) {
+  const run = detail.agentRun
+  const failure = detail.events.find((event) => event.eventType === 'agent_run.failure_diagnostic')?.payload as { stderrTail?: string | null; uncommittedChanges?: string[]; uncommittedPatch?: { path: string; bytes: number } | null } | undefined
+  const seconds = run.completedAt ? Math.round((Date.parse(run.completedAt) - Date.parse(run.startedAt)) / 1000) : undefined
+  const compact = (payload: Record<string, unknown>) => {
+    const { stderrTail: _stderr, uncommittedChanges: _changes, uncommittedPatch: _patch, ...rest } = payload
+    const text = JSON.stringify(rest)
+    return text === '{}' ? '' : ` ${text.length > 300 ? `${text.slice(0, 300)}…` : text}`
+  }
+  return [
+    `# BoundaryX Agent Run 诊断 · ${run.id}`,
+    `状态: ${run.status}${run.exitCode === undefined ? '' : ` · exit ${run.exitCode}`}`,
+    `Work Item: ${workItemLabel(workItem) ?? run.workItemId} (${run.workItemId}) · Intent ${run.intentVersionId}`,
+    `项目: ${projectSlug ?? run.projectId} · base ${run.baseRef}@${run.baseSha.slice(0, 12)} → ${run.branchRef}`,
+    `Runtime: ${run.adapterId} · ${run.isolation} · egress ${run.networkEgress}${runtime?.modelProvider || runtime?.model ? ` · 当前模型 ${runtime.modelProvider ?? '?'}/${runtime.model ?? '?'}` : ''}`,
+    `时间: ${run.startedAt} → ${run.completedAt ?? '未结束'}${seconds === undefined ? '' : ` (${seconds}s)`}`,
+    '',
+    '## 错误',
+    run.errorMessage ?? '(无错误信息)',
+    ...(failure?.stderrTail ? ['', '## Agent stderr 末尾（已脱敏）', failure.stderrTail] : []),
+    ...(failure?.uncommittedChanges ? ['', `## 未提交的改动（${failure.uncommittedChanges.length}）`, ...(failure.uncommittedChanges.length ? failure.uncommittedChanges : ['(无)']), ...(failure.uncommittedPatch ? [`补丁已保存: ${failure.uncommittedPatch.path} (${failure.uncommittedPatch.bytes} bytes)`] : [])] : []),
+    '',
+    `## 事件（${detail.events.length}）`,
+    ...detail.events.map((event) => `${event.occurredAt} ${event.eventType}${compact(event.payload)}`),
+  ].join('\n')
+}
+
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    // Clipboard API refused (permissions, non-secure origin): fall back to a selected textarea.
+    const area = document.createElement('textarea')
+    area.value = text
+    document.body.append(area)
+    area.select()
+    document.execCommand('copy')
+    area.remove()
+  }
+}
 
 function downloadArtifact(filename: string, content: string, type: string) {
   const blob = new Blob([content], { type })
@@ -660,6 +714,7 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
   const [createError, setCreateError] = useState<string>()
   const [approvingId, setApprovingId] = useState<string>()
   const [approvalError, setApprovalError] = useState<string>()
+  const [openWorkItemId, setOpenWorkItemId] = useState<string>()
   const allIntents = useMemo(() => [...derivedIntents, ...intents], [derivedIntents])
   const filtered = useMemo(() => allIntents.filter((item) => `${item.id}${item.title}`.toLowerCase().includes(query.toLowerCase())), [allIntents, query])
   const template = intentTemplates[productType]
@@ -713,7 +768,7 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
             <small className="local-criteria-note">标注会进入 Agent prompt 与 Evidence，并在审查时逐条设门禁：关键标准必须有独立证据，[人工] 标准由批准人在审批意见中签署。</small>
             {parsedCriteria.map((criterion, index) => (
               <div className={`local-criteria-row ${criterion.criticality}`} key={`${index}-${criterion.statement}`}>
-                <em className={criterion.verificationType}>{criticalityLabels[criterion.criticality]} · {verificationLabels[criterion.verificationType]}</em>
+                <em className={criterion.verificationType}>{criticalityLabels[criterion.criticality]} · {verificationLabels[criterion.verificationType]}验证</em>
                 <p>AC-{index + 1} · {criterion.statement || '（这一行只有标注）'}</p>
                 {criterion.warnings.length > 0 && <ul>{criterion.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}
               </div>
@@ -732,8 +787,9 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
         {approvalError && <p className="local-form-error" role="alert">{approvalError}</p>}
         {local.workItems.length > 0 && <div className="local-work-items">{local.workItems.map((item) => {
           const intent = latestIntentFor(item.id)
-          return <article key={item.id}><span className={`local-product-type ${item.productType}`}>{item.productType === 'agent_system' ? 'AGENT' : 'APP'}</span><div><strong>{item.title}</strong><small>{item.id} · {intent ? `v${intent.version} · ${riskLabels[intent.riskLevel]} · ${intent.contentDigest.slice(7, 19)}` : item.authorityRef}</small></div>{intent && <div className="local-intent-approval"><span className={`local-status ${intent.status}`}>{intentStatusLabel(intent)}</span>{intent.status === 'draft' && <button className="secondary-button" disabled={approvingId === intent.id || !canApproveIntent(intent)} title={approveIntentTitle(intent)} onClick={() => void approveIntent(intent.id)}><ShieldCheck size={13} />{approvingId === intent.id ? '批准中' : '批准 Intent'}</button>}</div>}<code>{item.updatedAt.slice(0, 16).replace('T', ' ')}</code></article>
+          return <article key={item.id} className="local-work-item-row" onClick={() => setOpenWorkItemId(item.id)}><span className={`local-product-type ${item.productType}`}>{item.productType === 'agent_system' ? 'AGENT' : 'APP'}</span><div><button className="local-work-item-open" onClick={(event) => { event.stopPropagation(); setOpenWorkItemId(item.id) }} title="查看 Intent 详情"><strong>{workItemLabel(item)}</strong></button><small>{item.id} · {intent ? `v${intent.version} · ${riskLabels[intent.riskLevel]} · ${intent.contentDigest.slice(7, 19)}` : item.authorityRef}</small></div>{intent && <div className="local-intent-approval"><span className={`local-status ${intent.status}`}>{intentStatusLabel(intent)}</span>{intent.status === 'draft' && <button className="secondary-button" disabled={approvingId === intent.id || !canApproveIntent(intent)} title={approveIntentTitle(intent)} onClick={(event) => { event.stopPropagation(); void approveIntent(intent.id) }}><ShieldCheck size={13} />{approvingId === intent.id ? '批准中' : '批准 Intent'}</button>}</div>}<code>{item.updatedAt.slice(0, 16).replace('T', ' ')}<span className="local-work-item-more">详情<ChevronRight size={13} /></span></code></article>
         })}</div>}
+        {openWorkItemId && local.workItems.some((item) => item.id === openWorkItemId) && <LocalIntentDrawer workItemId={openWorkItemId} onClose={() => setOpenWorkItemId(undefined)} approval={{ can: canApproveIntent, title: approveIntentTitle, approvingId, error: approvalError, approve: approveIntent }} />}
       </section>}
       <DemoRegion title="Intent 列表" note="以下列表仍用于展示既有 UI，不作为本地权威状态。">
         <div className="table-toolbar"><div className="inline-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 Intent..." aria-label="搜索 Intent" type="search" /></div><button className="secondary-button" disabled title="原型控件：尚未接入本地 Control Plane，点击不会产生任何状态变更"><ListFilter size={15} />筛选</button><button className="secondary-button" disabled title="原型控件：尚未接入本地 Control Plane，点击不会产生任何状态变更"><Boxes size={15} />视图</button></div>
@@ -1008,14 +1064,26 @@ function ProjectRepositoryChip() {
 
 function LocalAgentRuns() {
   const local = useLocalControlPlane()
-  const [input, setInput] = useState({ workItemId: '', baseRef: '', declaredContextPaths: 'README.md, AGENTS.md' })
+  const [input, setInput] = useState({ workItemId: '', baseRef: '', declaredContextPaths: '' })
   const [busy, setBusy] = useState(false)
   const [cancelling, setCancelling] = useState<string>()
   const [notice, setNotice] = useState<string>()
   const [detail, setDetail] = useState<LocalAgentRunDetail>()
   const [detailBusyId, setDetailBusyId] = useState<string>()
+  const [copiedRunId, setCopiedRunId] = useState<string>()
   const [error, setError] = useState<string>()
   if (local.status !== 'ready') return null
+  const copyDiagnostic = async (runId: string) => {
+    setError(undefined)
+    try {
+      const runDetail = await local.getAgentRunDetail(runId)
+      await copyText(runDiagnosticReport(runDetail, local.workItems.find((item) => item.id === runDetail.agentRun.workItemId), local.agentRuntime, local.projects.find((project) => project.id === runDetail.agentRun.projectId)?.slug))
+      setCopiedRunId(runId)
+      window.setTimeout(() => setCopiedRunId((current) => current === runId ? undefined : current), 2000)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
   const selectedWorkItemId = input.workItemId || local.workItems[0]?.id || ''
   const selectedIntent = local.intentVersions.filter((item) => item.workItemId === selectedWorkItemId).sort((left, right) => right.version - left.version)[0]
   const canRun = local.actor && ['owner', 'maintainer', 'developer'].includes(local.currentProjectRole ?? '')
@@ -1059,7 +1127,7 @@ function LocalAgentRuns() {
       setDetailBusyId(undefined)
     }
   }
-  return <section className="panel local-agent-runs"><div className="local-core-heading"><div><span className="eyebrow">真实数据 · 本地 Agent</span><h2>Intent → Worktree → Agent → Change Proposal</h2><p>Agent 命令由服务端配置；浏览器不能提交任意 Shell。只有 Container Runtime 会显示受限网络与运行证明。</p>{local.agentRuntime?.reason && <small className="local-runtime-reason"><ShieldAlert size={12} />{local.agentRuntime.reason}</small>}</div><span className={`local-agent-capability ${local.agentRuntime?.status === 'ready' ? 'ready' : 'disabled'}`}><i />{local.agentRuntime ? `${local.agentRuntime.status} · ${local.agentRuntime.isolation}` : 'Runner disabled'}</span></div><div className="local-agent-form"><select value={selectedWorkItemId} onChange={(event) => setInput((current) => ({ ...current, workItemId: event.target.value }))}>{local.workItems.length === 0 ? <option value="">先创建 Intent</option> : local.workItems.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select><ProjectRepositoryChip /><input value={input.baseRef} onChange={(event) => setInput((current) => ({ ...current, baseRef: event.target.value }))} placeholder={`Base ref（默认 ${local.currentProject?.defaultBranch ?? 'main'}）`} /><input value={input.declaredContextPaths} onChange={(event) => setInput((current) => ({ ...current, declaredContextPaths: event.target.value }))} placeholder="声明 Context，逗号分隔" /><button className="primary-button" disabled={!local.agentRunnerId || !canRun || !selectedIntent || Boolean(intentBlock) || !local.currentProject?.repositoryPath || busy} onClick={() => void start()}><Play size={13} />{busy ? '受理中' : '启动真实 Run'}</button></div>{intentBlock && <p className="local-rule-note local-intent-block" role="status"><ShieldAlert size={12} />{intentBlock}</p>}{error && <p className="local-form-error" role="alert">{error}</p>}{notice && !error && <p className="local-run-notice" role="status"><Clock3 size={11} />{notice}</p>}{inFlight.length > 0 && <p className="local-run-notice" role="status"><RefreshCw size={11} className="spin" />{inFlight.length} 个 Run 在 Worker 进程中执行，状态每 3 秒自动刷新；控制面保持可用。</p>}<div className="local-agent-run-list">{local.agentRuns.length === 0 ? <div className="local-empty"><Bot size={18} /><p>尚无真实本地 Agent Run。</p></div> : local.agentRuns.map((run) => <article key={run.id} className={run.status === 'queued' || run.status === 'running' ? 'in-flight' : undefined}><span className={`local-status ${run.status}`}>{run.status}</span><div><strong>{local.workItems.find((item) => item.id === run.workItemId)?.title ?? run.workItemId}</strong><small>{run.id} · {run.branchRef} · {run.adapterId}</small></div><code title={run.runtimeAttestationDigest}>{run.baseSha.slice(0, 7)} → {run.changeProposalId ?? 'no proposal'}</code><em>{run.status === 'queued' ? '排队等待 Worker' : run.status === 'running' ? `Worker PID ${run.workerPid ?? '—'}` : run.isolation === 'container' ? `${run.networkEgress} egress · ${run.runtimeImageRef}` : '未隔离进程'}</em><button className="secondary-button" disabled={detailBusyId === run.id} onClick={() => void openDetail(run.id)}><Eye size={12} />{detailBusyId === run.id ? '读取中' : '上下文对账'}</button>{(run.status === 'queued' || run.status === 'running') && <button className="secondary-button" disabled={cancelling === run.id || Boolean(run.cancellationRequestedAt)} onClick={() => void cancel(run.id)}><X size={12} />{run.cancellationRequestedAt ? '取消中' : '取消'}</button>}</article>)}</div>{detail && <LocalRunContextDrawer detail={detail} onClose={() => setDetail(undefined)} />}</section>
+  return <section className="panel local-agent-runs"><div className="local-core-heading"><div><span className="eyebrow">真实数据 · 本地 Agent</span><h2>Intent → Worktree → Agent → Change Proposal</h2><p>Agent 命令由服务端配置；浏览器不能提交任意 Shell。只有 Container Runtime 会显示受限网络与运行证明。</p>{local.agentRuntime?.reason && <small className="local-runtime-reason"><ShieldAlert size={12} />{local.agentRuntime.reason}</small>}</div><span className={`local-agent-capability ${local.agentRuntime?.status === 'ready' ? 'ready' : 'disabled'}`}><i />{local.agentRuntime ? `${local.agentRuntime.status} · ${local.agentRuntime.isolation}` : 'Runner disabled'}</span></div><div className="local-agent-form"><select value={selectedWorkItemId} onChange={(event) => setInput((current) => ({ ...current, workItemId: event.target.value }))}>{local.workItems.length === 0 ? <option value="">先创建 Intent</option> : local.workItems.map((item) => <option key={item.id} value={item.id}>{workItemLabel(item)}</option>)}</select><ProjectRepositoryChip /><input value={input.baseRef} onChange={(event) => setInput((current) => ({ ...current, baseRef: event.target.value }))} placeholder={`Base ref（默认 ${local.currentProject?.defaultBranch ?? 'main'}）`} /><input value={input.declaredContextPaths} onChange={(event) => setInput((current) => ({ ...current, declaredContextPaths: event.target.value }))} placeholder="追加 Context，逗号分隔（manifest 的必需文件总会带上）" aria-label="声明 Context" /><button className="primary-button" disabled={!local.agentRunnerId || !canRun || !selectedIntent || Boolean(intentBlock) || !local.currentProject?.repositoryPath || busy} onClick={() => void start()}><Play size={13} />{busy ? '受理中' : '启动真实 Run'}</button></div>{intentBlock && <p className="local-rule-note local-intent-block" role="status"><ShieldAlert size={12} />{intentBlock}</p>}{error && <p className="local-form-error" role="alert">{error}</p>}{notice && !error && <p className="local-run-notice" role="status"><Clock3 size={11} />{notice}</p>}{inFlight.length > 0 && <p className="local-run-notice" role="status"><RefreshCw size={11} className="spin" />{inFlight.length} 个 Run 在 Worker 进程中执行，状态每 3 秒自动刷新；控制面保持可用。</p>}<div className="local-agent-run-list">{local.agentRuns.length === 0 ? <div className="local-empty"><Bot size={18} /><p>尚无真实本地 Agent Run。</p></div> : local.agentRuns.map((run) => <article key={run.id} className={run.status === 'queued' || run.status === 'running' ? 'in-flight' : undefined}><span className={`local-status ${run.status}`}>{run.status}</span><div><strong>{workItemLabel(local.workItems.find((item) => item.id === run.workItemId)) ?? run.workItemId}</strong><small>{run.id} · {run.branchRef} · {run.adapterId}</small>{run.status === 'failed' && run.errorMessage && <small className="local-run-error" title={run.errorMessage}>{run.errorMessage.trim().split('\n').at(-1)}</small>}</div><code title={run.runtimeAttestationDigest}>{run.baseSha.slice(0, 7)} → {run.changeProposalId ?? 'no proposal'}</code><em>{run.status === 'queued' ? '排队等待 Worker' : run.status === 'running' ? `Worker PID ${run.workerPid ?? '—'}` : run.isolation === 'container' ? `${run.networkEgress} egress · ${run.runtimeImageRef}` : '未隔离进程'}</em><button className="secondary-button" disabled={detailBusyId === run.id} onClick={() => void openDetail(run.id)}><Eye size={12} />{detailBusyId === run.id ? '读取中' : '上下文对账'}</button>{(run.status === 'failed' || run.status === 'cancelled') && <button className="secondary-button" onClick={() => void copyDiagnostic(run.id)} title="复制错误、Agent 输出末尾、未提交改动与事件日志（密钥已脱敏）"><ClipboardCopy size={12} />{copiedRunId === run.id ? '已复制' : '复制诊断'}</button>}{(run.status === 'queued' || run.status === 'running') && <button className="secondary-button" disabled={cancelling === run.id || Boolean(run.cancellationRequestedAt)} onClick={() => void cancel(run.id)}><X size={12} />{run.cancellationRequestedAt ? '取消中' : '取消'}</button>}</article>)}</div>{detail && <LocalRunContextDrawer detail={detail} onClose={() => setDetail(undefined)} />}</section>
 }
 
 function ReviewPage({ onOpenReview }: { onOpenReview: (item: ReviewItem) => void }) {
@@ -1216,7 +1284,7 @@ function LocalReviewQueue() {
         <div><span>有效 / 失效决策</span><strong>{local.reviewMetrics.currentDecisionCount} / {local.reviewMetrics.invalidatedDecisionCount}</strong><small>{local.reviewMetrics.activeReviewerCount} active reviewers</small></div>
       </div>
       <div className="local-change-form">
-        <select value={selectedWorkItemId} onChange={(event) => setProposalInput((current) => ({ ...current, workItemId: event.target.value }))}>{local.workItems.length === 0 ? <option value="">先创建 Intent</option> : local.workItems.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select>
+        <select value={selectedWorkItemId} onChange={(event) => setProposalInput((current) => ({ ...current, workItemId: event.target.value }))}>{local.workItems.length === 0 ? <option value="">先创建 Intent</option> : local.workItems.map((item) => <option key={item.id} value={item.id}>{workItemLabel(item)}</option>)}</select>
         <ProjectRepositoryChip />
         <input value={proposalInput.baseRef} onChange={(event) => setProposalInput((current) => ({ ...current, baseRef: event.target.value }))} placeholder={`Base ref（默认 ${local.currentProject?.defaultBranch ?? 'main'}）`} />
         <input value={proposalInput.headRef} onChange={(event) => setProposalInput((current) => ({ ...current, headRef: event.target.value }))} placeholder="Head ref / branch" />
@@ -1255,7 +1323,7 @@ function LocalReviewQueue() {
           const choiceIneligible = Boolean(choice && policyFiles.length && candidates.find((item) => item.actorId === choice)?.role !== 'owner')
           const overrideTitle = !canOverride ? '仅 Owner 可推翻门禁' : selfReview ? '作者不能推翻自己提案的门禁' : note.length < 10 ? '先在下方意见框写下推翻理由（至少 10 个字）' : '以下方意见作为理由，记录一条 Override Decision'
           return <article key={proposal.id}>
-            <div className="local-proposal-main"><span className={`local-status ${proposal.status}`}>{proposal.status}</span><div><strong>{workItems.get(proposal.workItemId)?.title ?? proposal.workItemId}</strong><small>{proposal.id} · {proposal.baseRef} → {proposal.headRef}</small></div><code title={proposal.headSha}>{proposal.headSha.slice(0, 12)}</code></div>
+            <div className="local-proposal-main"><span className={`local-status ${proposal.status}`}>{proposal.status}</span><div><strong>{workItemLabel(workItems.get(proposal.workItemId)) ?? proposal.workItemId}</strong><small>{proposal.id} · {proposal.baseRef} → {proposal.headRef}</small></div><code title={proposal.headSha}>{proposal.headSha.slice(0, 12)}</code></div>
             <div className="local-proposal-stats"><span>{proposal.changedFiles} files</span><span className="additions">+{proposal.additions}</span><span className="deletions">−{proposal.deletions}</span><span>{proposal.authorActorId === local.actor?.id ? '你是作者' : `author ${proposal.authorActorId.slice(-8)}`}</span><span><Clock3 size={11} /> cycle {formatReviewDuration(Math.max(0, Math.floor((Date.now() - Date.parse(proposal.reviewCycleStartedAt)) / 1000)))}</span></div>
             {policyFiles.length > 0 && <div className="local-policy-change" role="note"><ShieldAlert size={14} /><div><strong>改动策略文件 · {policyFiles.length}</strong><small>本次变更修改了治理它自己的规则；Run 仍按 Base 上的 Manifest 执行。批准需 Owner 并写明理由。</small></div><ul>{policyFiles.map((file) => <li key={file}><code>{file}</code></li>)}</ul></div>}
             <div className={`local-review-assignment ${assignment?.overdue ? 'overdue' : assignment ? assignment.status : 'unassigned'}`}>
@@ -1344,7 +1412,7 @@ function LocalReleaseCandidates() {
     setError(undefined)
     try { await local.approveReleaseCandidate(candidateId, 'Merge Evidence 与 Source Snapshot Digest 已复验，批准该发布候选。') } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) } finally { setBusyId(undefined) }
   }
-  return <section className="panel local-release-candidates"><div className="local-core-heading"><div><span className="eyebrow">真实数据 · 本地发布</span><h2>Merged Revision → Source Snapshot</h2><p>当前只封存 Source Tree Digest 与独立发布批准；不执行部署，也不冒充二进制制品证明。</p></div><span>{local.releaseCandidates.filter((candidate) => candidate.status === 'approved').length} approved</span></div>{mergedProposals.length === 0 ? <div className="local-empty"><PackageCheck size={18} /><p>尚无已合并 Change Proposal；Release Candidate 必须从 Merge Evidence 创建。</p></div> : <div className="local-release-list">{mergedProposals.map((proposal) => { const candidate = candidatesByProposal.get(proposal.id); const selfApproval = candidate?.createdByActorId === local.actor?.id; return <article key={proposal.id}><div><span className={`local-status ${candidate?.status ?? 'review_ready'}`}>{candidate?.status ?? 'not_created'}</span><strong>{local.workItems.find((item) => item.id === proposal.workItemId)?.title ?? proposal.workItemId}</strong><small>{proposal.id} · commit {proposal.headSha.slice(0, 12)}</small></div>{candidate ? <><div className="local-release-digests"><code title={candidate.sourceTreeDigest}>{candidate.sourceTreeDigest}</code><small>{candidate.sourceFileCount} source files · {candidate.contentDigest}</small></div><div className="local-release-actions">{candidate.approval ? <span><ShieldCheck size={13} />{candidate.approval.approverActorId.slice(-8)} · approved</span> : <button className="approve-button" disabled={!canManage || selfApproval || busyId === candidate.id} onClick={() => void approveCandidate(candidate.id)}><Check size={13} />{selfApproval ? '需要独立 Maintainer' : '批准候选'}</button>}</div></> : <button className="secondary-button" disabled={!canManage || busyId === proposal.id} onClick={() => void createCandidate(proposal.id)}><Plus size={13} />{busyId === proposal.id ? '封存中' : '创建候选'}</button>}</article> })}</div>}{error && <p className="local-form-error" role="alert">{error}</p>}</section>
+  return <section className="panel local-release-candidates"><div className="local-core-heading"><div><span className="eyebrow">真实数据 · 本地发布</span><h2>Merged Revision → Source Snapshot</h2><p>当前只封存 Source Tree Digest 与独立发布批准；不执行部署，也不冒充二进制制品证明。</p></div><span>{local.releaseCandidates.filter((candidate) => candidate.status === 'approved').length} approved</span></div>{mergedProposals.length === 0 ? <div className="local-empty"><PackageCheck size={18} /><p>尚无已合并 Change Proposal；Release Candidate 必须从 Merge Evidence 创建。</p></div> : <div className="local-release-list">{mergedProposals.map((proposal) => { const candidate = candidatesByProposal.get(proposal.id); const selfApproval = candidate?.createdByActorId === local.actor?.id; return <article key={proposal.id}><div><span className={`local-status ${candidate?.status ?? 'review_ready'}`}>{candidate?.status ?? 'not_created'}</span><strong>{workItemLabel(local.workItems.find((item) => item.id === proposal.workItemId)) ?? proposal.workItemId}</strong><small>{proposal.id} · commit {proposal.headSha.slice(0, 12)}</small></div>{candidate ? <><div className="local-release-digests"><code title={candidate.sourceTreeDigest}>{candidate.sourceTreeDigest}</code><small>{candidate.sourceFileCount} source files · {candidate.contentDigest}</small></div><div className="local-release-actions">{candidate.approval ? <span><ShieldCheck size={13} />{candidate.approval.approverActorId.slice(-8)} · approved</span> : <button className="approve-button" disabled={!canManage || selfApproval || busyId === candidate.id} onClick={() => void approveCandidate(candidate.id)}><Check size={13} />{selfApproval ? '需要独立 Maintainer' : '批准候选'}</button>}</div></> : <button className="secondary-button" disabled={!canManage || busyId === proposal.id} onClick={() => void createCandidate(proposal.id)}><Plus size={13} />{busyId === proposal.id ? '封存中' : '创建候选'}</button>}</article> })}</div>}{error && <p className="local-form-error" role="alert">{error}</p>}</section>
 }
 
 function ReleasePage() {
@@ -2548,6 +2616,92 @@ function IntentDrawer({ intent, onClose }: { intent: IntentItem; onClose: () => 
           </>}
         </div>
         <div className="drawer-footer"><button className="secondary-button" disabled title="原型控件：尚未接入本地 Control Plane，点击不会产生任何状态变更">打开 GitHub Issue</button><button className="primary-button" disabled title="原型控件：尚未接入本地 Control Plane，点击不会产生任何状态变更">编辑 Intent</button></div>
+      </aside>
+    </>
+  )
+}
+
+const intentVersionStatusLabels: Record<LocalIntentVersion['status'], string> = { draft: '待批准', approved: '已批准', superseded: '已被取代' }
+const riskShort: Record<LocalIntentVersion['riskLevel'], '高' | '中' | '低'> = { high: '高', medium: '中', low: '低' }
+
+/** Stage of a real Intent, in the demo's vocabulary, from what actually exists for it. */
+function localIntentStage(intent: LocalIntentVersion | undefined, runs: Array<{ status: string }>, proposals: LocalChangeProposal[], released: boolean) {
+  if (released) return 'Released'
+  if (proposals.some((proposal) => proposal.status === 'merged')) return 'Merged'
+  if (proposals.some((proposal) => proposal.status !== 'closed')) return 'Review'
+  if (runs.some((run) => run.status === 'running' || run.status === 'queued')) return 'Execution'
+  return intent?.status === 'approved' ? 'Context' : 'Intent'
+}
+
+type LocalIntentApproval = { can: (intent: LocalIntentVersion) => boolean; title: (intent: LocalIntentVersion) => string; approvingId?: string; error?: string; approve: (intentVersionId: string) => Promise<void> }
+
+/** A real Intent in the demo drawer's layout. Every number and list comes from the local Control Plane or the draft checker. */
+function LocalIntentDrawer({ workItemId, onClose, approval }: { workItemId: string; onClose: () => void; approval: LocalIntentApproval }) {
+  const local = useLocalControlPlane()
+  const [tab, setTab] = useState<'意图' | '验收标准' | '关系'>('意图')
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+  const workItem = local.workItems.find((item) => item.id === workItemId)
+  if (!workItem) return null
+  const versions = local.intentVersions.filter((intent) => intent.workItemId === workItemId).sort((left, right) => right.version - left.version)
+  const intent = versions[0]
+  const runs = local.agentRuns.filter((run) => run.workItemId === workItemId)
+  const proposals = local.changeProposals.filter((proposal) => proposal.workItemId === workItemId)
+  const proposal = proposals.find((item) => item.status !== 'closed') ?? proposals[0]
+  const readiness = proposal ? local.reviewReadiness.find((item) => item.changeProposalId === proposal.id) : undefined
+  const link = proposal ? local.codeHostLinks.find((item) => item.changeProposalId === proposal.id) : undefined
+  const releases = local.releaseCandidates.filter((candidate) => proposals.some((item) => item.id === candidate.changeProposalId))
+  const release = releases.find((candidate) => candidate.status === 'approved') ?? releases[0]
+  const latestRun = runs[0]
+  const actorName = (actorId?: string) => local.actors.find((candidate) => candidate.id === actorId)?.displayName ?? actorId ?? '—'
+  const criteria = intent?.acceptanceCriteria ?? []
+  // The same checker that runs while the Intent is drafted, applied to what was stored.
+  const lint = intent ? lintIntentDraft({ goal: intent.goal, constraints: intent.constraints, riskLevel: intent.riskLevel, criteria: criteria.map((criterion) => ({ statement: criterion.statement, criticality: criterion.criticality, verificationType: criterion.verificationType, warnings: inspectStatement(criterion.statement, criterion.verificationType) })) }) : { blockers: [], warnings: [] }
+  const criterionWarnings = criteria.flatMap((criterion, index) => inspectStatement(criterion.statement, criterion.verificationType).map((warning) => `AC-${String(index + 1).padStart(2, '0')}：${warning}`))
+  const unknowns = [...lint.blockers, ...lint.warnings.filter((warning) => !warning.includes('条验收标准仍有待补充')), ...criterionWarnings]
+  const quality = Math.max(0, 100 - lint.blockers.length * 25 - (lint.warnings.length + criterionWarnings.length) * 8)
+  const qualityTitle = `由 Intent 起草检查计算：${lint.blockers.length} 项阻断（每项 −25）、${lint.warnings.length + criterionWarnings.length} 项提示（每项 −8），满分 100`
+  const stage = localIntentStage(intent, runs, proposals, release?.status === 'approved')
+  const source = workItem.authorityProvider === 'local' ? 'Local Intent' : `${workItem.authorityProvider} · ${workItem.authorityRef}`
+  const criterionState = (criterionId: string) => readiness?.criteria.find((item) => item.criterionId === criterionId)
+  const coveredCount = criteria.filter((criterion) => ['passed', 'overridden'].includes(criterionState(criterion.id)?.status ?? '')).length
+  const readinessView = !intent ? { title: '尚无 Intent 版本', detail: '创建 Intent 版本后才能启动 Run。' }
+    : intent.status === 'draft' ? { title: '等待批准后才能启动 Run', detail: `${riskLabels[intent.riskLevel]} Intent 需要作者以外的 owner、maintainer 或 reviewer 批准内容摘要 ${intent.contentDigest.slice(0, 19)}…` }
+    : proposal?.status === 'merged' ? { title: '已合并', detail: `${proposal.id} 已合并到 ${proposal.baseRef}${release ? `；发布候选 ${release.id} ${release.status === 'approved' ? '已批准' : '待批准'}` : '；尚未创建发布候选'}。` }
+    : proposal ? { title: readiness?.status === 'ready' ? '证据齐备，可以审查' : '正在审查', detail: readiness ? `${coveredCount}/${criteria.length} 条验收标准有独立证据${readiness.blockers.length ? `；${readiness.blockers[0]}` : ''}` : `${proposal.id} 等待门禁计算。` }
+    : lint.blockers.length ? { title: '已批准，但起草检查仍有阻断项', detail: lint.blockers[0] }
+    : { title: '可以启动 Agent Run', detail: `已批准${intent.approval?.basis === 'low_risk_rule' ? '（低风险规则）' : `（${actorName(intent.approval?.actorId)}）`}；到 Agent Runs 页选择这个 Work Item 启动。` }
+  const traceCount = [intent, latestRun, readiness?.evidence.length ? readiness : undefined, proposal, link, release].filter(Boolean).length + Math.max(0, versions.length - 1)
+  return (
+    <>
+      <button className="drawer-overlay" onClick={onClose} aria-label="关闭 Intent 详情" />
+      <aside className="intent-drawer" role="dialog" aria-label={`Intent ${workItemLabel(workItem)}`}>
+        <div className="drawer-header"><div><span>{workItem.sequence ? `#${workItem.sequence} · ` : ''}{workItem.id}</span><StageBadge stage={stage} /></div><button className="icon-button" onClick={onClose} aria-label="关闭"><X size={18} /></button></div>
+        <div className="intent-drawer-title"><div>{intent && <span className={`intent-risk risk-${riskShort[intent.riskLevel]}`}>{riskShort[intent.riskLevel]}风险</span>}<h2>{workItem.title}</h2><p>{source} · Owner {actorName(workItem.ownerActorId)} · Version {intent?.version ?? '—'}{intent ? ` · ${intentVersionStatusLabels[intent.status]}` : ''}</p></div>{intent && <div className="intent-quality" title={qualityTitle} style={{ background: `radial-gradient(circle closest-side, #0c1d3a 74%, transparent 76%), conic-gradient(${quality >= 80 ? '#4190f8' : quality >= 60 ? '#e4a84a' : '#e86179'} ${quality}%, #17376f 0)` }}><strong>{quality}</strong><span>意图质量</span></div>}</div>
+        <div className="drawer-tabs">{(['意图', '验收标准', '关系'] as const).map((item) => <button className={tab === item ? 'active' : ''} onClick={() => setTab(item)} key={item}>{item}</button>)}</div>
+        <div className="intent-drawer-body">
+          {tab === '意图' && <>
+            <section className="intent-section"><span className="intent-label">业务目标</span><p className="intent-goal">{intent?.goal ?? workItem.description}</p></section>
+            <section className="intent-section"><span className="intent-label">成功结果 · 关键验收标准</span>{criteria.some((criterion) => criterion.criticality === 'critical') ? <div className="outcome-list">{criteria.filter((criterion) => criterion.criticality === 'critical').map((criterion) => <div key={criterion.id}><Check size={13} /><span>{criterion.statement}</span></div>)}</div> : <p className="local-intent-empty">没有关键验收标准，这个 Intent 不会阻塞任何审批。</p>}</section>
+            <section className="intent-section"><span className="intent-label">约束</span>{intent?.constraints.length ? <div className="constraint-tags">{intent.constraints.map((constraint) => <span key={constraint}>{constraint}</span>)}</div> : <p className="local-intent-empty">未声明约束</p>}</section>
+            <section className="intent-section"><div className="section-heading"><h3>未决问题</h3><span>{unknowns.length}</span></div>{unknowns.length ? <div className="unknown-list">{unknowns.map((unknown) => <div key={unknown}><span>?</span><p>{unknown}</p></div>)}</div> : <p className="local-intent-empty">起草检查没有发现问题。</p>}</section>
+            <section className="intent-readiness"><div><Sparkles size={16} /><span><strong>{readinessView.title}</strong><small>{readinessView.detail}</small></span></div></section>
+            {versions.length > 1 && <section className="intent-section"><div className="section-heading"><h3>版本历史</h3><span>{versions.length}</span></div><div className="local-intent-rows">{versions.map((version) => <div key={version.id}><span className={`local-status ${version.status}`}>v{version.version}</span><div><strong>{intentVersionStatusLabels[version.status]} · {riskLabels[version.riskLevel]} · {version.acceptanceCriteria.length} 条标准</strong><small>{version.contentDigest.slice(0, 19)} · {actorName(version.createdBy)} · {version.createdAt.slice(0, 16).replace('T', ' ')}</small></div></div>)}</div></section>}
+          </>}
+
+          {tab === '验收标准' && <section className="intent-section"><div className="section-heading"><h3>Acceptance Criteria</h3><span>{proposal ? `${coveredCount}/${criteria.length} 有证据` : `${criteria.length} 已定义`}</span></div>{criteria.length ? <div className="acceptance-list">{criteria.map((criterion, index) => { const state = criterionState(criterion.id); const linked = state?.status === 'passed' || state?.status === 'overridden'; return <div key={criterion.id}><span className={linked ? 'linked' : 'missing'}>{linked ? <Check size={13} /> : '!'}</span><div><strong>{criterion.statement}</strong><small>AC-{String(index + 1).padStart(2, '0')} · {criterion.criticality === 'critical' ? 'Critical' : 'Required'} · {verificationLabels[criterion.verificationType]}验证</small></div><em className={linked ? 'linked' : 'missing'}>{state ? `${criterionStatusLabels[state.status]}${state.checkNames.length ? ` · ${state.checkNames.join(', ')}` : ''}` : proposal ? '等待门禁计算' : '尚无 Change Proposal'}</em></div> })}</div> : <p className="local-intent-empty">尚无验收标准</p>}</section>}
+
+          {tab === '关系' && <>
+            <section className="intent-section"><div className="section-heading"><h3>追溯关系</h3><span>{traceCount} linked objects</span></div><div className="traceability-map"><div className="trace-node source"><CircleDot size={14} /><span><strong>{workItem.sequence ? `#${workItem.sequence}` : workItem.id}</strong><small>Intent</small></span></div><ArrowRight size={14} /><div className="trace-column"><div title={intent?.contentDigest}><FolderTree size={13} />{intent ? `${intent.id} · v${intent.version}` : '无 Intent 版本'}</div><div title={latestRun?.errorMessage}><Bot size={13} />{latestRun ? `${latestRun.id} · ${latestRun.status}` : '尚无 Run'}{runs.length > 1 ? ` (+${runs.length - 1})` : ''}</div><div><FlaskConical size={13} />{readiness ? `${readiness.successfulCheckCount} 通过 / ${readiness.failedCheckCount} 失败` : '尚无检查'}</div></div><ArrowRight size={14} /><div className="trace-column"><div><FileCheck2 size={13} />{readiness?.evidence[0]?.id ?? '尚无 Evidence'}</div><div><GitPullRequest size={13} />{link ? <a href={link.url} target="_blank" rel="noreferrer">PR #{link.externalId}</a> : proposal ? proposal.id : '尚无提案'}</div><div><Rocket size={13} />{release ? `${release.id}` : '尚无发布'}</div></div></div></section>
+            {runs.length > 0 && <section className="intent-section"><div className="section-heading"><h3>Agent Runs</h3><span>{runs.length}</span></div><div className="local-intent-rows">{runs.map((run) => <div key={run.id}><span className={`local-status ${run.status}`}>{run.status}</span><div><strong>{run.id} · Intent v{versions.find((version) => version.id === run.intentVersionId)?.version ?? '?'}</strong><small>{run.startedAt?.slice(0, 16).replace('T', ' ') ?? '—'}{run.changeProposalId ? ` · ${run.changeProposalId}` : ''}</small>{run.status === 'failed' && run.errorMessage && <small className="local-run-error" title={run.errorMessage}>{run.errorMessage.trim().split('\n').at(-1)}</small>}</div></div>)}</div></section>}
+            <section className="intent-section"><span className="intent-label">权威来源</span><div className="authority-card"><GitPullRequest size={16} /><div><strong>{source}</strong><p>{workItem.authorityProvider === 'local' ? '该 Intent 在 Control Plane 中创建，尚未关联外部 Issue；目标、约束、验收标准以这里的版本化内容为准。' : '标题与讨论以外部系统为准；Control Plane 维护验收标准、约束与 Evidence。'}</p></div><span>{workItem.authorityProvider === 'local' ? '仅本地' : '已关联'}</span></div></section>
+          </>}
+        </div>
+        {approval.error && <p className="local-form-error" role="alert" style={{ margin: '0 17px 8px' }}>{approval.error}</p>}
+        <div className="drawer-footer">{link ? <a className="secondary-button" href={link.url} target="_blank" rel="noreferrer">打开 Pull Request #{link.externalId}</a> : <button className="secondary-button" disabled title="这个 Intent 还没有发布到代码托管的 Change Proposal">打开 Pull Request</button>}{intent?.status === 'draft' ? <button className="primary-button" disabled={approval.approvingId === intent.id || !approval.can(intent)} title={approval.title(intent)} onClick={() => void approval.approve(intent.id)}><ShieldCheck size={15} />{approval.approvingId === intent.id ? '批准中' : '批准 Intent'}</button> : <button className="primary-button" disabled title="修改目标、约束或验收标准会产生新版本并需要重新批准；编辑界面尚未提供">编辑 Intent</button>}</div>
       </aside>
     </>
   )

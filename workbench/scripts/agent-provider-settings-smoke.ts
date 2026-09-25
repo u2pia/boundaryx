@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http'
 import { once } from 'node:events'
 import { tmpdir } from 'node:os'
@@ -69,7 +69,7 @@ git('commit', '-m', 'initial')
 // prove the configured provider (and only the configured provider) crossed the process boundary.
 const environmentDumpPath = join(root, 'agent-environment.json')
 const agentScript = join(root, 'provider-agent.mjs')
-writeFileSync(agentScript, `import { writeFileSync } from 'node:fs'\nwriteFileSync(process.env.CODEX_ENV_DUMP, JSON.stringify(process.env))\nwriteFileSync('generated.ts', 'export const generated = true\\n')\nconsole.log(JSON.stringify({ type: 'message', summary: 'provider fixture' }))\n`)
+writeFileSync(agentScript, `import { writeFileSync } from 'node:fs'\nif (process.env.CODEX_FAIL_WITH_KEY) { writeFileSync('partial.txt', 'half done'); console.error('calling provider'); console.error('401 from provider, key ' + process.env.APERTURE_AGENT_PROVIDER_API_KEY + ' is invalid'); process.exit(1) }\nwriteFileSync(process.env.CODEX_ENV_DUMP, JSON.stringify(process.env))\nwriteFileSync('generated.ts', 'export const generated = true\\n')\nconsole.log(JSON.stringify({ type: 'message', summary: 'provider fixture' }))\n`)
 
 // The runner's environment allowlist passes `CODEX_*` through from the server process, which is how the dump
 // path reaches the fixture agent without widening the allowlist for the test.
@@ -184,6 +184,26 @@ try {
   const runId = run.body!.agentRun.id
 
   const agentEnvironmentDump = JSON.parse(readFileSync(environmentDumpPath, 'utf8')) as Record<string, string>
+
+  // A failed agent says why: the end of its stderr reaches the run's error message, with the provider key removed.
+  process.env.CODEX_FAIL_WITH_KEY = '1'
+  const failing = createConfiguredAgentRunner({ database, dataDirectory: root, env: agentEnvironment })
+  const failingRequest = makeRequester(createControlPlaneRequestHandler({ database, agentRunner: failing.runner, agentRuntimeDescriptor: failing.descriptor, evidenceStore: failing.evidenceStore }))
+  const failedRun = await failingRequest<{ agentRun: { status: string; errorMessage?: string } }>('/api/agent-runs', { cookie: authorCookie, body: { workItemId, intentVersionId, baseRef: 'main', declaredContextPaths: [] } })
+  delete process.env.CODEX_FAIL_WITH_KEY
+  assert.equal(failedRun.status, 422, failedRun.text)
+  const failedRecord = database.listAgentRuns().find((agentRun) => agentRun.status === 'failed')
+  for (const message of [failedRun.text, String(failedRecord?.errorMessage)]) assert.match(message, /Agent exited with status 1: calling provider(?:\\n|\n)401 from provider, key \[redacted\] is invalid/u)
+  // The failure diagnostic keeps the redacted stderr and what the agent had changed but was never committed.
+  const failureDiagnostic = database.listAggregateEvents('agent_run', String(failedRecord?.id)).find((event) => event.eventType === 'agent_run.failure_diagnostic')?.payload
+  assert.match(String(failureDiagnostic?.stderrTail), /401 from provider, key \[redacted\] is invalid/u)
+  assert.deepEqual(failureDiagnostic?.uncommittedChanges, ['?? partial.txt'])
+  const savedPatch = failureDiagnostic?.uncommittedPatch as { path: string } | null
+  assert.match(readFileSync(String(savedPatch?.path), 'utf8'), /partial\.txt[\s\S]*\+half done/u, 'the unfinished work is kept as a patch')
+  // The worktree cleanup removes the checkout and request.json but keeps the patch the diagnostic points at.
+  assert.equal(existsSync(String(failedRecord?.worktreePath)), false)
+  assert.deepEqual(readdirSync(dirname(String(savedPatch?.path))), ['uncommitted.patch'])
+  assert.equal(JSON.stringify(database.listAgentRuns()).includes(secret), false)
   assert.equal(agentEnvironmentDump.APERTURE_AGENT_MODEL, 'gpt-5.1-codex')
   assert.equal(agentEnvironmentDump.APERTURE_AGENT_MODEL_PROVIDER, 'ica')
   assert.equal(agentEnvironmentDump.APERTURE_AGENT_PROVIDER_BASE_URL, 'https://proxy.example.test/v1')

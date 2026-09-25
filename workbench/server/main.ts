@@ -21,7 +21,7 @@ function joinDefault(...parts: string[]) {
 mkdirSync(dataDirectory, { recursive: true })
 const database = new ControlPlaneDatabase(databasePath, resolve(serverDirectory, 'migrations'))
 const configuredAgent = createConfiguredAgentRunner({ database, dataDirectory })
-const agentRunQueue = configuredAgent.runner ? new AgentRunQueue({ database, databasePath, dataDirectory, concurrency: Number(process.env.CONTROL_PLANE_RUN_CONCURRENCY ?? 2) }) : undefined
+const agentRunQueue = configuredAgent.runner ? new AgentRunQueue({ database, databasePath, dataDirectory, concurrency: Number(process.env.CONTROL_PLANE_RUN_CONCURRENCY ?? 2), runner: configuredAgent.runner }) : undefined
 const orphaned = agentRunQueue?.reconcile() ?? []
 const githubOAuth = githubOAuthConfigFromEnv(process.env, `http://127.0.0.1:${port}`)
 const codeHostSyncer = new CodeHostSyncer({ database, publicUrl: process.env.CONTROL_PLANE_PUBLIC_URL })
@@ -30,7 +30,7 @@ codeHostSyncer.start(codeHostSyncSeconds)
 const server = createControlPlaneServer({ database, staticDirectory: resolve(workbenchDirectory, 'dist'), agentRunner: configuredAgent.runner, agentRunQueue, agentRuntimeDescriptor: configuredAgent.descriptor, evidenceStore: configuredAgent.evidenceStore, githubOAuth, codeHostSyncer })
 
 server.listen(port, '127.0.0.1', () => {
-  console.log(`Local Control Plane listening on http://127.0.0.1:${port}`)
+  console.log(`${new Date().toISOString()} Local Control Plane listening on http://127.0.0.1:${port}`)
   console.log(`SQLite: ${databasePath}`)
   console.log(`Agent Runner: ${configuredAgent.runner?.id ?? 'disabled'} · ${configuredAgent.descriptor.status} · ${configuredAgent.descriptor.isolation}`)
   console.log(`Identity: ${database.getIdentityMode()} mode · GitHub sign-in ${githubOAuth ? `configured · callback ${githubOAuth.redirectUri}` : 'not configured'}`)
@@ -39,7 +39,9 @@ server.listen(port, '127.0.0.1', () => {
   if (agentRunQueue) console.log(`Agent Run queue: ${agentRunQueue.snapshot().concurrency} concurrent worker(s)${orphaned.length ? ` · failed ${orphaned.length} orphaned run(s): ${orphaned.join(', ')}` : ''}`)
 })
 
-function shutdown() {
+// Why the process stopped is the first question after a run is lost, so every exit path says so with a time.
+function shutdown(signal: string) {
+  console.log(`${new Date().toISOString()} received ${signal}; stopping the Control Plane (in-flight runs are failed on the next start)`)
   agentRunQueue?.close()
   codeHostSyncer.close()
   server.close(() => {
@@ -48,5 +50,10 @@ function shutdown() {
   })
 }
 
-process.on('SIGINT', shutdown)
-process.on('SIGTERM', shutdown)
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGHUP', () => shutdown('SIGHUP (terminal closed)'))
+process.on('uncaughtException', (error) => {
+  console.error(`${new Date().toISOString()} Control Plane crashed: ${error.stack ?? error.message}`)
+  process.exit(1)
+})

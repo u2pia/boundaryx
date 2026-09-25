@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import type { ControlPlaneDatabase } from './database.ts'
 import { GitWorktreeAgentRunner, type AgentExecutionRuntime, type AgentRunPostprocessor, type AgentRuntimeContext } from './git-worktree-agent-runner.ts'
 import { sha256 } from './security.ts'
-import type { AgentProviderSettings, AgentRunRequest, AgentRunner, AgentRunnerDescriptor } from './types.ts'
+import type { AgentProviderSettings, AgentRun, AgentRunRequest, AgentRunner, AgentRunnerDescriptor } from './types.ts'
 
 /**
  * Translates the Control Plane's provider setting into the environment the builder wrapper reads. The
@@ -49,12 +49,22 @@ class LocalProcessRuntime implements AgentExecutionRuntime {
 
   execute(context: AgentRuntimeContext) {
     const result = spawnSync(this.input.executable, this.input.args, { cwd: context.worktreePath, encoding: 'utf8', timeout: context.timeoutMs, maxBuffer: 20 * 1024 * 1024, env: { ...this.buildEnvironment(), APERTURE_RUN_REQUEST: context.requestPath, APERTURE_WORKTREE: context.worktreePath } })
-    return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', error: result.error }
+    return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', error: result.error, diagnostic: this.diagnostic(result.stderr ?? '') }
+  }
+
+  /** Last lines of stderr, so a failed run says why; the provider key and any other secret variable's value are removed first. */
+  private diagnostic(stderr: string) {
+    let text = stderr
+    const environment = this.buildEnvironment() as Record<string, string | undefined>
+    for (const [key, value] of Object.entries(environment)) if (value && value.length >= 8 && /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/u.test(key)) text = text.replaceAll(value, '[redacted]')
+    const tail = text.trim().split('\n').slice(-40).join('\n')
+    return tail ? tail.slice(-4000) : undefined
   }
 
   private buildEnvironment() {
     const allowed = new Set(['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS', ...this.input.environmentAllowlist])
     for (const key of Object.keys(process.env)) if (key.startsWith('CODEX_')) allowed.add(key)
+    if (process.env.APERTURE_BUILDER_MAX_STEPS) allowed.add('APERTURE_BUILDER_MAX_STEPS')
     // An operator who keeps the key in the server environment instead of in the Control Plane still needs
     // that one variable to reach the agent, without widening the allowlist by hand.
     if (this.input.provider?.apiKeyEnv && !this.input.provider.apiKey) allowed.add(this.input.provider.apiKeyEnv)
@@ -83,5 +93,9 @@ export class LocalCommandAgentRunner implements AgentRunner {
 
   run(request: AgentRunRequest, actorId: string) {
     return this.runner.run(request, actorId)
+  }
+
+  cleanUpWorktree(run: AgentRun, actorId?: string) {
+    return this.runner.cleanUpWorktree(run, actorId)
   }
 }

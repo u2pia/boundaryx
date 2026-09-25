@@ -190,10 +190,9 @@ export function applyProjectManifest(input: { binding: ProjectManifestBinding; w
   if (riskRank[input.intent.riskLevel] > riskRank[manifest.policy.maximumRisk]) throw new AppError(409, `Intent risk ${input.intent.riskLevel} exceeds project maximum ${manifest.policy.maximumRisk}`, 'project_manifest_risk_exceeded')
   if (input.runtime.isolation === 'unisolated_process' && !manifest.policy.allowUnisolatedRuntime) throw new AppError(409, 'Project policy forbids the configured unisolated process runtime', 'project_manifest_runtime_forbidden')
 
-  const requested = input.declaredContextPaths.length ? [...new Set(input.declaredContextPaths.map((value, index) => normalizeRepositoryPath(value, `declaredContextPaths[${index}]`)))] : manifest.context.required
-  const requestedSet = new Set(requested)
-  for (const requiredPath of manifest.context.required) if (!requestedSet.has(requiredPath)) throw new AppError(409, `Required context path was not declared: ${requiredPath}`, 'project_manifest_context_required')
+  // Required context is always part of the run, so a declaration only adds to it; what it may add is still bounded by `allowed`.
+  const requested = [...new Set([...manifest.context.required, ...input.declaredContextPaths.map((value, index) => normalizeRepositoryPath(value, `declaredContextPaths[${index}]`))])]
   const allowedSet = new Set(manifest.context.allowed)
-  for (const requestedPath of requested) if (!allowedSet.has(requestedPath)) throw new AppError(409, `Context path is not allowed by the project manifest: ${requestedPath}`, 'project_manifest_context_forbidden')
+  for (const requestedPath of requested) if (!allowedSet.has(requestedPath)) throw new AppError(409, `Context path is not allowed by the project manifest: ${requestedPath} (allowed: ${manifest.context.allowed.join(', ')})`, 'project_manifest_context_forbidden')
   return requested
 }

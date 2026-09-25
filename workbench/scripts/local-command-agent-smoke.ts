@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -57,14 +57,15 @@ try {
   assert.throws(() => runner.run({ workItemId: workItem.id, intentVersionId: intent.id, repositoryPath, baseRef: 'main', declaredContextPaths: ['README.md'] }, owner.id), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'intent_not_approved')
   database.approveIntentVersion(intent.id, reviewer.id)
   assert.throws(() => runner.run({ workItemId: workItem.id, intentVersionId: intent.id, repositoryPath, baseRef: 'main', declaredContextPaths: ['README.md', 'AGENTS.md'] }, owner.id), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'project_manifest_context_forbidden')
-  const run = runner.run({ workItemId: workItem.id, intentVersionId: intent.id, repositoryPath, baseRef: 'main', declaredContextPaths: ['README.md'] }, owner.id)
+  // An empty declaration still carries the manifest's required context.
+  const run = runner.run({ workItemId: workItem.id, intentVersionId: intent.id, repositoryPath, baseRef: 'main', declaredContextPaths: [] }, owner.id)
+  assert.deepEqual(database.getAgentRunPlan(run.id).declaredContextPaths, ['README.md'])
 
   assert.equal(run.status, 'succeeded')
   assert.equal(run.isolation, 'unisolated_process')
   assert.ok(run.changeProposalId)
   assert.equal(git('branch', '--show-current'), 'main')
   assert.equal(git('status', '--porcelain'), '')
-  assert.match(readFileSync(join(run.worktreePath, 'feature.ts'), 'utf8'), /generatedByAgent/u)
   const proposal = database.getChangeProposal(run.changeProposalId!)
   assert.equal(proposal.runId, run.id)
   assert.equal(proposal.changedFiles, 1)
@@ -74,7 +75,11 @@ try {
   assert.equal(events.some((event) => event.eventType === 'agent_run.context_rejected'), true)
   assert.equal(events.some((event) => event.eventType === 'agent_run.check_completed'), true)
   assert.equal(events.some((event) => event.eventType === 'agent_run.evidence_packaged'), true)
-  assert.equal(events.at(-1)?.eventType, 'agent_run.succeeded')
+  // The terminal state is written first, so the cleanup event is the last thing in the run's chain.
+  assert.deepEqual(events.slice(-2).map((event) => event.eventType), ['agent_run.succeeded', 'agent_run.worktree_pruned'])
+  assert.equal(events.at(-1)?.payload.pruned, true)
+  assert.equal(events.at(-1)?.payload.error, null, 'the cleanup finished without an error')
+  assert.equal(existsSync(dirname(run.worktreePath)), false, 'the run directory is removed with its checkout')
   assert.equal(database.verifyAggregateEventChain('agent_run', run.id), true)
   const attestation = events.find((event) => event.eventType === 'agent_run.runtime_attested')
   assert.equal(Array.isArray(attestation?.payload.environmentKeys), true)
@@ -135,6 +140,19 @@ try {
   const revisionEvidencePackage = evidenceStore.read(revisedReadiness.evidence[0].uri, revisedReadiness.evidence[0].sha256)
   assert.equal(revisionEvidencePackage.run.startSha, proposal.headSha)
   assert.equal(revisionEvidencePackage.run.revisionOfProposalId, proposal.id)
+
+  // The worktree is gone for both runs and for every negative run above, while the proposal branches and the
+  // evidence packages they produced are still readable — the revision run in between proved the latter on its
+  // own, because it started from the reviewed Head SHA of the first run's branch.
+  for (const cleaned of [run, revisionRun, missingMetrics.negativeRun, belowThreshold.negativeRun, tamperedDataset.negativeRun]) {
+    assert.equal(existsSync(cleaned.worktreePath), false, `${cleaned.id} should not leave a worktree behind`)
+    assert.equal(git('worktree', 'list', '--porcelain').split('\n').some((line) => line.startsWith('worktree ')), true, 'the primary worktree remains')
+    assert.equal(git('worktree', 'list').includes(cleaned.worktreePath), false, `${cleaned.id} should not be listed as a worktree`)
+    assert.equal(readdirSync(join(root, 'runs')).includes(cleaned.id), false, `${cleaned.id} should not leave a run directory behind`)
+    assert.equal(git('rev-parse', '--verify', `${cleaned.branchRef}^{commit}`).length, 40, `${cleaned.branchRef} must survive the cleanup`)
+  }
+  assert.equal(git('worktree', 'list', '--porcelain').includes('prunable'), false, 'no administrative entry outlives its worktree')
+  assert.equal(git('rev-parse', '--verify', `${revisedProposal.headRef}^{commit}`), revisedProposal.headSha, 'the revised Head branch still resolves to the reviewed SHA')
 
   console.log(`local command agent smoke passed · ${run.id} → ${revisionRun.id} · ${proposal.headSha.slice(0, 7)} → ${revisedProposal.headSha.slice(0, 7)} · revision governed`)
 } finally {

@@ -110,7 +110,8 @@ try {
   assert.equal(honest.readiness.checks.find((check) => check.name === 'node-tests@baseline')?.runId, honest.run.id)
   // Restoring the head test files must leave no trace: a dirty worktree would have been recorded.
   assert.equal(honest.readiness.checks.some((check) => check.name === 'workspace-clean'), false)
-  assert.equal(readFileSync(join(honest.run.worktreePath, 'test/adder.test.ts'), 'utf8').includes('adds zero'), true)
+  // The worktree is removed when the run ends, so the reviewed head is read from the proposal's commit.
+  assert.equal(git('show', `${honest.readiness.headSha}:test/adder.test.ts`).includes('adds zero'), true)
 
   // 2. The failure this invariant exists for: the agent rewrote the tests so its own head run is green,
   //    but the project's own tests still fail. Review must be blocked.
