@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   Archive,
@@ -335,6 +335,8 @@ function App() {
 
         <div className="page-content">
           <LocalControlPlaneAccess />
+          {/* Keyed by project: a half-written Intent or a model draft belongs to the project it was started in. */}
+          <Fragment key={localControlPlane.currentProjectId ?? 'none'}>
           {page === '总览' && <Overview onOpenReview={setSelectedReview} onOpenRun={setSelectedRun} onNavigate={setPage} />}
           {page === 'Intents' && <IntentsPage onOpenIntent={setSelectedIntent} />}
           {page === '上下文' && <ContextPage />}
@@ -350,6 +352,7 @@ function App() {
           {page === '项目' && <ProjectsPage />}
           {page === '团队' && <TeamPage />}
           {page === '度量' && <MetricsPage />}
+          </Fragment>
         </div>
       </main>
 
@@ -516,30 +519,28 @@ function Sidebar({ page, onNavigate, open, collapsed, onToggle }: { page: Page; 
 }
 
 /**
- * Whether static sample data may be shown: only in the default project, which has no repository and so no real work
- * to be confused with, and before sign-in, when there is no project at all.
+ * Whether static sample data may be shown: only before sign-in, when there is no project at all. Once signed in,
+ * every page shows the current project's real rows only, the default project included: its seeded work items are
+ * real rows, and sample Intents beside them would read as belonging to it.
  */
 function useDemoScope() {
   const local = useLocalControlPlane()
-  return !(local.status === 'ready' && local.actor) || local.currentProjectId === DEMO_PROJECT_ID
+  return !(local.status === 'ready' && local.actor)
 }
 
 // Everything below a DemoRegion is static sample data. It used to share cards, check marks and scores with the
 // real sections above it, so a reviewer could not tell them apart at a glance; the region now carries its own frame,
-// neutralises the "passed" greens, and appears only in the default project, where it is open by default.
+// neutralises the "passed" greens, and appears only before sign-in, where it is open by default.
 function DemoRegion({ title, note, actions, children }: { title: string; note: string; actions?: React.ReactNode; children: React.ReactNode }) {
-  const local = useLocalControlPlane()
   const demoScope = useDemoScope()
   const [expanded, setExpanded] = useState<boolean>()
   const bodyId = useId()
   const open = expanded ?? true
-  const demoProject = local.projects.find((project) => project.id === DEMO_PROJECT_ID)
   if (!demoScope) return (
     <section className="demo-region demo-region-elsewhere" aria-label={`演示数据：${title}`}>
       <header className="demo-region-bar">
         <span className="demo-region-tag">演示数据</span>
-        <div><strong>{title}</strong><p>演示数据只在「{demoProject?.name ?? '默认项目'}」中显示；当前项目只展示真实数据。</p></div>
-        {demoProject && <button className="secondary-button" onClick={() => void local.selectProject(DEMO_PROJECT_ID)}>切换到演示项目</button>}
+        <div><strong>{title}</strong><p>这一块只有演示数据，登录后不显示；各页只展示当前项目的真实数据。</p></div>
       </header>
     </section>
   )
