@@ -24,6 +24,9 @@ export type ProviderProbeResult = {
   detail?: string
 }
 
+/** A completed turn: the probe's fields, with the model's whole reply in place of the clipped `reply`. */
+export type ProviderCompletion = Omit<ProviderProbeResult, 'reply'> & { text?: string }
+
 const PROMPT = 'Reply with the single word OK.'
 
 // Mirrors scripts/agents/builder.mjs, which picks the engine from the same fields at each run.
@@ -63,10 +66,10 @@ function reasonFor(status: number) {
 const CLAUDE_ENVIRONMENT = ['HOME', 'PATH', 'USER', 'LANG', 'TMPDIR', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy']
 
 /** One print-mode turn of the local Claude Code, configured the way claude-builder runs it. */
-async function probeLocalClaude(input: ProviderProbeInput, timeoutMs: number): Promise<ProviderProbeResult> {
+async function completeWithLocalClaude(input: ProviderProbeInput, prompt: string, timeoutMs: number): Promise<ProviderCompletion> {
   const executable = localClaude() as string | undefined
   const started = Date.now()
-  const result = (fields: Partial<ProviderProbeResult>): ProviderProbeResult => ({ ok: false, engine: 'claude-code', endpoint: executable ?? 'claude', latencyMs: Date.now() - started, ...fields })
+  const result = (fields: Partial<ProviderCompletion>): ProviderCompletion => ({ ok: false, engine: 'claude-code', endpoint: executable ?? 'claude', latencyMs: Date.now() - started, ...fields })
   if (!executable) return result({ error: '本机没有找到 Claude Code：安装后再试，或填写 API Key 直连 Anthropic' })
   const environment: Record<string, string> = Object.fromEntries(CLAUDE_ENVIRONMENT.flatMap((key) => process.env[key] ? [[key, process.env[key]!]] : []))
   if (input.baseUrl.trim()) environment.ANTHROPIC_BASE_URL = input.baseUrl.trim()
@@ -79,7 +82,7 @@ async function probeLocalClaude(input: ProviderProbeInput, timeoutMs: number): P
     child.stdout.on('data', (chunk) => { stdout += chunk })
     child.stderr.on('data', (chunk) => { stderr += chunk })
     child.stdin.on('error', () => {})
-    child.stdin.end(PROMPT)
+    child.stdin.end(prompt)
     child.on('error', (error) => { clearTimeout(timer); done({ code: null, stdout, stderr, timedOut, error }) })
     child.on('close', (code) => { clearTimeout(timer); done({ code, stdout, stderr, timedOut }) })
   })
@@ -90,28 +93,34 @@ async function probeLocalClaude(input: ProviderProbeInput, timeoutMs: number): P
   if (output.code !== 0 || !payload || payload.is_error || typeof payload.result !== 'string') {
     return result({ error: 'Claude Code 应答失败：检查它的登录、~/.claude/settings.json 里的网关和模型名', detail: scrub(typeof payload?.result === 'string' ? payload.result : output.stderr || output.stdout) })
   }
-  return result({ ok: true, reply: scrub(payload.result).slice(0, 80) })
+  return result({ ok: true, text: payload.result })
 }
 
-export async function probeAgentProvider(input: ProviderProbeInput, options: { timeoutMs?: number } = {}): Promise<ProviderProbeResult> {
+/**
+ * The full text of one model turn, unclipped, for callers that parse it (the Intent drafter). Failures carry the
+ * same plain-language reasons as the probe; `text` is returned as the provider sent it, so a caller that shows any
+ * of it must scrub it itself.
+ */
+export async function completeWithProvider(input: ProviderProbeInput, prompt: string, options: { timeoutMs?: number; maxTokens?: number } = {}): Promise<ProviderCompletion> {
   const base = input.baseUrl.trim().replace(/\/+$/u, '')
-  if (isAnthropic(input) && !input.apiKey) return probeLocalClaude(input, options.timeoutMs ?? 60_000)
+  if (isAnthropic(input) && !input.apiKey) return completeWithLocalClaude(input, prompt, options.timeoutMs ?? 60_000)
   const engine: ProviderProbeResult['engine'] = isAnthropic(input) ? 'anthropic' : input.wireApi
   const bearer = input.apiKey ? { Authorization: `Bearer ${input.apiKey}` } : {}
   const request = engine === 'anthropic'
-    ? { endpoint: `${base}/v1/messages`, headers: { 'anthropic-version': '2023-06-01', ...(input.apiKey ? { 'x-api-key': input.apiKey } : {}) }, body: { model: input.model, max_tokens: 16, messages: [{ role: 'user', content: PROMPT }] } }
+    ? { endpoint: `${base}/v1/messages`, headers: { 'anthropic-version': '2023-06-01', ...(input.apiKey ? { 'x-api-key': input.apiKey } : {}) }, body: { model: input.model, max_tokens: options.maxTokens ?? 16, messages: [{ role: 'user', content: prompt }] } }
     : engine === 'chat'
-      ? { endpoint: `${base}/chat/completions`, headers: bearer, body: { model: input.model, messages: [{ role: 'user', content: PROMPT }] } }
-      : { endpoint: `${base}/responses`, headers: bearer, body: { model: input.model, input: PROMPT } }
+      ? { endpoint: `${base}/chat/completions`, headers: bearer, body: { model: input.model, messages: [{ role: 'user', content: prompt }] } }
+      : { endpoint: `${base}/responses`, headers: bearer, body: { model: input.model, input: prompt } }
   const started = Date.now()
-  const result = (fields: Partial<ProviderProbeResult>): ProviderProbeResult => ({ ok: false, engine, endpoint: request.endpoint, latencyMs: Date.now() - started, ...fields })
+  const result = (fields: Partial<ProviderCompletion>): ProviderCompletion => ({ ok: false, engine, endpoint: request.endpoint, latencyMs: Date.now() - started, ...fields })
+  const timeoutMs = options.timeoutMs ?? 30_000
   let response: Response
   try {
-    response = await fetch(request.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', ...request.headers }, body: JSON.stringify(request.body), signal: AbortSignal.timeout(options.timeoutMs ?? 30_000) })
+    response = await fetch(request.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', ...request.headers }, body: JSON.stringify(request.body), signal: AbortSignal.timeout(timeoutMs) })
   } catch (error) {
     const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')
     const cause = error instanceof Error ? ((error.cause as Error | undefined)?.message ?? error.message) : String(error)
-    return result({ error: timedOut ? '等待超时：服务商没有在 30 秒内应答' : '连不上 Base URL：检查地址、网络或代理', detail: scrub(cause, input.apiKey) })
+    return result({ error: timedOut ? `等待超时：服务商没有在 ${Math.round(timeoutMs / 1000)} 秒内应答` : '连不上 Base URL：检查地址、网络或代理', detail: scrub(cause, input.apiKey) })
   }
   const text = await response.text().catch(() => '')
   if (!response.ok) return result({ status: response.status, error: reasonFor(response.status), detail: scrub(text, input.apiKey) })
@@ -119,5 +128,10 @@ export async function probeAgentProvider(input: ProviderProbeInput, options: { t
   try { body = JSON.parse(text) } catch { return result({ status: response.status, error: '返回的不是 JSON：Base URL 可能指向了网页而不是 API', detail: scrub(text, input.apiKey) }) }
   const reply = replyOf(engine, body)
   if (reply === undefined) return result({ status: response.status, error: '接口应答了，但读不到模型回复：检查 Wire API 是否选对', detail: scrub(text, input.apiKey) })
-  return result({ ok: true, status: response.status, reply: scrub(reply, input.apiKey).slice(0, 80) })
+  return result({ ok: true, status: response.status, text: reply })
+}
+
+export async function probeAgentProvider(input: ProviderProbeInput, options: { timeoutMs?: number } = {}): Promise<ProviderProbeResult> {
+  const { text, ...result } = await completeWithProvider(input, PROMPT, options)
+  return text === undefined ? result : { ...result, reply: scrub(text, input.apiKey).slice(0, 80) }
 }

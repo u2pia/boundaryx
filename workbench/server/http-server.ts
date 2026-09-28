@@ -13,6 +13,7 @@ import { requestContext, type RequestContext } from './request-context.ts'
 import { projectContext, projectContextFile } from './project-context.ts'
 import { projectProductType } from './project-product-type.ts'
 import { probeAgentProvider } from './provider-probe.ts'
+import { generateIntentDraft, maximumBriefLength, projectDraftingContext } from './intent-drafter.ts'
 import { agentRunProgress } from './run-progress.ts'
 import { createSessionToken } from './security.ts'
 import { AppError, type AgentRunner, type AgentRunnerDescriptor, type CodeHostKind, type MergeMode, type ProjectRole, type SessionActor, type TeamRole } from './types.ts'
@@ -435,6 +436,28 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         return sendJson(response, 200, { productType: projectProductType(database, productTypeRoute.projectId) ?? null })
       }
 
+      // A model draft of an Intent from the developer's brief, for them to edit and submit through the normal form.
+      // It uses the Builder's provider and key; nothing is created until the developer submits.
+      const intentDraftRoute = routeMatch(path, /^\/api\/projects\/(?<projectId>[^/]+)\/intent-drafts$/u)
+      if (method === 'POST' && intentDraftRoute) {
+        const projectId = intentDraftRoute.projectId
+        requireIn(projectId)
+        database.assertIntentDrafter(actor.id, projectId)
+        const body = await readJson(request)
+        const title = requireString(body, 'title')
+        const brief = requireString(body, 'brief')
+        if (title.length > 200) throw new AppError(400, 'title must be at most 200 characters', 'invalid_intent_brief')
+        if (brief.length > maximumBriefLength) throw new AppError(400, `brief must be at most ${maximumBriefLength} characters`, 'invalid_intent_brief')
+        const provider = database.getAgentProviderSettings()
+        if (!provider) throw new AppError(409, '还没有配置模型：请 Owner 先在设置里配置 LLM Provider', 'agent_provider_not_configured')
+        const context = projectDraftingContext(database, projectId)
+        const requested = optionalString(body, 'productType')
+        const productType = context.productType ?? (requested === 'agent_system' ? 'agent_system' : 'application')
+        const { draft, reply } = await generateIntentDraft({ provider: { providerId: provider.providerId, model: provider.model, baseUrl: provider.baseUrl, wireApi: provider.wireApi, apiKey: provider.apiKey ?? (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined) }, title, brief, productType, checks: context.checks })
+        const record = database.recordIntentDraft({ projectId, title, brief, productType, providerId: provider.providerId, model: provider.model, draft, reply }, actor.id)
+        return sendJson(response, 201, { intentDraft: { id: record.id, providerId: record.providerId, model: record.model, createdAt: record.createdAt, ...record.draft } })
+      }
+
       // The context a Run started now would bind, read from the manifest on the default branch. Read-only: the files
       // change in the repository through review, so this cannot drift from what a Run is given.
       const projectContextRoute = routeMatch(path, /^\/api\/projects\/(?<projectId>[^/]+)\/context$/u)
@@ -469,7 +492,7 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
       if (method === 'POST' && intentRoute) {
         const body = await readJson(request)
         if (!Array.isArray(body.acceptanceCriteria)) throw new AppError(400, 'acceptanceCriteria must be an array', 'invalid_acceptance_criteria')
-        const intentVersion = database.createIntentVersion({ workItemId: intentRoute.workItemId, goal: requireString(body, 'goal'), constraints: Array.isArray(body.constraints) ? body.constraints.filter((item): item is string => typeof item === 'string') : [], ...(body.nonGoals === undefined ? {} : { nonGoals: body.nonGoals as string[] }), ...(body.examples === undefined ? {} : { examples: body.examples as Array<{ input: string; expected: string }> }), riskLevel: requireString(body, 'riskLevel') as 'low' | 'medium' | 'high', acceptanceCriteria: body.acceptanceCriteria.map((criterion) => {
+        const intentVersion = database.createIntentVersion({ workItemId: intentRoute.workItemId, goal: requireString(body, 'goal'), constraints: Array.isArray(body.constraints) ? body.constraints.filter((item): item is string => typeof item === 'string') : [], ...(body.nonGoals === undefined ? {} : { nonGoals: body.nonGoals as string[] }), ...(body.examples === undefined ? {} : { examples: body.examples as Array<{ input: string; expected: string }> }), riskLevel: requireString(body, 'riskLevel') as 'low' | 'medium' | 'high', ...(optionalString(body, 'draftId') ? { draftId: optionalString(body, 'draftId') } : {}), acceptanceCriteria: body.acceptanceCriteria.map((criterion) => {
           if (!criterion || typeof criterion !== 'object') throw new AppError(400, 'Invalid acceptance criterion', 'invalid_acceptance_criteria')
           const value = criterion as Record<string, unknown>
           return { statement: requireString(value, 'statement'), criticality: requireString(value, 'criticality') as 'normal' | 'critical', verificationType: requireString(value, 'verificationType') as 'deterministic' | 'model' | 'human', ...(value.verifiedBy === undefined ? {} : { verifiedBy: value.verifiedBy as string[] }) }

@@ -105,6 +105,25 @@ export type LocalIntentVersion = {
   status: 'draft' | 'approved' | 'superseded'
   approval?: { basis: 'low_risk_rule' | 'named_approval'; actorId?: string; approvedAt: string; comment?: string }
   acceptanceCriteria: Array<{ id: string; ordinal: number; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; verifiedBy?: string[] }>
+  /** Present when the version started as a model draft: which model, and which fields the author changed ([] = none). */
+  draft?: { draftId: string; providerId: string; model: string; changedFields: Array<'goal' | 'constraints' | 'nonGoals' | 'examples' | 'riskLevel' | 'acceptanceCriteria'> }
+}
+
+/** A model draft of an Intent, already normalised by the server; nothing exists until the developer submits the form. */
+export type LocalIntentDraft = {
+  id: string
+  providerId: string
+  model: string
+  createdAt: string
+  goal: string
+  constraints: string[]
+  nonGoals: string[]
+  examples: Array<{ input: string; expected: string }>
+  riskLevel: LocalIntentVersion['riskLevel']
+  riskRationale?: string
+  acceptanceCriteria: Array<{ statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; verifiedBy?: string[] }>
+  questions: string[]
+  adjustments: string[]
 }
 
 export type LocalChangeProposal = {
@@ -392,6 +411,7 @@ export const localControlPlaneClient = {
   updateActor: (actorId: string, input: LocalActorUpdate) => post<{ actor: LocalActor }>(`/api/actors/${encodeURIComponent(actorId)}`, input),
   listProjects: () => request<{ projects: LocalProject[]; roles: Record<string, LocalActor['role'] | undefined> }>('/api/projects'),
   /** What the project builds, from .aperture/project.json on its default branch; null while it has no repository. */
+  draftIntent: (projectId: string, input: { title: string; brief: string; productType: LocalWorkItem['productType'] }) => post<{ intentDraft: LocalIntentDraft }>(`/api/projects/${encodeURIComponent(projectId)}/intent-drafts`, input),
   getProjectProductType: (projectId: string) => request<{ productType: LocalWorkItem['productType'] | null }>(`/api/projects/${encodeURIComponent(projectId)}/product-type`),
   getProjectContext: (projectId: string) => request<{ context: LocalProjectContext | null }>(`/api/projects/${encodeURIComponent(projectId)}/context`),
   getProjectContextFile: (projectId: string, path: string) => request<{ file: { path: string; baseSha: string; sizeBytes: number; truncated: boolean; content: string } }>(`/api/projects/${encodeURIComponent(projectId)}/context/file?path=${encodeURIComponent(path)}`),
@@ -409,7 +429,7 @@ export const localControlPlaneClient = {
   listWorkItems: (projectId?: string) => request<{ workItems: LocalWorkItem[] }>(scoped('/api/work-items', projectId)),
   getWorkItem: (workItemId: string) => request<{ workItem: LocalWorkItem; intentVersions: LocalIntentVersion[] }>(`/api/work-items/${workItemId}`),
   createWorkItem: (input: { title: string; description: string; productType: LocalWorkItem['productType']; ownerActorId?: string; projectId: string }) => post<{ workItem: LocalWorkItem }>('/api/work-items', input),
-  createIntentVersion: (workItemId: string, input: { goal: string; constraints: string[]; nonGoals?: string[]; examples?: Array<{ input: string; expected: string }>; riskLevel: LocalIntentVersion['riskLevel']; acceptanceCriteria: Array<{ statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; verifiedBy?: string[] }> }) => post<{ intentVersion: LocalIntentVersion }>(`/api/work-items/${workItemId}/intent-versions`, input),
+  createIntentVersion: (workItemId: string, input: { draftId?: string; goal: string; constraints: string[]; nonGoals?: string[]; examples?: Array<{ input: string; expected: string }>; riskLevel: LocalIntentVersion['riskLevel']; acceptanceCriteria: Array<{ statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; verifiedBy?: string[] }> }) => post<{ intentVersion: LocalIntentVersion }>(`/api/work-items/${workItemId}/intent-versions`, input),
   approveIntentVersion: (intentVersionId: string, input: { comment: string }) => post<{ intentVersion: LocalIntentVersion }>(`/api/intent-versions/${encodeURIComponent(intentVersionId)}/approve`, input),
   listAgentRuns: (projectId?: string) => request<{ agentRuns: LocalAgentRun[] }>(scoped('/api/agent-runs', projectId)),
   startAgentRun: (input: { workItemId: string; intentVersionId: string; baseRef?: string; declaredContextPaths: string[]; changeProposalId?: string }) => post<{ agentRun: LocalAgentRun; queuePosition?: number }>('/api/agent-runs', input),

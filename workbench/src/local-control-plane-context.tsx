@@ -16,6 +16,8 @@ type IntentBundleInput = {
   // prompt，所以不能由这一层代填——代填出来的「全部确定性关键」是一句谎话。
   // verifiedBy 是起草人声明的「这条标准由哪些 check 证明」，同样进入 contentDigest。
   acceptanceCriteria: Array<{ statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; verifiedBy?: string[] }>
+  /** The model draft the form was filled from; the server records which fields the developer changed. */
+  draftId?: string
 }
 
 // The repository is never named here: the server resolves it from the work item's project.
@@ -392,6 +394,7 @@ export function LocalControlPlaneProvider({ children }: { children: ReactNode })
     if (!projectId) throw new Error('当前没有可用的项目，请先让 Owner 把你加入一个项目')
     const created = await localControlPlaneClient.createWorkItem({ title: input.title, description: input.description, productType: input.productType, ownerActorId: actor?.id, projectId })
     await localControlPlaneClient.createIntentVersion(created.workItem.id, {
+      ...(input.draftId ? { draftId: input.draftId } : {}),
       goal: input.goal,
       constraints: input.constraints,
       ...(input.nonGoals?.length ? { nonGoals: input.nonGoals } : {}),

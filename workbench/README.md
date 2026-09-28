@@ -167,6 +167,13 @@ Intent 页的表单按 `PRODUCT_CHARTER.md` 的定义补三样东西：验收标
 
 「套用模版」按钮按当前产品类型（App / Agent System）填充目标、约束与验收标准。模版故意保留 `<...>` 占位符：套用之后解析预览会立刻提示"还有未替换的模版占位符"，模版因此是一份必须逐项填完的清单，而不是一段可以直接提交的空话。
 
+「用模型起草」按钮把 Work Item 标题和一段需求描述交给设置里配置的 LLM Provider（与 Builder 同一个，`POST /api/projects/:id/intent-drafts`），生成目标、约束、不做什么、示例、风险等级和带标注的验收标准，填进同一张表单，开发人员改完再提交。草稿本身不创建任何东西，提交时和手写的 Intent 走同样的校验。几条约定：
+
+- 模型的输出先由服务端规范化：无法识别的标注按「关键 · 确定性」处理，manifest 里没有的 Check 名去掉，高风险缺人工标准这类问题只提示、不代补，所有调整都列在草稿下方；模型拿不准的地方以「待确认问题」列出；
+- 模型建议的风险等级比表单当前值低时不会自动下调，因为风险等级决定谁来批准，要由人自己改；
+- 草稿原样存进只允许追加的 `intent_drafts` 表，并在项目事件链上记一条 `intent.draft_generated`（需求描述只记摘要）。Intent 版本记下来源草稿和作者改过的字段（`draft.changedFields`），不计入 `contentDigest`。Intent 详情会显示「由某模型起草，作者修改了哪些字段」；验收标准没改过时会提醒批准人逐条核对；
+- 草稿只能由生成它的作者、在同一项目里使用（`intent_draft_foreign`）。
+
 验收标准一行一条，行首可带任意数量、任意顺序的方括号标注：
 
 | 标注 | 含义 |
@@ -476,6 +483,7 @@ npm run check
 - `npm run test:github-e2e`（手动，不在 `check` 里）对真实 GitHub 仓库跑同样的流程，需要 `APERTURE_GITHUB_TOKEN` 与 `GITHUB_E2E_REPO=owner/repo`。仓库须是可丢弃的测试仓库，并在 `pull_request` 上用 Actions 跑测试。覆盖 GitHub Actions 检查导入、GitHub 上显示的 `aperture/gate`、平台合并推送、远程前进时拒绝并回滚、PR 关闭、`host_protected` 下的 squash 合并和绕过门禁的合并。结果留在 `.aperture-github-e2e/` 供界面查看；
 - `npm run test:governance-decisions` 验证 Override 的角色、作者、理由与 Head 绑定，共享检查需要每条依赖标准都推翻，完整性检查不可推翻，以及 Reject 的终局性；
 - `npm run test:intent-template` 验证验收标准标注的解析与默认值、模版本身带显式标注且套用后仍被标为待补充、模糊度提示只告警不拦截，以及服务端的枚举校验、高风险人工审批不变量和 `criticality` / `verificationType` 按输入落库并参与 `contentDigest`；
+- `npm run test:intent-draft` 用一个假的 OpenAI 兼容服务验证模型起草：输出规范化与调整提示、文本框格式往返一致、未配置 Provider 与无法解析的回复被拒、草稿不创建任何东西、原样提交记录 `changedFields: []`、改动被逐字段记录、提交仍受高风险人工标准门禁、他人不能冒用草稿、草稿表只允许追加；
 - `npm run test:local-control-plane` 验证 SQLite、Local Authority、真实 Git Revision、Review 失效和追加式 Domain Event Log；
 - `npm run test:local-control-plane-http` 验证初始化、登录、成员、Intent、Change Proposal、Check、Evidence、Review 和 Event API 的 HTTP 契约；
 - `npm run test:agent-provider` 验证 LLM Provider 设置的 Owner 边界、API Key 只写不读、保留与清除语义，以及模型进入 Agent 进程环境、Runtime Attestation 与 codex `-c` 覆盖；

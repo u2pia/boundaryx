@@ -3,7 +3,9 @@
  *
  * 这里的动机不是表单体验。验收标准的 `criticality` 与 `verificationType` 会进入 `contentDigest`、Evidence
  * Package 和 Builder Agent 的 prompt（见 scripts/agents/codex-builder.mjs），所以「这条标准怎么被证明」必须由
- * 起草人声明，不能由 UI 代填。纯 TS 无框架依赖，因此 scripts/ 下的 smoke 可以直接导入。
+ * 起草人声明，不能由 UI 代填。模型起草（server/intent-drafter.ts）也不例外：它的标注以明文 `[关键] [确定性]`
+ * 写回文本框，由起草人看过、改过再提交；提交后服务端记下草稿的哪些字段被改过，批准人能看到哪些标注是模型原样给的。
+ * 纯 TS 无框架依赖，因此 scripts/ 下的 smoke 可以直接导入。
  */
 
 export type Criticality = 'normal' | 'critical'
@@ -185,6 +187,19 @@ export function parseAcceptanceCriteria(text: string): ParsedCriterion[] {
   }
 
   return criteria
+}
+
+/**
+ * `parseAcceptanceCriteria` 的逆运算：把结构化的标准写回文本框语法。标注全部显式写出、不依赖默认值，
+ * 这样起草人看到的就是将被提交的声明。smoke 校验两者往返一致。
+ */
+export function formatAcceptanceCriteria(criteria: Array<{ statement: string; criticality: Criticality; verificationType: VerificationType; verifiedBy?: string[] }>) {
+  return criteria.map((criterion) => `[${criticalityLabels[criterion.criticality]}] [${verificationLabels[criterion.verificationType]}] ${criterion.statement}${criterion.verifiedBy?.length ? ` [验证: ${criterion.verifiedBy.join(', ')}]` : ''}`).join('\n')
+}
+
+/** `parseIntentExamples` 的逆运算。 */
+export function formatIntentExamples(examples: Array<{ input: string; expected: string }>) {
+  return examples.map((example) => `输入：${example.input}\n期望：${example.expected}`).join('\n')
 }
 
 /** 把一行一条的文本框内容拆成数组，约束与上下文路径都用这个。 */

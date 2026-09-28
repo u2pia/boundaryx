@@ -7,7 +7,8 @@ import { criterionStatus, isSubstantiveHumanCriterion, mapCriteriaToChecks, ment
 import { requestContext } from './request-context.ts'
 import { loadEventSealKeyring, type EventSealKeyring } from './event-seal.ts'
 import { normalizeProjectHost, type ProjectHostInput } from './code-host/index.ts'
-import type { AcceptanceCriterionInput, BuilderStopReason, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentExample, IntentVersion, MergeEvidence, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
+import type { GeneratedIntentDraft, IntentDraftContent } from './intent-drafter.ts'
+import type { IntentDraftField, IntentVersionDraft, AcceptanceCriterionInput, BuilderStopReason, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentExample, IntentVersion, MergeEvidence, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
 import { AppError } from './types.ts'
 
 type SqlValue = string | number | null
@@ -28,6 +29,7 @@ export const DEFAULT_PROJECT_ID = 'PRJ-DEFAULT'
 /** Migration 020: records what a code host reported. Disabled, has no credential, and can never decide anything. */
 export const SYSTEM_CODE_HOST_ACTOR_ID = 'ACT-SYSTEM-CODE-HOST'
 const ALL_ROLES: TeamRole[] = ['owner', 'maintainer', 'reviewer', 'developer']
+const intentDraftFields: IntentDraftField[] = ['goal', 'constraints', 'nonGoals', 'examples', 'riskLevel', 'acceptanceCriteria']
 const PROJECT_ROLES: ProjectRole[] = ['maintainer', 'reviewer', 'developer']
 const PROJECT_TABLES: Record<string, string> = { work_item: 'work_items', change_proposal: 'change_proposals', agent_run: 'agent_runs', release_candidate: 'release_candidates' }
 
@@ -603,8 +605,9 @@ export class ControlPlaneDatabase {
     return this.mapWorkItem(row)
   }
 
-  createIntentVersion(input: { workItemId: string; goal: string; constraints: string[]; nonGoals?: string[]; examples?: IntentExample[]; riskLevel: IntentVersion['riskLevel']; acceptanceCriteria: AcceptanceCriterionInput[] }, actorId: string) {
-    this.requireProjectRole(actorId, this.getWorkItem(input.workItemId).projectId, ALL_ROLES, 'intent_forbidden')
+  createIntentVersion(input: { workItemId: string; goal: string; constraints: string[]; nonGoals?: string[]; examples?: IntentExample[]; riskLevel: IntentVersion['riskLevel']; acceptanceCriteria: AcceptanceCriterionInput[]; draftId?: string }, actorId: string) {
+    const projectId = this.getWorkItem(input.workItemId).projectId
+    this.requireProjectRole(actorId, projectId, ALL_ROLES, 'intent_forbidden')
     if (!input.goal.trim() || !input.acceptanceCriteria.length) throw new AppError(400, 'Intent goal and acceptance criteria are required', 'invalid_intent')
     // 这两项校验放在 database 层而不是 HTTP 层：smoke 脚本与 real-case 都直接调用这个方法，只在 HTTP 边界
     // 校验会留下一个绕过口。criticality 与 verificationType 会进入 contentDigest 与 Evidence Package，
@@ -648,6 +651,9 @@ export class ControlPlaneDatabase {
     if (input.riskLevel !== 'low' && !input.acceptanceCriteria.some((criterion) => criterion.criticality === 'critical')) {
       throw new AppError(400, 'A medium or high risk intent requires at least one critical acceptance criterion', 'intent_requires_critical_criterion')
     }
+    // A draft is only evidence of where this text came from if the author is the one who asked for it, in this project.
+    const draft = input.draftId === undefined ? undefined : this.getIntentDraft(input.draftId)
+    if (draft && (draft.projectId !== projectId || draft.createdBy !== actorId)) throw new AppError(403, 'An Intent can only start from a draft its author generated in the same project', 'intent_draft_foreign')
     return this.inTransaction(() => {
       const version = Number((this.db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS version FROM intent_versions WHERE work_item_id = ?').get(input.workItemId) as { version: number }).version)
       const intentId = `${input.workItemId}:v${version}`
@@ -656,13 +662,15 @@ export class ControlPlaneDatabase {
       const canonical = { workItemId: input.workItemId, version, goal: input.goal.trim(), constraints: input.constraints, ...(nonGoals.length ? { nonGoals: [...new Set(nonGoals)] } : {}), ...(examples.length ? { examples: examples.map((example) => ({ input: example.input, expected: example.expected })) } : {}), riskLevel: input.riskLevel, acceptanceCriteria }
       // V0.3 §10.1: a low risk Intent becomes Ready through the lightweight rule; anything riskier waits for a named approver.
       const lowRisk = input.riskLevel === 'low'
-      const intent: IntentVersion = { id: intentId, ...canonical, contentDigest: `sha256:${sha256(JSON.stringify(canonical))}`, createdBy: actorId, createdAt: timestamp, acceptanceCriteria: acceptanceCriteria.map((criterion, index) => ({ ...criterion, id: `${intentId}:AC-${index + 1}`, ordinal: index + 1 })), status: lowRisk ? 'approved' : 'draft', ...(lowRisk ? { approval: { basis: 'low_risk_rule' as const, approvedAt: timestamp } } : {}) }
+      const submitted: IntentDraftContent = { goal: canonical.goal, constraints: canonical.constraints, nonGoals: canonical.nonGoals ?? [], examples: canonical.examples ?? [], riskLevel: canonical.riskLevel, acceptanceCriteria }
+      const drafted: IntentVersionDraft | undefined = draft ? { draftId: draft.id, providerId: draft.providerId, model: draft.model, changedFields: intentDraftFields.filter((field) => JSON.stringify(submitted[field]) !== JSON.stringify(draft.draft[field])) } : undefined
+      const intent: IntentVersion = { ...(drafted ? { draft: drafted } : {}), id: intentId, ...canonical, contentDigest: `sha256:${sha256(JSON.stringify(canonical))}`, createdBy: actorId, createdAt: timestamp, acceptanceCriteria: acceptanceCriteria.map((criterion, index) => ({ ...criterion, id: `${intentId}:AC-${index + 1}`, ordinal: index + 1 })), status: lowRisk ? 'approved' : 'draft', ...(lowRisk ? { approval: { basis: 'low_risk_rule' as const, approvedAt: timestamp } } : {}) }
       const superseded = this.db.prepare("UPDATE intent_versions SET status = 'superseded' WHERE work_item_id = ? AND status != 'superseded'").run(input.workItemId)
-      this.db.prepare('INSERT INTO intent_versions(id, work_item_id, version, goal, constraints_json, non_goals_json, examples_json, risk_level, content_digest, created_by, created_at, status, approved_at, approval_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(intent.id, intent.workItemId, intent.version, intent.goal, JSON.stringify(intent.constraints), intent.nonGoals ? JSON.stringify(intent.nonGoals) : null, intent.examples ? JSON.stringify(intent.examples) : null, intent.riskLevel, intent.contentDigest, actorId, timestamp, intent.status, lowRisk ? timestamp : null, lowRisk ? 'low_risk_rule' : null)
+      this.db.prepare('INSERT INTO intent_versions(id, work_item_id, version, goal, constraints_json, non_goals_json, examples_json, risk_level, content_digest, created_by, created_at, status, approved_at, approval_basis, draft_id, draft_changes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(intent.id, intent.workItemId, intent.version, intent.goal, JSON.stringify(intent.constraints), intent.nonGoals ? JSON.stringify(intent.nonGoals) : null, intent.examples ? JSON.stringify(intent.examples) : null, intent.riskLevel, intent.contentDigest, actorId, timestamp, intent.status, lowRisk ? timestamp : null, lowRisk ? 'low_risk_rule' : null, drafted?.draftId ?? null, drafted ? JSON.stringify(drafted.changedFields) : null)
       const insertCriterion = this.db.prepare('INSERT INTO acceptance_criteria(id, intent_version_id, statement, criticality, verification_type, ordinal, verified_by_json) VALUES (?, ?, ?, ?, ?, ?, ?)')
       intent.acceptanceCriteria.forEach((criterion) => insertCriterion.run(criterion.id, intent.id, criterion.statement, criterion.criticality, criterion.verificationType, criterion.ordinal, criterion.verifiedBy ? JSON.stringify(criterion.verifiedBy) : null))
       this.db.prepare("UPDATE work_items SET status = 'ready', updated_at = ? WHERE id = ?").run(timestamp, input.workItemId)
-      this.appendEvent({ aggregateType: 'work_item', aggregateId: input.workItemId, eventType: 'intent.versioned', actorId, payload: { intentVersionId: intent.id, version, contentDigest: intent.contentDigest, acceptanceCriterionCount: intent.acceptanceCriteria.length, supersededCount: Number(superseded.changes) } })
+      this.appendEvent({ aggregateType: 'work_item', aggregateId: input.workItemId, eventType: 'intent.versioned', actorId, payload: { intentVersionId: intent.id, version, contentDigest: intent.contentDigest, acceptanceCriterionCount: intent.acceptanceCriteria.length, supersededCount: Number(superseded.changes), ...(drafted ? { draft: { draftId: drafted.draftId, model: drafted.model, changedFields: drafted.changedFields } } : {}) } })
       if (lowRisk) this.appendEvent({ aggregateType: 'work_item', aggregateId: input.workItemId, eventType: 'intent.approved', actorId, payload: { intentVersionId: intent.id, contentDigest: intent.contentDigest, basis: 'low_risk_rule' } })
       return intent
     })
@@ -694,11 +702,43 @@ export class ControlPlaneDatabase {
     if (intent.status !== 'approved') throw new AppError(409, `Intent ${intent.id} is ${intent.riskLevel} risk and has not been approved yet`, 'intent_not_approved')
   }
 
+  /** Checked before the model is called, so a non-member cannot spend the team's provider budget. */
+  assertIntentDrafter(actorId: string, projectId: string) {
+    this.requireProjectRole(actorId, projectId, ALL_ROLES, 'intent_draft_forbidden')
+  }
+
+  /**
+   * Keeps a model draft as it was handed to the developer. The brief is kept whole because it is what the model
+   * was asked; the reply only by digest, since the normalised draft is what the developer saw.
+   */
+  recordIntentDraft(input: { projectId: string; title: string; brief: string; productType: WorkItem['productType']; providerId: string; model: string; draft: GeneratedIntentDraft; reply: string }, actorId: string) {
+    this.assertIntentDrafter(actorId, input.projectId)
+    const identity = this.decisionIdentity(actorId)
+    const id = `intent-draft-${randomUUID()}`
+    const timestamp = nowIso()
+    const content: IntentDraftContent = { goal: input.draft.goal, constraints: input.draft.constraints, nonGoals: input.draft.nonGoals, examples: input.draft.examples, riskLevel: input.draft.riskLevel, acceptanceCriteria: input.draft.acceptanceCriteria }
+    const contentDigest = `sha256:${sha256(JSON.stringify(content))}`
+    const replyDigest = `sha256:${sha256(input.reply)}`
+    this.inTransaction(() => {
+      this.db.prepare('INSERT INTO intent_drafts(id, project_id, created_by, title, brief, product_type, provider_id, model, draft_json, content_digest, reply_digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(id, input.projectId, actorId, input.title, input.brief, input.productType, input.providerId, input.model, JSON.stringify(input.draft), contentDigest, replyDigest, timestamp)
+      this.appendEvent({ aggregateType: 'project', aggregateId: input.projectId, eventType: 'intent.draft_generated', actorId, payload: { draftId: id, providerId: input.providerId, model: input.model, briefDigest: `sha256:${sha256(input.brief)}`, contentDigest, replyDigest, riskLevel: content.riskLevel, acceptanceCriterionCount: content.acceptanceCriteria.length, adjustmentCount: input.draft.adjustments.length, identity } })
+    })
+    return this.getIntentDraft(id)
+  }
+
+  getIntentDraft(draftId: string) {
+    const row = this.db.prepare('SELECT * FROM intent_drafts WHERE id = ?').get(draftId) as Record<string, SqlValue> | undefined
+    if (!row) throw new AppError(404, `Intent draft ${draftId} not found`, 'intent_draft_not_found')
+    return { id: String(row.id), projectId: String(row.project_id), createdBy: String(row.created_by), providerId: String(row.provider_id), model: String(row.model), contentDigest: String(row.content_digest), createdAt: String(row.created_at), draft: parseJson<GeneratedIntentDraft>(String(row.draft_json)) }
+  }
+
   listIntentVersions(workItemId: string): IntentVersion[] {
     const rows = this.db.prepare('SELECT * FROM intent_versions WHERE work_item_id = ? ORDER BY version DESC').all(workItemId) as Array<Record<string, SqlValue>>
     return rows.map((row) => {
       const criteria = this.db.prepare('SELECT * FROM acceptance_criteria WHERE intent_version_id = ? ORDER BY ordinal').all(String(row.id)) as Array<Record<string, SqlValue>>
-      return { id: String(row.id), workItemId: String(row.work_item_id), version: Number(row.version), goal: String(row.goal), constraints: parseJson<string[]>(String(row.constraints_json)), ...(row.non_goals_json ? { nonGoals: parseJson<string[]>(String(row.non_goals_json)) } : {}), ...(row.examples_json ? { examples: parseJson<IntentExample[]>(String(row.examples_json)) } : {}), riskLevel: String(row.risk_level) as IntentVersion['riskLevel'], contentDigest: String(row.content_digest), createdBy: String(row.created_by), createdAt: String(row.created_at), status: String(row.status) as IntentVersion['status'], ...(row.approved_at ? { approval: { basis: String(row.approval_basis) as NonNullable<IntentVersion['approval']>['basis'], ...(row.approved_by ? { actorId: String(row.approved_by) } : {}), approvedAt: String(row.approved_at), ...(row.approval_comment ? { comment: String(row.approval_comment) } : {}) } } : {}), acceptanceCriteria: criteria.map((criterion) => ({ id: String(criterion.id), statement: String(criterion.statement), criticality: String(criterion.criticality) as AcceptanceCriterionInput['criticality'], verificationType: String(criterion.verification_type) as AcceptanceCriterionInput['verificationType'], ...(criterion.verified_by_json ? { verifiedBy: parseJson<string[]>(String(criterion.verified_by_json)) } : {}), ordinal: Number(criterion.ordinal) })) }
+      const drafted = row.draft_id ? this.db.prepare('SELECT provider_id, model FROM intent_drafts WHERE id = ?').get(String(row.draft_id)) as { provider_id: string; model: string } : undefined
+      const draft: IntentVersionDraft | undefined = drafted ? { draftId: String(row.draft_id), providerId: drafted.provider_id, model: drafted.model, changedFields: parseJson<IntentDraftField[]>(String(row.draft_changes_json)) } : undefined
+      return { ...(draft ? { draft } : {}), id: String(row.id), workItemId: String(row.work_item_id), version: Number(row.version), goal: String(row.goal), constraints: parseJson<string[]>(String(row.constraints_json)), ...(row.non_goals_json ? { nonGoals: parseJson<string[]>(String(row.non_goals_json)) } : {}), ...(row.examples_json ? { examples: parseJson<IntentExample[]>(String(row.examples_json)) } : {}), riskLevel: String(row.risk_level) as IntentVersion['riskLevel'], contentDigest: String(row.content_digest), createdBy: String(row.created_by), createdAt: String(row.created_at), status: String(row.status) as IntentVersion['status'], ...(row.approved_at ? { approval: { basis: String(row.approval_basis) as NonNullable<IntentVersion['approval']>['basis'], ...(row.approved_by ? { actorId: String(row.approved_by) } : {}), approvedAt: String(row.approved_at), ...(row.approval_comment ? { comment: String(row.approval_comment) } : {}) } } : {}), acceptanceCriteria: criteria.map((criterion) => ({ id: String(criterion.id), statement: String(criterion.statement), criticality: String(criterion.criticality) as AcceptanceCriterionInput['criticality'], verificationType: String(criterion.verification_type) as AcceptanceCriterionInput['verificationType'], ...(criterion.verified_by_json ? { verifiedBy: parseJson<string[]>(String(criterion.verified_by_json)) } : {}), ordinal: Number(criterion.ordinal) })) }
     })
   }
 

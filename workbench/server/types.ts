@@ -135,7 +135,14 @@ export type IntentVersion = {
   /** DOMAIN_MODEL.md §6.1: only an approved version may start a Run; a newer version supersedes older ones. */
   status: 'draft' | 'approved' | 'superseded'
   approval?: { basis: 'low_risk_rule' | 'named_approval'; actorId?: string; approvedAt: string; comment?: string }
+  /** Present when the version started as a model draft. Provenance only: it is not part of the content digest. */
+  draft?: IntentVersionDraft
 }
+
+export type IntentDraftField = 'goal' | 'constraints' | 'nonGoals' | 'examples' | 'riskLevel' | 'acceptanceCriteria'
+
+/** Which model drafted an Intent version, and which fields the author changed before submitting it ([] = none). */
+export type IntentVersionDraft = { draftId: string; providerId: string; model: string; changedFields: IntentDraftField[] }
 
 export type ChangeProposal = {
   id: string
