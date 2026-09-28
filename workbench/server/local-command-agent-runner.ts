@@ -1,6 +1,6 @@
 import { realpathSync, readFileSync } from 'node:fs'
-import { execFileSync, spawnSync } from 'node:child_process'
-import { dirname, resolve } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { dirname } from 'node:path'
 import type { ControlPlaneDatabase } from './database.ts'
 import { GitWorktreeAgentRunner, type AgentExecutionRuntime, type AgentRunPostprocessor, type AgentRuntimeContext } from './git-worktree-agent-runner.ts'
 import { progressPathFor } from './run-progress.ts'
@@ -31,8 +31,8 @@ function providerEnvironment(provider?: AgentProviderSettings) {
 
 /**
  * Paths a confined Builder may not read or write: the Control Plane's data directory (database, holdouts, evidence,
- * evaluation directories, other runs) and a seal key kept elsewhere. Its own run directory and the repository's Git
- * directory are re-allowed, since the worktree needs both.
+ * evaluation directories, other runs) and a seal key kept elsewhere. Its own run directory is re-allowed, and the
+ * repository's Git directory is readable, since the worktree needs both.
  */
 export type BuilderConfinement = { kind: 'seatbelt'; denied: string[] }
 
@@ -47,8 +47,9 @@ class LocalProcessRuntime implements AgentExecutionRuntime {
 
   private policy(context: AgentRuntimeContext): SeatbeltPolicy | undefined {
     if (!this.input.confinement) return undefined
-    const gitCommonDirectory = resolve(context.worktreePath, execFileSync('git', ['-C', context.worktreePath, 'rev-parse', '--git-common-dir'], { encoding: 'utf8' }).trim())
-    return { denied: this.input.confinement.denied, allowed: [dirname(context.worktreePath), gitCommonDirectory] }
+    // The repository's Git directory is readable, never writable: a hook, an fsmonitor command or a filter written
+    // into its config would otherwise run later in the Control Plane's own Git commands, outside the sandbox.
+    return { denied: this.input.confinement.denied, allowed: [dirname(context.worktreePath)], readOnly: [context.git.commonDirectory] }
   }
 
   attest(context: AgentRuntimeContext) {
@@ -66,7 +67,7 @@ class LocalProcessRuntime implements AgentExecutionRuntime {
   private confinementAttestation(context: AgentRuntimeContext) {
     const policy = this.policy(context)
     if (!policy) return { holdoutReadable: true }
-    return { confinement: { kind: 'seatbelt' as const, deniedPaths: policy.denied, allowedPaths: policy.allowed ?? [], profileDigest: seatbeltCommand(policy, this.input.executable, this.input.args).profileDigest }, holdoutReadable: false }
+    return { confinement: { kind: 'seatbelt' as const, deniedPaths: policy.denied, allowedPaths: policy.allowed ?? [], readOnlyPaths: policy.readOnly ?? [], profileDigest: seatbeltCommand(policy, this.input.executable, this.input.args).profileDigest }, holdoutReadable: false }
   }
 
   execute(context: AgentRuntimeContext) {

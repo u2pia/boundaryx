@@ -16,7 +16,10 @@ mkdirSync(workspace)
 writeFileSync(join(workspace, 'README.md'), '# Fixture\n')
 writeFileSync(join(root, 'outside.txt'), 'not yours\n')
 spawnSync('git', ['init', '--quiet', workspace])
-writeFileSync(requestPath, JSON.stringify({ runId: 'RUN-CHAT', workItem: { title: 'Build fixture', productType: 'application' }, intent: { goal: 'Create src/generated.ts', constraints: ['offline'], acceptanceCriteria: [{ statement: 'File exists', criticality: 'critical', verificationType: 'deterministic' }] }, declaredContextPaths: ['README.md'] }))
+writeFileSync(requestPath, JSON.stringify({ runId: 'RUN-CHAT', workItem: { title: 'Build fixture', productType: 'application' }, intent: { goal: 'Create src/generated.ts', constraints: ['offline'], nonGoals: ['Do not touch README.md'], examples: [{ input: 'import it', expected: 'generated === true' }], acceptanceCriteria: [{ statement: 'File exists', criticality: 'critical', verificationType: 'deterministic' }] }, declaredContextPaths: ['README.md'], declaredContext: { baseSha: 'a'.repeat(40), budgetBytes: 200000, entries: [{ path: 'README.md', required: true, fileBytes: 20, fileDigest: 'sha256:x', injectedBytes: 20, injectedDigest: 'sha256:x', truncatedAt: null, content: '# Reviewed fixture\n' }], omitted: [{ path: 'docs/big.md', required: false, reason: 'budget' }] }, projectManifest: { builder: { allowShell: true } } }))
+// The same run under a manifest that does not allow a shell, which is the default.
+const noShellRequestPath = join(root, 'request-no-shell.json')
+writeFileSync(noShellRequestPath, JSON.stringify({ ...JSON.parse(readFileSync(requestPath, 'utf8')), projectManifest: { builder: { allowShell: false } } }))
 
 type ChatRequest = { model: string; messages: Array<{ role: string; content: string | null; tool_call_id?: string }>; tools: Array<{ function: { name: string } }>; tool_choice?: unknown }
 const call = (id: string, name: string, args: Record<string, unknown>) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } })
@@ -29,11 +32,18 @@ const script = [
 const requests: ChatRequest[] = []
 const budgetRequests: ChatRequest[] = []
 const clockRequests: ChatRequest[] = []
+const noShellRequests: ChatRequest[] = []
 const headers: IncomingMessage['headers'][] = []
 const server = createServer((request, response) => {
   let body = ''
   request.on('data', (chunk) => { body += chunk })
   request.on('end', () => {
+    // A model that calls run_command although it was not offered.
+    if (request.url === '/no-shell/chat/completions') {
+      noShellRequests.push(JSON.parse(body) as ChatRequest)
+      const reply = noShellRequests.length === 1 ? { tool_calls: [call('n1', 'run_command', { command: 'touch shell-ran' })] } : { tool_calls: [call('n2', 'finish', { summary: 'No shell.' })] }
+      return response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: null, ...reply } }] }))
+    }
     // A model that never finishes on its own, to exercise the step budget.
     if (request.url === '/budget/chat/completions') {
       const parsed = JSON.parse(body) as ChatRequest
@@ -88,7 +98,8 @@ try {
   assert.equal(requests.length, 3)
   assert.equal(requests[0].model, 'deepseek-chat')
   assert.deepEqual(requests[0].tools.map((tool) => tool.function.name), ['list_files', 'read_file', 'write_file', 'replace_in_file', 'run_command', 'finish'])
-  assert.match(String(requests[0].messages[0].content), /Target product type: application[\s\S]*Declared context: README\.md/u)
+  assert.match(String(requests[0].messages[0].content), /Target product type: application[\s\S]*base revision aaaaaaaaaaaa[\s\S]*Declared context: README\.md\n\n# Reviewed fixture[\s\S]*left out because the prompt budget was spent: docs\/big\.md/u, 'the prompt carries the compiled context, not the worktree file')
+  assert.match(String(requests[0].messages[0].content), /Out of scope[^\n]*\n- Do not touch README\.md[\s\S]*Acceptance criteria:[\s\S]*Examples of the intended behaviour[\s\S]*Input:\nimport it\nExpected:\ngenerated === true/u, 'nonGoals and examples reach the prompt')
   assert.equal(headers.every((header) => header.authorization === `Bearer ${secret}`), true)
   const toolResult = (id: string) => String(requests.flatMap((request) => request.messages).find((message) => message.tool_call_id === id)?.content)
   assert.match(toolResult('c1'), /README\.md/u)
@@ -110,6 +121,15 @@ try {
   assert.equal(steps.includes('第 2 步 · 写入 src/generated.ts'), true)
   assert.equal(steps.at(-1), '第 3 步 · 写总结')
   assert.equal(steps.some((step) => step.includes('export const generated')), false)
+
+  // Without builder.allowShell the chat engine has no shell: run_command is neither offered, mentioned nor run.
+  const noShell = await run([join(agents, 'chat-builder.mjs')], { ...provider, APERTURE_RUN_REQUEST: noShellRequestPath, APERTURE_AGENT_PROVIDER_BASE_URL: `http://127.0.0.1:${port}/no-shell`, APERTURE_AGENT_PROVIDER_WIRE_API: 'chat' })
+  assert.equal(noShell.status, 0, noShell.stderr)
+  assert.deepEqual(noShellRequests[0].tools.map((tool) => tool.function.name), ['list_files', 'read_file', 'write_file', 'replace_in_file', 'finish'])
+  assert.doesNotMatch(String(noShellRequests[0].messages[0].content), /run_command/u)
+  assert.match(String(noShellRequests[0].messages[0].content), /there is no shell/u)
+  assert.match(String(noShellRequests[1].messages.find((message) => message.tool_call_id === 'n1')?.content), /not available: the project manifest does not set builder\.allowShell/u)
+  assert.equal(existsSync(join(workspace, 'shell-ran')), false)
 
   // A provider error is surfaced with the provider's message and a failing exit.
   const unreachable = await run([join(agents, 'chat-builder.mjs')], { ...provider, APERTURE_AGENT_PROVIDER_BASE_URL: `http://127.0.0.1:${port}/missing`, APERTURE_AGENT_PROVIDER_WIRE_API: 'chat' })

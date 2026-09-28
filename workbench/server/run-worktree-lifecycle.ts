@@ -7,11 +7,12 @@
 import { existsSync, readdirSync, realpathSync, rmSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { basename, dirname, join, resolve, sep } from 'node:path'
+import { GIT_NO_EXEC } from './worktree-git.ts'
 
 export type PruneOutcome = { removed: boolean; skipped: string[]; error?: string }
 
 function git(repositoryPath: string, args: string[]) {
-  return execFileSync('git', ['-C', repositoryPath, ...args], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+  return execFileSync('git', [...GIT_NO_EXEC, '-C', repositoryPath, ...args], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim()
 }
 
 /** The directory a run owns: `<worktreeRoot>/<runId>`, i.e. the parent of the checkout. */

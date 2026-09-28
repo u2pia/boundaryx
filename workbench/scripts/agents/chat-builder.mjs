@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
 import { progress } from './progress.mjs'
+import { declaredContextSections, taskPrompt } from './run-request.mjs'
 
 // A Builder Agent with no external CLI: it drives any OpenAI-compatible Chat Completions endpoint (DeepSeek,
 // Qwen, OpenAI, vLLM, Ollama, a gateway) through tool calls, so which model writes the code is decided only by
@@ -33,41 +34,16 @@ if (!requestPath || !worktreePath || !baseUrl || !model) {
 
 const root = realpathSync(worktreePath)
 const request = JSON.parse(readFileSync(requestPath, 'utf8'))
-const contextSections = []
-let contextBytes = 0
-for (const declaredPath of request.declaredContextPaths ?? []) {
-  const candidate = resolve(worktreePath, declaredPath)
-  const insideWorktree = candidate === worktreePath || candidate.startsWith(`${worktreePath}${sep}`)
-  if (!insideWorktree || !existsSync(candidate) || !statSync(candidate).isFile() || contextBytes >= 200_000) continue
-  const content = readFileSync(candidate, 'utf8').slice(0, Math.max(0, 200_000 - contextBytes))
-  contextBytes += Buffer.byteLength(content)
-  const normalizedPath = relative(worktreePath, candidate).split(sep).join('/')
-  contextSections.push(`\n## Declared context: ${normalizedPath}\n\n${content}`)
-  console.log(JSON.stringify({ type: 'context_consumed', path: normalizedPath }))
-}
-
-const criteria = (request.intent.acceptanceCriteria ?? []).map((criterion) => `- [${criterion.criticality}/${criterion.verificationType}] ${criterion.statement}`).join('\n')
-const revisionFeedback = request.revision?.feedback?.map((feedback) => `- ${feedback.reviewerDisplayName}: ${feedback.comment || 'Changes requested without an additional comment.'}`).join('\n')
-const prompt = `You are the Builder Agent for an AI Native SDLC Control Plane run.
-
-Target product type: ${request.workItem.productType}
-Work item: ${request.workItem.title}
-Goal: ${request.intent.goal}
-
-Constraints:
-${(request.intent.constraints ?? []).map((constraint) => `- ${constraint}`).join('\n') || '- None declared'}
-
-Acceptance criteria:
-${criteria}
-
-${request.revision ? `This is a revision of Change Proposal ${request.revision.changeProposalId} at ${request.revision.previousHeadSha}.
-Review feedback that must be addressed:
-${revisionFeedback || '- Review requested changes; inspect the current implementation and acceptance criteria.'}` : 'This is the initial implementation run.'}
+const contextSections = declaredContextSections(request)
+// A shell runs whatever the model asks for, so the chat engine only gets one when the project's reviewed manifest
+// (aperture.project.v2, builder.allowShell) says so. Without it the Control Plane's checks are the only code that runs.
+const allowShell = request.projectManifest?.builder?.allowShell === true
+const prompt = `${taskPrompt(request)}
 
 You work through the provided tools inside an isolated Git worktree; paths are relative to its root.
 Start by listing and reading the files you need; call several tools in one turn when they are independent
 (for example, read all the files you need at once). Make the change with write_file or replace_in_file, add or
-update relevant tests, and run the project's tests with run_command when that is useful. Do not delete,
+update relevant tests, ${allowShell ? "and run the project's tests with run_command when that is useful" : 'and leave running them to the Control Plane, which runs the project\'s checks after you finish; there is no shell'}. Do not delete,
 skip or weaken existing tests. Do not create a Git commit: the Control Plane commits your changes.
 When you are done, call finish with a concise summary of changed files and remaining risks.
 ${contextSections.join('\n')}`
@@ -77,7 +53,7 @@ const tools = [
   { name: 'read_file', description: 'Read a UTF-8 text file. Long files are returned in slices; use offset to continue.', parameters: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer', description: 'Character offset to start from.' } }, required: ['path'] } },
   { name: 'write_file', description: 'Create or overwrite a file with the given content.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
   { name: 'replace_in_file', description: 'Replace exactly one occurrence of old_string with new_string in a file.', parameters: { type: 'object', properties: { path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } }, required: ['path', 'old_string', 'new_string'] } },
-  { name: 'run_command', description: 'Run a shell command in the worktree root (e.g. the test suite). 180 s timeout; output is truncated.', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+  ...(allowShell ? [{ name: 'run_command', description: 'Run a shell command in the worktree root (e.g. the test suite). 180 s timeout; output is truncated.', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }] : []),
   { name: 'finish', description: 'End the run with a summary of changed files and remaining risks.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } },
 ].map((tool) => ({ type: 'function', function: tool }))
 
@@ -151,6 +127,7 @@ const handlers = {
     return `edited ${relativePath}`
   },
   run_command({ command }) {
+    if (!allowShell) throw new Error('run_command is not available: the project manifest does not set builder.allowShell')
     if (typeof command !== 'string' || !command.trim()) throw new Error('command is required')
     if (forbiddenGit.test(command)) throw new Error('Git history and branches are managed by the Control Plane; only read-only git commands are allowed')
     // A command may not run into the time reserved for the summary.

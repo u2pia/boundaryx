@@ -192,6 +192,33 @@ export function splitLines(text: string) {
   return text.split('\n').map((line) => line.trim()).filter(Boolean)
 }
 
+export type ParsedIntentExamples = { examples: Array<{ input: string; expected: string }>; errors: string[] }
+
+/**
+ * 示例文本框：每个示例以「输入：」开头的一行起头，「期望：」那行开始是期望结果，两者都可以跨多行。
+ * 示例只是说明，进入 Agent prompt 与 Intent 摘要，但不会变成验收标准。
+ */
+export function parseIntentExamples(text: string): ParsedIntentExamples {
+  const examples: Array<{ input: string[]; expected: string[] | undefined }> = []
+  const errors: string[] = []
+  for (const line of text.split('\n')) {
+    const input = /^\s*(?:输入|input)\s*[:：]\s?(.*)$/iu.exec(line)
+    const expected = /^\s*(?:期望|expected)\s*[:：]\s?(.*)$/iu.exec(line)
+    if (input) examples.push({ input: [input[1]], expected: undefined })
+    else if (expected) {
+      const current = examples.at(-1)
+      if (!current || current.expected) errors.push('「期望：」前面要有一行「输入：」')
+      else current.expected = [expected[1]]
+    } else if (examples.length) {
+      const current = examples.at(-1)!
+      ;(current.expected ?? current.input).push(line)
+    } else if (line.trim()) errors.push('示例要以「输入：」开头')
+  }
+  const joined = examples.map((example, index) => ({ index, input: example.input.join('\n').trim(), expected: example.expected?.join('\n').trim() ?? '' }))
+  for (const example of joined) if (!example.input || !example.expected) errors.push(`示例 ${example.index + 1} 缺少${example.input ? '期望' : '输入'}`)
+  return { examples: joined.filter((example) => example.input && example.expected).map(({ input, expected }) => ({ input, expected })), errors: [...new Set(errors)] }
+}
+
 export function lintIntentDraft(draft: IntentDraft): IntentDraftLint {
   const warnings: string[] = []
   const blockers: string[] = []

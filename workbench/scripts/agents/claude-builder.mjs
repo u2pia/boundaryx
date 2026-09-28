@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process'
-import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
 import { progress } from './progress.mjs'
 import { cliTimeoutMs, partialMessage } from './run-deadline.mjs'
+import { declaredContextSections, taskPrompt } from './run-request.mjs'
 
 const [claudeExecutable, ...configuredArgs] = process.argv.slice(2)
 const requestPath = process.env.APERTURE_RUN_REQUEST
@@ -13,37 +14,33 @@ if (!claudeExecutable || !requestPath || !worktreePath) {
   process.exit(2)
 }
 
-const request = JSON.parse(readFileSync(requestPath, 'utf8'))
-const contextSections = []
-let contextBytes = 0
-for (const declaredPath of request.declaredContextPaths ?? []) {
-  const candidate = resolve(worktreePath, declaredPath)
-  const insideWorktree = candidate === worktreePath || candidate.startsWith(`${worktreePath}${sep}`)
-  if (!insideWorktree || !existsSync(candidate) || contextBytes >= 200_000) continue
-  const content = readFileSync(candidate, 'utf8').slice(0, Math.max(0, 200_000 - contextBytes))
-  contextBytes += Buffer.byteLength(content)
-  const normalizedPath = relative(worktreePath, candidate).split(sep).join('/')
-  contextSections.push(`\n## Declared context: ${normalizedPath}\n\n${content}`)
-  console.log(JSON.stringify({ type: 'context_consumed', path: normalizedPath }))
+// The worktree is the repository under change, so nothing in it may configure the engine that changes it: its
+// .claude/settings*.json could allow Bash, add hooks that run on this host or set environment variables, its .mcp.json
+// could start servers, and its CLAUDE.md and .claude/skills are instructions no manifest declared. These flags keep
+// only the operator's own settings (~/.claude/settings.json, where the gateway and credential live), take every
+// built-in tool that runs code out of the engine rather than just not pre-approving it, and start no MCP server.
+// Whether a flag given twice takes the first or the last value is not documented, so the configured arguments may
+// not name any of them at all.
+const TOOLS = 'Read,Write,Edit,Glob,Grep'
+const hardeningArgs = [
+  '--setting-sources', 'user',
+  '--settings', JSON.stringify({ disableAllHooks: true }),
+  '--strict-mcp-config',
+  '--tools', TOOLS,
+  '--allowedTools', TOOLS,
+  '--disallowedTools', 'mcp__*',
+  '--disable-slash-commands',
+]
+const hardeningFlags = ['--setting-sources', '--settings', '--strict-mcp-config', '--mcp-config', '--tools', '--allowedTools', '--allowed-tools', '--disallowedTools', '--disallowed-tools', '--disable-slash-commands', '--permission-mode', '--dangerously-skip-permissions', '--allow-dangerously-skip-permissions', '--add-dir', '--plugin-dir', '--agents', '--bare', '--safe-mode', '--restricted']
+const overriding = configuredArgs.filter((arg) => hardeningFlags.includes(arg.split('=')[0]))
+if (overriding.length) {
+  console.error(`claude-builder sets ${overriding.join(', ')} itself; remove them from the configured arguments`)
+  process.exit(2)
 }
 
-const criteria = (request.intent.acceptanceCriteria ?? []).map((criterion) => `- [${criterion.criticality}/${criterion.verificationType}] ${criterion.statement}`).join('\n')
-const revisionFeedback = request.revision?.feedback?.map((feedback) => `- ${feedback.reviewerDisplayName}: ${feedback.comment || 'Changes requested without an additional comment.'}`).join('\n')
-const prompt = `You are the Builder Agent for an AI Native SDLC Control Plane run.
-
-Target product type: ${request.workItem.productType}
-Work item: ${request.workItem.title}
-Goal: ${request.intent.goal}
-
-Constraints:
-${(request.intent.constraints ?? []).map((constraint) => `- ${constraint}`).join('\n') || '- None declared'}
-
-Acceptance criteria:
-${criteria}
-
-${request.revision ? `This is a revision of Change Proposal ${request.revision.changeProposalId} at ${request.revision.previousHeadSha}.
-Review feedback that must be addressed:
-${revisionFeedback || '- Review requested changes; inspect the current implementation and acceptance criteria.'}` : 'This is the initial implementation run.'}
+const request = JSON.parse(readFileSync(requestPath, 'utf8'))
+const contextSections = declaredContextSections(request)
+const prompt = `${taskPrompt(request)}
 
 Operate only inside the current working directory, which is an isolated Git worktree.
 You have file read and write tools only; you cannot run commands. The Control Plane runs the
@@ -71,10 +68,10 @@ const child = spawn(claudeExecutable, [
   '--output-format', 'stream-json',
   '--verbose',
   '--permission-mode', 'acceptEdits',
-  '--allowedTools', 'Read,Write,Edit,Glob,Grep',
+  ...hardeningArgs,
   ...modelArgs,
   ...configuredArgs,
-], { cwd: worktreePath, env: { ...process.env, ...providerEnvironment } })
+], { cwd: worktreePath, env: { ...process.env, ...providerEnvironment, CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' } })
 progress('Claude Code 已启动，正在阅读需求')
 // A CLI that never reads its input must not crash the wrapper.
 child.stdin.on('error', () => {})
@@ -104,6 +101,24 @@ function describeTool(use) {
   return `${toolLabels[use.name] ?? use.name}${target ? ` ${target}` : ''}`
 }
 
+// What Claude Code read, from its own event stream: a Read, or a Grep that returned matching lines, counts once its
+// tool_result came back without an error, so a call the engine refused or that failed is not a read. Still reported
+// from inside the run, so the runner records it as not independently observed.
+const pendingReads = new Map()
+const reportedReads = new Set()
+function readOf(use) {
+  const input = use.input ?? {}
+  if (use.name === 'Read' && typeof input.file_path === 'string') return { tool: 'Read', path: worktreeRelative(input.file_path), offset: input.offset, limit: input.limit }
+  if (use.name === 'Grep' && input.output_mode === 'content') return { tool: 'Grep', path: typeof input.path === 'string' ? worktreeRelative(input.path) || '.' : '.' }
+  return undefined
+}
+function reportRead(read) {
+  const key = JSON.stringify(read)
+  if (reportedReads.has(key)) return
+  reportedReads.add(key)
+  console.log(JSON.stringify({ type: 'context_consumed', source: 'engine_stream', path: read.path, tool: read.tool, ...(Number.isSafeInteger(read.offset) ? { offset: read.offset } : {}), ...(Number.isSafeInteger(read.limit) ? { limit: read.limit } : {}) }))
+}
+
 let resultLine
 let buffered = ''
 function readLine(line) {
@@ -111,7 +126,18 @@ function readLine(line) {
   let event
   try { event = JSON.parse(line) } catch { return }
   if (event.type === 'assistant') {
-    for (const part of event.message?.content ?? []) if (part.type === 'tool_use') progress(describeTool(part))
+    for (const part of event.message?.content ?? []) {
+      if (part.type !== 'tool_use') continue
+      progress(describeTool(part))
+      const read = readOf(part)
+      if (read && typeof part.id === 'string') pendingReads.set(part.id, read)
+    }
+  } else if (event.type === 'user') {
+    for (const part of Array.isArray(event.message?.content) ? event.message.content : []) {
+      if (part.type !== 'tool_result' || !pendingReads.has(part.tool_use_id)) continue
+      if (part.is_error !== true) reportRead(pendingReads.get(part.tool_use_id))
+      pendingReads.delete(part.tool_use_id)
+    }
   } else if (event.type === 'result' || (event.type === undefined && 'result' in event)) {
     resultLine = line
   }

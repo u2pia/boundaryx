@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { AppError, type ChangeProposal, type GithubHostConfig, type Project } from '../types.ts'
 import type { CodeHost, CodeHostConnection, CodeHostFactoryContext } from './types.ts'
+import { GIT_NO_EXEC } from '../worktree-git.ts'
 
 /** The commit status the platform publishes; branch protection makes it required in `host_protected` mode. */
 export const GATE_STATUS_CONTEXT = 'aperture/gate'
@@ -115,7 +116,7 @@ export class GithubCodeHost implements CodeHost {
 
   private git(args: string[], cwd = this.workingRepository()) {
     try {
-      return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', env: this.gitEnv(), stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 }).trim()
+      return execFileSync('git', [...GIT_NO_EXEC, '-C', cwd, ...args], { encoding: 'utf8', env: this.gitEnv(), stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 }).trim()
     } catch (error) {
       const stderr = String((error as { stderr?: unknown }).stderr ?? '').trim()
       // `push --porcelain` reports a rejected ref and its reason on stdout, so both streams are kept for callers.
@@ -126,7 +127,7 @@ export class GithubCodeHost implements CodeHost {
 
   private gitOk(args: string[]) {
     try {
-      execFileSync('git', ['-C', this.workingRepository(), ...args], { stdio: 'ignore' })
+      execFileSync('git', [...GIT_NO_EXEC, '-C', this.workingRepository(), ...args], { stdio: 'ignore' })
       return true
     } catch {
       return false
@@ -143,7 +144,7 @@ export class GithubCodeHost implements CodeHost {
     if (existsSync(join(path, 'HEAD'))) {
       let current = ''
       try {
-        current = execFileSync('git', ['-C', path, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+        current = execFileSync('git', [...GIT_NO_EXEC, '-C', path, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
       } catch {}
       if (current !== this.remoteUrl()) this.git(current ? ['remote', 'set-url', 'origin', this.remoteUrl()] : ['remote', 'add', 'origin', this.remoteUrl()])
       return path
@@ -269,7 +270,7 @@ export class GithubCodeHost implements CodeHost {
   private patchId(from: string, to: string) {
     const diff = this.git(['diff', '--full-index', '--binary', from, to])
     if (!diff) return undefined
-    return execFileSync('git', ['-C', this.workingRepository(), 'patch-id', '--stable'], { input: `${diff}\n`, encoding: 'utf8' }).trim().split(/\s+/u)[0]
+    return execFileSync('git', [...GIT_NO_EXEC, '-C', this.workingRepository(), 'patch-id', '--stable'], { input: `${diff}\n`, encoding: 'utf8' }).trim().split(/\s+/u)[0]
   }
 
   async testConnection(): Promise<CodeHostConnection> {

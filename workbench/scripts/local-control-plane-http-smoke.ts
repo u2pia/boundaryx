@@ -11,6 +11,7 @@ import { ControlPlaneDatabase } from '../server/database.ts'
 import { createControlPlaneRequestHandler } from '../server/http-server.ts'
 import { LocalCommandAgentRunner } from '../server/local-command-agent-runner.ts'
 import { LocalEvidenceStore } from '../server/local-evidence-store.ts'
+import { sha256 } from '../server/security.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'aperture-http-control-plane-'))
 const repositoryPath = join(root, 'repository')
@@ -63,7 +64,7 @@ git('checkout', '-b', 'agent/http-authority')
 writeFileSync(join(repositoryPath, 'feature.ts'), 'export const local = true\n')
 git('add', 'feature.ts')
 git('commit', '-m', 'agent implementation')
-writeFileSync(agentScript, `import { readFileSync, writeFileSync } from 'node:fs'\nconst request = JSON.parse(readFileSync(process.env.APERTURE_RUN_REQUEST, 'utf8'))\nreadFileSync('README.md', 'utf8')\nconsole.log(JSON.stringify({ type: 'context_consumed', path: 'README.md' }))\nwriteFileSync('generated.ts', 'export const runId = ' + JSON.stringify(request.runId) + '\\n')\n`)
+writeFileSync(agentScript, `import { readFileSync, writeFileSync } from 'node:fs'\nconst request = JSON.parse(readFileSync(process.env.APERTURE_RUN_REQUEST, 'utf8'))\nreadFileSync('README.md', 'utf8')\nconsole.log(JSON.stringify({ type: 'context_consumed', path: 'README.md' }))\nwriteFileSync('generated.ts', 'export const runId = ' + JSON.stringify(request.runId) + '\\n')\nwriteFileSync('injected.txt', request.declaredContext.entries.map((entry) => entry.content).join(''))\nwriteFileSync('README.md', '# Rewritten by an unreviewed Builder\\n')\n`)
 
 try {
   const health = await request<{ status: string; agentRunner: string }>('/api/health')
@@ -238,7 +239,10 @@ try {
   // what the run reported reading, including whether that report was independently observed.
   assert.deepEqual(agentRunDetail.body?.declaredContextPaths, ['README.md'])
   const consumedContext = agentRunDetail.body!.events.filter((event) => event.eventType === 'agent_run.context_consumed')
-  assert.equal(consumedContext.every((event) => event.payload.independentlyObserved === false && event.payload.reportSource === 'agent_protocol'), true)
+  // The Control Plane records what it injected, from the base revision; what the Builder reports reading stays a report.
+  const injected = consumedContext.filter((event) => event.payload.reportSource === 'control_plane_injection')
+  assert.deepEqual(injected.map((event) => [event.payload.path, event.payload.independentlyObserved, event.payload.truncatedAt, event.payload.contentDigest]), [['README.md', true, null, `sha256:${sha256('# HTTP Authority\n')}`]])
+  assert.equal(consumedContext.filter((event) => event.payload.reportSource !== 'control_plane_injection').every((event) => event.payload.independentlyObserved === false && event.payload.reportSource === 'agent_protocol'), true)
   assert.equal(consumedContext.some((event) => event.payload.path === 'README.md' && event.payload.declared === true), true)
   const generatedProposal = (await request<{ changeProposal: { id: string; headSha: string } }>(`/api/change-proposals/${agentRunResponse.body!.agentRun.changeProposalId}`, { cookie: authorCookie })).body!.changeProposal
   const revisionRequested = await request(`/api/change-proposals/${generatedProposal.id}/reviews`, { cookie: reviewerLogin.cookie!, body: { headSha: generatedProposal.headSha, decision: 'changes_requested', comment: 'Run the Builder again and update generated.ts.' } })
@@ -249,6 +253,9 @@ try {
   assert.equal(revisedRun.body?.agentRun.changeProposalId, generatedProposal.id)
   assert.equal(revisedRun.body?.agentRun.revisionOfProposalId, generatedProposal.id)
   assert.equal(revisedRun.body?.agentRun.startSha, generatedProposal.headSha)
+  // The revision starts from the previous head, where the last Builder rewrote README.md; it is given the reviewed one.
+  assert.equal(git('show', `${generatedProposal.headSha}:README.md`), '# Rewritten by an unreviewed Builder')
+  assert.equal(git('show', `${database.getAgentRun(revisedRun.body!.agentRun.id).branchRef}:injected.txt`), '# HTTP Authority')
   const revisedDetail = await request<{ changeProposal: { status: string; headSha: string; runId: string }; events: Array<{ eventType: string }> }>(`/api/change-proposals/${generatedProposal.id}`, { cookie: authorCookie })
   assert.equal(revisedDetail.body?.changeProposal.status, 'review_ready')
   assert.equal(revisedDetail.body?.changeProposal.runId, revisedRun.body?.agentRun.id)

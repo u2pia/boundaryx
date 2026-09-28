@@ -8,7 +8,9 @@ import { LocalGitAuthority } from './local-git-authority.ts'
 import { applyProjectManifest, loadProjectManifest, type ProjectManifestBinding } from './project-manifest.ts'
 import { progressPathFor, readBuilderSteps } from './run-progress.ts'
 import { removeRunWorktree, runRootFor, type PruneOutcome } from './run-worktree-lifecycle.ts'
+import { compileDeclaredContext, declaredContextSummary, type DeclaredContextEntry } from './declared-context.ts'
 import { sha256 } from './security.ts'
+import { GIT_NO_EXEC, worktreeGit, worktreeGitDirectories, type WorktreeGit } from './worktree-git.ts'
 import { AppError, type AgentRun, type AgentRunRequest, type AgentRunner, type AgentRunnerDescriptor, type BuilderStopReason, type ChangeProposal, type IntentVersion, type WorkItem } from './types.ts'
 
 export type AgentRuntimeAttestation = {
@@ -30,7 +32,7 @@ export type AgentRuntimeAttestation = {
   secretEnvironmentKeys?: string[]
   productionEligible: boolean
   /** How the Builder process itself was confined beyond its worktree, when it was; recorded so a reviewer can see what it could read. */
-  confinement?: { kind: 'seatbelt'; deniedPaths: string[]; allowedPaths: string[]; profileDigest: string }
+  confinement?: { kind: 'seatbelt'; deniedPaths: string[]; allowedPaths: string[]; readOnlyPaths: string[]; profileDigest: string }
   /** Whether the Builder could read registered evaluation holdouts. A holdout evaluation is independent only when it could not. */
   holdoutReadable?: boolean
   attestationDigest: string
@@ -39,6 +41,8 @@ export type AgentRuntimeAttestation = {
 export type AgentRuntimeContext = {
   runId: string
   worktreePath: string
+  /** The worktree's Git directories as the repository records them, not as the worktree's `.git` file says. */
+  git: WorktreeGit
   requestPath: string
   timeoutMs: number
 }
@@ -63,6 +67,7 @@ export type AgentRunPostprocessorInput = {
   actorId: string
   adapterId: string
   worktreePath: string
+  git: WorktreeGit
   workItem: WorkItem
   intent: IntentVersion
   projectManifest: ProjectManifestBinding
@@ -80,13 +85,28 @@ export interface AgentRunPostprocessor {
   process(input: AgentRunPostprocessorInput): unknown
 }
 
-type AgentProtocolMessage = { type: 'context_consumed'; path: string } | { type: 'message'; summary: string; stopped?: BuilderStopReason }
+/**
+ * A read the Builder's side reports. `engine_stream` is a wrapper saying it saw the read in its engine's own event
+ * stream (a tool call that returned a result) rather than taking the model's word; it is still reported from inside the
+ * run, so it is not independently observed.
+ */
+type ContextReport = { type: 'context_consumed'; path: string; source: 'agent_protocol' | 'engine_stream'; tool?: string; offset?: number; limit?: number }
+type AgentProtocolMessage = ContextReport | { type: 'message'; summary: string; stopped?: BuilderStopReason }
 const builderStopReasons: readonly string[] = ['time_budget', 'step_budget'] satisfies BuilderStopReason[]
 
 function git(repositoryPath: string, args: string[]) {
   try {
-    return execFileSync('git', ['-C', repositoryPath, ...args], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }).trim()
+    return execFileSync('git', [...GIT_NO_EXEC, '-C', repositoryPath, ...args], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }).trim()
   } catch (error) {
+    throw new AppError(400, `Git operation failed: ${error instanceof Error ? error.message : String(error)}`, 'git_operation_failed')
+  }
+}
+
+function gitIn(worktree: WorktreeGit, args: string[]) {
+  try {
+    return worktreeGit(worktree, args).trim()
+  } catch (error) {
+    if (error instanceof AppError) throw error
     throw new AppError(400, `Git operation failed: ${error instanceof Error ? error.message : String(error)}`, 'git_operation_failed')
   }
 }
@@ -97,7 +117,12 @@ function parseProtocol(stdout: string) {
     if (!line.trim().startsWith('{')) continue
     try {
       const value = JSON.parse(line) as Record<string, unknown>
-      if (value.type === 'context_consumed' && typeof value.path === 'string') messages.push({ type: 'context_consumed', path: value.path })
+      if (value.type === 'context_consumed' && typeof value.path === 'string') {
+        const count = (field: unknown) => typeof field === 'number' && Number.isSafeInteger(field) && field >= 0 ? field : undefined
+        const offset = count(value.offset)
+        const limit = count(value.limit)
+        messages.push({ type: 'context_consumed', path: value.path, source: value.source === 'engine_stream' ? 'engine_stream' : 'agent_protocol', ...(typeof value.tool === 'string' ? { tool: value.tool.slice(0, 40) } : {}), ...(offset === undefined ? {} : { offset }), ...(limit === undefined ? {} : { limit }) })
+      }
       if (value.type === 'message' && typeof value.summary === 'string') messages.push({ type: 'message', summary: value.summary.slice(0, 1000), ...(typeof value.stopped === 'string' && builderStopReasons.includes(value.stopped) ? { stopped: value.stopped as BuilderStopReason } : {}) })
     } catch {}
   }
@@ -152,6 +177,7 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     const holdout = projectManifest.manifest.evaluation.holdout
     if (holdout && this.input.database.readEvaluationHoldout(workItem.projectId, holdout.digest) === undefined) throw new AppError(422, `The evaluation holdout ${holdout.digest} named by the project manifest is not registered with this Control Plane, or no longer has that digest`, 'evaluation_holdout_missing')
     const declaredContextPaths = applyProjectManifest({ binding: projectManifest, workItem, intent, runtime: this.descriptor, declaredContextPaths: request.declaredContextPaths })
+    const declaredContext = compileDeclaredContext(repositoryPath, baseSha, declaredContextPaths, projectManifest.manifest.context.required)
     const runId = `RUN-${randomUUID().slice(0, 8).toUpperCase()}`
     const branchRef = revisionProposal ? `agent/revision-${runId.toLowerCase()}` : `agent/${runId.toLowerCase()}`
     const runRoot = resolve(this.input.worktreeRoot, runId)
@@ -160,16 +186,18 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     const timeoutMs = this.input.timeoutMs ?? 10 * 60 * 1000
     mkdirSync(runRoot, { recursive: true })
     git(repositoryPath, ['worktree', 'add', '-b', branchRef, worktreePath, startSha])
-    git(worktreePath, ['config', 'user.name', 'BoundaryX Local Agent'])
-    git(worktreePath, ['config', 'user.email', 'local-agent@aperture.invalid'])
-    writeFileSync(requestPath, JSON.stringify({ runId, workItem, intent, workspace: worktreePath, projectManifest: { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, evaluation: { profile: projectManifest.manifest.evaluation.profile, datasetPath: projectManifest.manifest.evaluation.datasetPath, holdout: Boolean(holdout), datasetDigest: projectManifest.evaluationDatasetDigest, thresholds: projectManifest.manifest.evaluation.thresholds }, artifact: projectManifest.manifest.artifact ?? null }, declaredContextPaths, revision: revisionProposal ? { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedback: reviewFeedback } : null }, null, 2))
-    const runtimeContext = { runId, worktreePath, requestPath, timeoutMs }
+    const worktree = worktreeGitDirectories(repositoryPath, worktreePath)
+    gitIn(worktree, ['config', 'user.name', 'BoundaryX Local Agent'])
+    gitIn(worktree, ['config', 'user.email', 'local-agent@aperture.invalid'])
+    writeFileSync(requestPath, JSON.stringify({ runId, workItem, intent, workspace: worktreePath, projectManifest: { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, evaluation: { profile: projectManifest.manifest.evaluation.profile, datasetPath: projectManifest.manifest.evaluation.datasetPath, holdout: Boolean(holdout), datasetDigest: projectManifest.evaluationDatasetDigest, thresholds: projectManifest.manifest.evaluation.thresholds }, artifact: projectManifest.manifest.artifact ?? null, builder: { allowShell: projectManifest.manifest.builder?.allowShell === true } }, declaredContextPaths, declaredContext: { baseSha, entries: declaredContext.entries.map((entry) => ({ path: entry.path, required: entry.required, fileBytes: entry.fileBytes, truncatedAt: entry.truncatedAt, content: entry.content })), omitted: declaredContext.omitted }, revision: revisionProposal ? { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedback: reviewFeedback } : null }, null, 2))
+    const runtimeContext = { runId, worktreePath, git: worktree, requestPath, timeoutMs }
     const attestation = this.input.runtime.attest(runtimeContext)
     const run = this.input.database.createAgentRun({ id: runId, workItemId: workItem.id, intentVersionId: intent.id, repositoryPath, baseRef: request.baseRef, baseSha, startSha, revisionOfProposalId: revisionProposal?.id, branchRef, worktreePath, adapterId: this.id, isolation: attestation.isolation, runtimeImageRef: attestation.imageRef, runtimeAttestationDigest: attestation.attestationDigest, networkEgress: attestation.networkEgress, productionEligible: attestation.productionEligible, startedByActorId: actorId, status: 'queued' })
     this.input.database.saveAgentRunPlan({ runId, declaredContextPaths, requestPath, timeoutMs })
     this.input.database.recordAgentRunEvent(runId, 'agent_run.runtime_attested', attestation, actorId)
     if (revisionProposal) this.input.database.recordAgentRunEvent(runId, 'agent_run.revision_feedback_bound', { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedbackReviewIds: reviewFeedback.map((feedback) => feedback.reviewId), feedbackDigest: `sha256:${sha256(JSON.stringify(reviewFeedback))}` }, actorId)
-    this.input.database.recordAgentRunEvent(runId, 'agent_run.project_manifest_bound', { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, schemaVersion: projectManifest.manifest.schemaVersion, productType: projectManifest.manifest.productType, requiredContextCount: projectManifest.manifest.context.required.length, allowedContextCount: projectManifest.manifest.context.allowed.length, checks: projectManifest.manifest.checks.map((check) => ({ name: check.name, kind: check.kind })), evaluationProfile: projectManifest.manifest.evaluation.profile, evaluationDatasetPath: projectManifest.manifest.evaluation.datasetPath ?? null, evaluationHoldout: Boolean(holdout), evaluationDatasetDigest: projectManifest.evaluationDatasetDigest ?? null, artifact: projectManifest.manifest.artifact ?? null, policy: projectManifest.manifest.policy }, actorId)
+    this.input.database.recordAgentRunEvent(runId, 'agent_run.project_manifest_bound', { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, schemaVersion: projectManifest.manifest.schemaVersion, productType: projectManifest.manifest.productType, requiredContextCount: projectManifest.manifest.context.required.length, allowedContextCount: projectManifest.manifest.context.allowed.length, checks: projectManifest.manifest.checks.map((check) => ({ name: check.name, kind: check.kind })), evaluationProfile: projectManifest.manifest.evaluation.profile, evaluationDatasetPath: projectManifest.manifest.evaluation.datasetPath ?? null, evaluationHoldout: Boolean(holdout), evaluationDatasetDigest: projectManifest.evaluationDatasetDigest ?? null, artifact: projectManifest.manifest.artifact ?? null, policy: projectManifest.manifest.policy, builder: { allowShell: projectManifest.manifest.builder?.allowShell === true } }, actorId)
+    this.input.database.recordAgentRunEvent(runId, 'agent_run.context_compiled', declaredContextSummary(declaredContext), actorId)
     this.input.database.recordAgentRunEvent(runId, 'agent_run.workspace_prepared', { worktreePath, branchRef, requestDigest: `sha256:${sha256(readFileSync(requestPath))}`, isolation: attestation.isolation, productionEligible: attestation.productionEligible }, actorId)
     return run
   }
@@ -188,7 +216,8 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     const revisionProposal = queued.revisionOfProposalId ? this.input.database.getChangeProposal(queued.revisionOfProposalId) : undefined
     const { repositoryPath, baseSha, startSha, branchRef, worktreePath } = queued
     const declaredContextPaths = plan.declaredContextPaths
-    const runtimeContext = { runId, worktreePath, requestPath: plan.requestPath, timeoutMs: plan.timeoutMs }
+    const worktree = worktreeGitDirectories(repositoryPath, worktreePath)
+    const runtimeContext = { runId, worktreePath, git: worktree, requestPath: plan.requestPath, timeoutMs: plan.timeoutMs }
     const attestation = this.input.runtime.attest(runtimeContext)
     if (!this.input.database.claimAgentRun(runId, process.pid, actorId)) {
       this.input.database.recordAgentRunEvent(runId, 'agent_run.cancelled_before_start', { worktreePath }, actorId)
@@ -210,6 +239,7 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     let changeProposalId: string | undefined
     let diagnostic: string | undefined
     try {
+      this.recordContextInjection(runId, actorId)
       const result = this.input.runtime.execute(runtimeContext)
       diagnostic = result.diagnostic
       this.recordBuilderProgress(runId, plan.requestPath, actorId)
@@ -224,30 +254,30 @@ export class GitWorktreeAgentRunner implements AgentRunner {
           // The agent's own report; review readiness reads `stopped` from the run behind the current head.
           this.input.database.recordAgentRunEvent(runId, 'agent_run.message', { summary: message.summary, ...(message.stopped ? { stopped: message.stopped } : {}) }, actorId)
           builderStopped = message.stopped ?? builderStopped
-        } else this.recordContextConsumption(runId, worktreePath, declaredContextPaths, message.path, actorId)
+        } else this.recordContextConsumption(runId, worktreePath, declaredContextPaths, message, actorId)
       }
       if (this.input.database.isAgentRunCancellationRequested(runId)) return this.terminal(runId, repositoryPath, actorId, { status: 'cancelled', exitCode, stdoutDigest, stderrDigest, errorMessage: 'Agent run was cancelled while the agent was generating' })
       if (result.error) throw new AppError((result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT' ? 408 : 422, `Agent runtime failed: ${result.error.message}`, 'agent_runtime_failed')
       // The message keeps the last few lines; the full tail goes to the failure diagnostic event.
       const lastLines = result.diagnostic?.split('\n').slice(-5).join('\n').slice(-800)
       if (result.status !== 0) throw new AppError(422, `Agent exited with status ${result.status ?? 'unknown'}${lastLines ? `: ${lastLines}` : ''}`, 'agent_execution_failed')
-      const changed = git(worktreePath, ['status', '--porcelain'])
+      const changed = gitIn(worktree, ['status', '--porcelain'])
       if (!changed) throw new AppError(422, 'Agent completed without producing a repository change', 'agent_empty_change')
-      git(worktreePath, ['add', '-A'])
-      git(worktreePath, ['commit', '-m', `agent: ${workItem.title.slice(0, 72)}`])
+      gitIn(worktree, ['add', '-A'])
+      gitIn(worktree, ['commit', '-m', `agent: ${workItem.title.slice(0, 72)}`])
       const authority = new LocalGitAuthority(this.input.database)
       const proposal = revisionProposal
         ? authority.reviseChangeProposal(revisionProposal.id, runId, branchRef, actorId).proposal
         : authority.createChangeProposal({ workItemId: workItem.id, intentVersionId: intent.id, runId, repositoryPath, baseRef: queued.baseRef, headRef: branchRef, authorActorId: actorId }, actorId)
       changeProposalId = proposal.id
       this.input.database.recordAgentRunEvent(runId, revisionProposal ? 'agent_run.change_revised' : 'agent_run.change_proposed', { changeProposalId: proposal.id, previousHeadSha: revisionProposal?.headSha ?? null, headSha: proposal.headSha, changedFiles: proposal.changedFiles, additions: proposal.additions, deletions: proposal.deletions }, actorId)
-      this.input.postprocessor?.process({ runId, actorId, adapterId: this.id, worktreePath, workItem, intent, projectManifest, startSha, revisionOfProposalId: revisionProposal?.id, proposal, attestation, stdoutDigest, stderrDigest, builderStopped })
+      this.input.postprocessor?.process({ runId, actorId, adapterId: this.id, worktreePath, git: worktree, workItem, intent, projectManifest, startSha, revisionOfProposalId: revisionProposal?.id, proposal, attestation, stdoutDigest, stderrDigest, builderStopped })
       return this.terminal(runId, repositoryPath, actorId, { status: 'succeeded', changeProposalId: proposal.id, exitCode: result.status ?? 0, stdoutDigest, stderrDigest })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const cancelled = this.input.database.isAgentRunCancellationRequested(runId)
       // Captured before terminal() prunes the worktree, which would take the uncommitted work with it.
-      if (!cancelled) this.recordFailureDiagnostic(runId, worktreePath, diagnostic, actorId)
+      if (!cancelled) this.recordFailureDiagnostic(runId, worktree, diagnostic, actorId)
       this.terminal(runId, repositoryPath, actorId, { status: cancelled ? 'cancelled' : 'failed', changeProposalId, exitCode, stdoutDigest, stderrDigest, errorMessage: cancelled ? `Agent run was cancelled: ${message}` : message })
       throw error
     }
@@ -301,21 +331,21 @@ export class GitWorktreeAgentRunner implements AgentRunner {
    * What someone diagnosing a failed run needs beyond the error message: the agent's redacted stderr tail and the
    * files it had changed but the Control Plane never committed. Best effort; it never masks the original failure.
    */
-  private recordFailureDiagnostic(runId: string, worktreePath: string, stderrTail: string | undefined, actorId: string) {
+  private recordFailureDiagnostic(runId: string, worktree: WorktreeGit, stderrTail: string | undefined, actorId: string) {
     try {
       let uncommittedChanges: string[] = []
       try {
-        uncommittedChanges = execFileSync('git', ['-C', worktreePath, 'status', '--porcelain', '--untracked-files=all'], { encoding: 'utf8' }).split('\n').filter(Boolean).slice(0, 100)
+        uncommittedChanges = worktreeGit(worktree, ['status', '--porcelain', '--untracked-files=all']).split('\n').filter(Boolean).slice(0, 100)
       } catch {}
       // The agent's unfinished work is kept as a patch beside the worktree, so it survives worktree cleanup and can be
       // reviewed or applied by hand. It stays on this machine and is referenced from the event by digest only.
       let uncommittedPatch: { path: string; digest: string; bytes: number } | undefined
       if (uncommittedChanges.length) {
         try {
-          execFileSync('git', ['-C', worktreePath, 'add', '-A'])
-          const patch = execFileSync('git', ['-C', worktreePath, 'diff', '--cached', '--binary'], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 })
-          execFileSync('git', ['-C', worktreePath, 'reset', '-q'])
-          const patchPath = resolve(dirname(worktreePath), 'uncommitted.patch')
+          worktreeGit(worktree, ['add', '-A'])
+          const patch = worktreeGit(worktree, ['diff', '--cached', '--binary'])
+          worktreeGit(worktree, ['reset', '-q'])
+          const patchPath = resolve(dirname(worktree.worktreePath), 'uncommitted.patch')
           writeFileSync(patchPath, patch)
           uncommittedPatch = { path: patchPath, digest: `sha256:${sha256(patch)}`, bytes: Buffer.byteLength(patch) }
         } catch {}
@@ -324,14 +354,29 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     } catch {}
   }
 
-  private recordContextConsumption(runId: string, worktreePath: string, declaredContextPaths: string[], reportedPath: string, actorId: string) {
-    const candidate = resolve(worktreePath, reportedPath)
+  /**
+   * What the Control Plane put in the Builder's prompt, from the compilation recorded at admission. Observed by the
+   * Control Plane itself rather than reported by the Builder, and exact down to where a file was cut.
+   */
+  private recordContextInjection(runId: string, actorId: string) {
+    const compiled = this.input.database.listAggregateEvents('agent_run', runId).find((event) => event.eventType === 'agent_run.context_compiled')?.payload as { baseSha: string; entries: Omit<DeclaredContextEntry, 'content'>[] } | undefined
+    for (const entry of compiled?.entries ?? []) this.input.database.recordAgentRunEvent(runId, 'agent_run.context_consumed', { path: entry.path, declared: true, required: entry.required, contentDigest: entry.injectedDigest, fileDigest: entry.fileDigest, fileBytes: entry.fileBytes, injectedBytes: entry.injectedBytes, truncatedAt: entry.truncatedAt, revision: compiled!.baseSha, reportSource: 'control_plane_injection', independentlyObserved: true }, actorId)
+  }
+
+  private recordContextConsumption(runId: string, worktreePath: string, declaredContextPaths: string[], report: ContextReport, actorId: string) {
+    const reported = { reportSource: report.source, ...(report.tool ? { tool: report.tool } : {}), ...(report.offset === undefined ? {} : { offset: report.offset }), ...(report.limit === undefined ? {} : { limit: report.limit }) }
+    const candidate = resolve(worktreePath, report.path)
     const insideWorktree = candidate === worktreePath || candidate.startsWith(`${worktreePath}${sep}`)
-    if (!insideWorktree || !existsSync(candidate) || !statSync(candidate).isFile()) {
-      this.input.database.recordAgentRunEvent(runId, 'agent_run.context_rejected', { reportedPath, reason: 'outside_workspace_or_missing', reportSource: 'agent_protocol' }, actorId)
+    const kind = insideWorktree && existsSync(candidate) ? statSync(candidate).isFile() ? 'file' : statSync(candidate).isDirectory() ? 'directory' : undefined : undefined
+    if (!kind) {
+      this.input.database.recordAgentRunEvent(runId, 'agent_run.context_rejected', { reportedPath: report.path, reason: 'outside_workspace_or_missing', ...reported }, actorId)
       return
     }
-    const normalizedPath = relative(worktreePath, candidate).split(sep).join('/')
-    this.input.database.recordAgentRunEvent(runId, 'agent_run.context_consumed', { path: normalizedPath, declared: declaredContextPaths.includes(normalizedPath), contentDigest: `sha256:${sha256(readFileSync(candidate))}`, reportSource: 'agent_protocol', independentlyObserved: false }, actorId)
+    const normalizedPath = relative(worktreePath, candidate).split(sep).join('/') || '.'
+    // A search across a directory (Grep in content mode) read the matching lines of files under it, which cannot be
+    // named one by one from the report; it is recorded as the directory searched, with nothing to digest.
+    const declared = kind === 'file' ? declaredContextPaths.includes(normalizedPath) : false
+    this.input.database.recordAgentRunEvent(runId, 'agent_run.context_consumed', { path: normalizedPath, declared, ...(kind === 'file' ? { contentDigest: `sha256:${sha256(readFileSync(candidate))}` } : { searchedDirectory: true }), ...reported, independentlyObserved: false }, actorId)
   }
+
 }

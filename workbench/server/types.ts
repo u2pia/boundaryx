@@ -115,12 +115,18 @@ export type AcceptanceCriterionInput = {
   verifiedBy?: string[]
 }
 
+export type IntentExample = { input: string; expected: string }
+
 export type IntentVersion = {
   id: string
   workItemId: string
   version: number
   goal: string
   constraints: string[]
+  /** What the Builder must not do, even where it looks helpful. Absent when none were declared. */
+  nonGoals?: string[]
+  /** Illustrations of the intended behaviour; they are not acceptance criteria and no check is derived from them. */
+  examples?: IntentExample[]
   riskLevel: RiskLevel
   contentDigest: string
   createdBy: string

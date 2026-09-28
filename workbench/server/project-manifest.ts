@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { posix } from 'node:path'
 import { sha256 } from './security.ts'
 import { AppError, type AgentRunnerDescriptor, type IntentVersion, type WorkItem } from './types.ts'
+import { GIT_NO_EXEC } from './worktree-git.ts'
 
 export const PROJECT_MANIFEST_PATH = '.aperture/project.json'
 
@@ -23,8 +24,10 @@ export type ProjectEvaluationThreshold = {
   threshold: number
 }
 
+export const PROJECT_MANIFEST_VERSIONS = ['aperture.project.v1', 'aperture.project.v2'] as const
+
 export type ProjectManifest = {
-  schemaVersion: 'aperture.project.v1'
+  schemaVersion: (typeof PROJECT_MANIFEST_VERSIONS)[number]
   productType: WorkItem['productType']
   context: {
     required: string[]
@@ -68,6 +71,11 @@ export type ProjectManifest = {
     maximumRisk: IntentVersion['riskLevel']
     allowUnisolatedRuntime: boolean
   }
+  /**
+   * What the Builder may do beyond reading and editing files (v2 only). `allowShell` gives the chat engine its
+   * `run_command` tool, which runs any command in the worktree; without it the chat engine only reads and writes files.
+   */
+  builder?: { allowShell: boolean }
 }
 
 export type ProjectManifestBinding = {
@@ -112,7 +120,8 @@ function parseManifest(raw: string): ProjectManifest {
     throw new AppError(422, `${PROJECT_MANIFEST_PATH} is not valid JSON`, 'invalid_project_manifest')
   }
   const root = requireObject(parsed, PROJECT_MANIFEST_PATH)
-  if (root.schemaVersion !== 'aperture.project.v1') throw new AppError(422, 'Unsupported project manifest schemaVersion', 'unsupported_project_manifest')
+  const schemaVersion = PROJECT_MANIFEST_VERSIONS.find((version) => version === root.schemaVersion)
+  if (!schemaVersion) throw new AppError(422, `Unsupported project manifest schemaVersion; use ${PROJECT_MANIFEST_VERSIONS.join(' or ')}`, 'unsupported_project_manifest')
   if (root.productType !== 'application' && root.productType !== 'agent_system') throw new AppError(422, 'productType must be application or agent_system', 'invalid_project_manifest')
 
   const context = requireObject(root.context, 'context')
@@ -201,8 +210,21 @@ function parseManifest(raw: string): ProjectManifest {
   if (!['low', 'medium', 'high'].includes(String(policy.maximumRisk))) throw new AppError(422, 'policy.maximumRisk must be low, medium or high', 'invalid_project_manifest')
   if (typeof policy.allowUnisolatedRuntime !== 'boolean') throw new AppError(422, 'policy.allowUnisolatedRuntime must be boolean', 'invalid_project_manifest')
 
+  // A v1 manifest has no builder section: one there would look like a setting the Control Plane ignores. A v2 manifest
+  // without one gets the defaults written out, so its digest records what the Builder was allowed.
+  let builder: ProjectManifest['builder']
+  if (schemaVersion === 'aperture.project.v1') {
+    if (root.builder !== undefined) throw new AppError(422, 'builder requires schemaVersion aperture.project.v2', 'invalid_project_manifest')
+  } else {
+    const configured = root.builder === undefined ? {} : requireObject(root.builder, 'builder')
+    const unknown = Object.keys(configured).filter((key) => key !== 'allowShell')
+    if (unknown.length) throw new AppError(422, `Unknown builder settings: ${unknown.join(', ')}`, 'invalid_project_manifest')
+    if (configured.allowShell !== undefined && typeof configured.allowShell !== 'boolean') throw new AppError(422, 'builder.allowShell must be boolean', 'invalid_project_manifest')
+    builder = { allowShell: configured.allowShell === true }
+  }
+
   return {
-    schemaVersion: 'aperture.project.v1',
+    schemaVersion,
     productType: root.productType,
     context: { required, allowed },
     checks,
@@ -210,13 +232,14 @@ function parseManifest(raw: string): ProjectManifest {
     evaluation,
     artifact,
     policy: { maximumRisk: policy.maximumRisk as IntentVersion['riskLevel'], allowUnisolatedRuntime: policy.allowUnisolatedRuntime },
+    ...(builder ? { builder } : {}),
   }
 }
 
 export function loadProjectManifest(repositoryPath: string, baseSha: string): ProjectManifestBinding {
   let raw: string
   try {
-    raw = execFileSync('git', ['-C', repositoryPath, 'show', `${baseSha}:${PROJECT_MANIFEST_PATH}`], { encoding: 'utf8', maxBuffer: 1024 * 1024 })
+    raw = execFileSync('git', [...GIT_NO_EXEC, '-C', repositoryPath, 'show', `${baseSha}:${PROJECT_MANIFEST_PATH}`], { encoding: 'utf8', maxBuffer: 1024 * 1024 })
   } catch {
     throw new AppError(422, `Base revision must contain ${PROJECT_MANIFEST_PATH}`, 'project_manifest_missing')
   }
@@ -224,7 +247,7 @@ export function loadProjectManifest(repositoryPath: string, baseSha: string): Pr
   let evaluationDatasetDigest: string | undefined = manifest.evaluation.holdout?.digest
   if (manifest.evaluation.datasetPath) {
     try {
-      const dataset = execFileSync('git', ['-C', repositoryPath, 'show', `${baseSha}:${manifest.evaluation.datasetPath}`], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 })
+      const dataset = execFileSync('git', [...GIT_NO_EXEC, '-C', repositoryPath, 'show', `${baseSha}:${manifest.evaluation.datasetPath}`], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 })
       evaluationDatasetDigest = `sha256:${sha256(dataset)}`
     } catch {
       throw new AppError(422, `Evaluation dataset is missing from the base revision: ${manifest.evaluation.datasetPath}`, 'evaluation_dataset_missing')

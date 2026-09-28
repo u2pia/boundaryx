@@ -1,8 +1,9 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
-import { dirname, relative, resolve, sep } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { progress } from './progress.mjs'
 import { cliTimeoutMs, partialMessage, stoppedAtDeadline } from './run-deadline.mjs'
+import { declaredContextSections, taskPrompt } from './run-request.mjs'
 
 const [codexExecutable, ...configuredArgs] = process.argv.slice(2)
 const requestPath = process.env.APERTURE_RUN_REQUEST
@@ -14,36 +15,8 @@ if (!codexExecutable || !requestPath || !worktreePath) {
 }
 
 const request = JSON.parse(readFileSync(requestPath, 'utf8'))
-const contextSections = []
-let contextBytes = 0
-for (const declaredPath of request.declaredContextPaths ?? []) {
-  const candidate = resolve(worktreePath, declaredPath)
-  const insideWorktree = candidate === worktreePath || candidate.startsWith(`${worktreePath}${sep}`)
-  if (!insideWorktree || !existsSync(candidate) || contextBytes >= 200_000) continue
-  const content = readFileSync(candidate, 'utf8').slice(0, Math.max(0, 200_000 - contextBytes))
-  contextBytes += Buffer.byteLength(content)
-  const normalizedPath = relative(worktreePath, candidate).split(sep).join('/')
-  contextSections.push(`\n## Declared context: ${normalizedPath}\n\n${content}`)
-  console.log(JSON.stringify({ type: 'context_consumed', path: normalizedPath }))
-}
-
-const criteria = (request.intent.acceptanceCriteria ?? []).map((criterion) => `- [${criterion.criticality}/${criterion.verificationType}] ${criterion.statement}`).join('\n')
-const revisionFeedback = request.revision?.feedback?.map((feedback) => `- ${feedback.reviewerDisplayName}: ${feedback.comment || 'Changes requested without an additional comment.'}`).join('\n')
-const prompt = `You are the Builder Agent for an AI Native SDLC Control Plane run.
-
-Target product type: ${request.workItem.productType}
-Work item: ${request.workItem.title}
-Goal: ${request.intent.goal}
-
-Constraints:
-${(request.intent.constraints ?? []).map((constraint) => `- ${constraint}`).join('\n') || '- None declared'}
-
-Acceptance criteria:
-${criteria}
-
-${request.revision ? `This is a revision of Change Proposal ${request.revision.changeProposalId} at ${request.revision.previousHeadSha}.
-Review feedback that must be addressed:
-${revisionFeedback || '- Review requested changes; inspect the current implementation and acceptance criteria.'}` : 'This is the initial implementation run.'}
+const contextSections = declaredContextSections(request)
+const prompt = `${taskPrompt(request)}
 
 Operate only inside the current Git worktree. Implement the requested change, add or update relevant tests when appropriate, and do not create a Git commit. Do not use network access unless the surrounding sandbox explicitly allows it. Finish with a concise summary of changed files and remaining risks.
 ${contextSections.join('\n')}`

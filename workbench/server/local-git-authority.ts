@@ -2,10 +2,11 @@ import { execFileSync } from 'node:child_process'
 import { resolveProjectRepository } from './code-host/index.ts'
 import type { ControlPlaneDatabase } from './database.ts'
 import { AppError } from './types.ts'
+import { GIT_NO_EXEC } from './worktree-git.ts'
 
 function git(repositoryPath: string, args: string[]) {
   try {
-    return execFileSync('git', ['-C', repositoryPath, ...args], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }).trim()
+    return execFileSync('git', [...GIT_NO_EXEC, '-C', repositoryPath, ...args], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }).trim()
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     throw new AppError(400, `Git operation failed: ${message}`, 'git_operation_failed')
@@ -34,7 +35,7 @@ function policyFiles(repositoryPath: string, baseSha: string, headSha: string) {
 
 function isAncestor(repositoryPath: string, ancestorSha: string, descendantSha: string) {
   try {
-    execFileSync('git', ['-C', repositoryPath, 'merge-base', '--is-ancestor', ancestorSha, descendantSha], { stdio: 'ignore' })
+    execFileSync('git', [...GIT_NO_EXEC, '-C', repositoryPath, 'merge-base', '--is-ancestor', ancestorSha, descendantSha], { stdio: 'ignore' })
     return true
   } catch {
     return false

@@ -9,6 +9,8 @@ type IntentBundleInput = {
   productType: LocalWorkItem['productType']
   goal: string
   constraints: string[]
+  nonGoals?: string[]
+  examples?: Array<{ input: string; expected: string }>
   riskLevel: LocalIntentVersion['riskLevel']
   // 起草人声明每条标准如何被证明。这两个字段进入 contentDigest、Evidence Package 和 Builder Agent 的
   // prompt，所以不能由这一层代填——代填出来的「全部确定性关键」是一句谎话。
@@ -392,6 +394,8 @@ export function LocalControlPlaneProvider({ children }: { children: ReactNode })
     await localControlPlaneClient.createIntentVersion(created.workItem.id, {
       goal: input.goal,
       constraints: input.constraints,
+      ...(input.nonGoals?.length ? { nonGoals: input.nonGoals } : {}),
+      ...(input.examples?.length ? { examples: input.examples } : {}),
       riskLevel: input.riskLevel,
       acceptanceCriteria: input.acceptanceCriteria,
     })

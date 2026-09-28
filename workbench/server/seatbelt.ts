@@ -30,6 +30,11 @@ export type SeatbeltPolicy = {
   denied: string[]
   /** Re-allowed beneath a denied path: later rules win in Seatbelt. Their ancestors up to the denied path become listable. */
   allowed?: string[]
+  /**
+   * Readable, never writable, including everything beneath, whether or not a denied path contains them. Applied after
+   * `allowed`, so it also narrows an allowed path that contains one.
+   */
+  readOnly?: string[]
   /** When set, writes are refused everywhere except beneath these paths (and /dev). */
   writableOnly?: string[]
   denyNetwork?: boolean
@@ -45,11 +50,12 @@ export function seatbeltProfile(policy: SeatbeltPolicy) {
   // no other file's content does.
   const denied = policy.denied.map(canonical)
   const ancestors = new Set<string>()
-  for (const path of (policy.allowed ?? []).map(canonical)) {
+  for (const path of [...(policy.allowed ?? []), ...(policy.readOnly ?? [])].map(canonical)) {
     for (let parent = dirname(path); parent !== dirname(parent); parent = dirname(parent)) if (denied.some((root) => parent === root || parent.startsWith(`${root}/`))) ancestors.add(parent)
   }
   if (ancestors.size) lines.push(`(allow file-read* ${[...ancestors].sort().map((path) => `(literal ${JSON.stringify(path)})`).join(' ')})`)
   for (const path of policy.allowed ?? []) lines.push(`(allow file-read* file-write* (subpath ${quote(path)}))`)
+  for (const path of policy.readOnly ?? []) lines.push(`(allow file-read* (subpath ${quote(path)}))`, `(deny file-write* (subpath ${quote(path)}))`)
   return lines.join('\n')
 }
 

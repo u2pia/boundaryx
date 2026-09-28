@@ -2,10 +2,11 @@ import { execFileSync } from 'node:child_process'
 import type { ControlPlaneDatabase } from './database.ts'
 import { sha256 } from './security.ts'
 import { AppError } from './types.ts'
+import { GIT_NO_EXEC } from './worktree-git.ts'
 
 function git(repositoryPath: string, args: string[]) {
   try {
-    return execFileSync('git', ['-C', repositoryPath, ...args], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 }).trim()
+    return execFileSync('git', [...GIT_NO_EXEC, '-C', repositoryPath, ...args], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 }).trim()
   } catch (error) {
     throw new AppError(400, `Git operation failed: ${error instanceof Error ? error.message : String(error)}`, 'git_operation_failed')
   }

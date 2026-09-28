@@ -1,5 +1,4 @@
 import { spawnSync } from 'node:child_process'
-import { execFileSync } from 'node:child_process'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import type { ControlPlaneDatabase } from './database.ts'
@@ -10,6 +9,7 @@ import { seatbeltAvailable, seatbeltCommand } from './seatbelt.ts'
 import { mapCriteriaToChecks } from './criteria-coverage.ts'
 import { POLICY_PATH_PREFIX } from './local-git-authority.ts'
 import { sha256 } from './security.ts'
+import { assertWorktreeGitIntact, worktreeGit, worktreeGitArgs, worktreeGitOptions, type WorktreeGit } from './worktree-git.ts'
 
 export type LocalCheckDefinition = {
   name: string
@@ -117,11 +117,11 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const checks: ExecutedCheck[] = []
     const manifestChecks = input.projectManifest.manifest.checks
     const testPaths = input.projectManifest.manifest.testPaths
-    const agentModifiedTestFiles = testPaths.length ? this.diffFiles(input.worktreePath, input.proposal.baseSha, input.proposal.headSha, testPaths) : []
+    const agentModifiedTestFiles = testPaths.length ? this.diffFiles(input.git, input.proposal.baseSha, input.proposal.headSha, testPaths) : []
     const headProvenance: CheckProvenance = !testPaths.length ? 'unverified' : agentModifiedTestFiles.length ? 'all_tests' : 'pre_existing'
     // The grader gets the same treatment as the tests: which revision of it produced each evaluation result.
     const harnessPaths = input.projectManifest.manifest.evaluation.harnessPaths ?? []
-    const agentModifiedHarnessFiles = harnessPaths.length ? this.diffFiles(input.worktreePath, input.proposal.baseSha, input.proposal.headSha, harnessPaths) : []
+    const agentModifiedHarnessFiles = harnessPaths.length ? this.diffFiles(input.git, input.proposal.baseSha, input.proposal.headSha, harnessPaths) : []
     const harnessProvenance: CheckProvenance = !harnessPaths.length ? 'unverified' : agentModifiedHarnessFiles.length ? 'all_tests' : 'pre_existing'
     const holdout = input.projectManifest.manifest.evaluation.holdout
     const datasetBeforeChecks = input.projectManifest.manifest.evaluation.profile === 'agent_dataset' && !holdout ? this.datasetState(input) : undefined
@@ -143,7 +143,7 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     if (datasetBeforeChecks) checks.push(this.recordEvaluationDatasetUntouched(input, datasetBeforeChecks))
     const artifacts = this.collectBuildArtifacts(input, checks)
     const allowedArtifactPaths = new Set(artifacts.map((artifact) => artifact.path))
-    const dirty = execFileSync('git', ['-C', input.worktreePath, 'status', '--porcelain', '--untracked-files=all'], { encoding: 'utf8' }).trim().split('\n').filter((line) => line && !allowedArtifactPaths.has(line.slice(3))).join('\n')
+    const dirty = worktreeGit(input.git, ['status', '--porcelain', '--untracked-files=all']).trim().split('\n').filter((line) => line && !allowedArtifactPaths.has(line.slice(3))).join('\n')
     if (dirty) checks.push(this.recordDirtyWorkspace(input, dirty))
     const testChecks = checks.filter((check) => check.kind === 'test')
     const testProvenance = {
@@ -160,7 +160,7 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
           : 'The run modified declared test paths, so the head test results are not independent. The @baseline results were produced with the test files reset to the proposal base revision.',
       // Everything else the run changed stayed at head during the @baseline re-runs: the code under test by design,
       // but also any helper or fixture outside testPaths. Listed so the reviewer can see where the baseline ends.
-      filesAtHeadDuringBaseline: agentModifiedTestFiles.length ? this.diffFiles(input.worktreePath, input.proposal.baseSha, input.proposal.headSha, ['.']).filter((file) => !agentModifiedTestFiles.includes(file)) : [],
+      filesAtHeadDuringBaseline: agentModifiedTestFiles.length ? this.diffFiles(input.git, input.proposal.baseSha, input.proposal.headSha, ['.']).filter((file) => !agentModifiedTestFiles.includes(file)) : [],
     }
     const evaluationProvenance = holdout ? {
       mode: 'holdout' as const,
@@ -204,7 +204,7 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
       generatedAt: new Date().toISOString(),
       projectManifest: { path: input.projectManifest.path, baseSha: input.projectManifest.baseSha, digest: input.projectManifest.digest, schemaVersion: input.projectManifest.manifest.schemaVersion, policy: input.projectManifest.manifest.policy, evaluation: { ...input.projectManifest.manifest.evaluation, datasetDigest: input.projectManifest.evaluationDatasetDigest }, artifact: input.projectManifest.manifest.artifact },
       workItem: { id: input.workItem.id, title: input.workItem.title, productType: input.workItem.productType },
-      intent: { id: input.intent.id, version: input.intent.version, goal: input.intent.goal, riskLevel: input.intent.riskLevel, contentDigest: input.intent.contentDigest, constraints: input.intent.constraints, acceptanceCriteria: input.intent.acceptanceCriteria },
+      intent: { id: input.intent.id, version: input.intent.version, goal: input.intent.goal, riskLevel: input.intent.riskLevel, contentDigest: input.intent.contentDigest, constraints: input.intent.constraints, ...(input.intent.nonGoals ? { nonGoals: input.intent.nonGoals } : {}), ...(input.intent.examples ? { examples: input.intent.examples } : {}), acceptanceCriteria: input.intent.acceptanceCriteria },
       project: { id: project.id, slug: project.slug },
       codeHost: { provider: project.codeHost, mergeMode: project.mergeMode, defaultBranch: project.defaultBranch, ...hosted },
       git: { repositoryPath: input.proposal.repositoryPath, baseRef: input.proposal.baseRef, baseSha: input.proposal.baseSha, headRef: input.proposal.headRef, headSha: input.proposal.headSha, changedFiles: input.proposal.changedFiles, additions: input.proposal.additions, deletions: input.proposal.deletions },
@@ -226,12 +226,12 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
   }
 
   /** Files under `paths` that differ between two revisions. An unmatched pathspec is not an error. */
-  private diffFiles(worktreePath: string, fromSha: string, toSha: string, paths: string[]) {
-    return execFileSync('git', ['-C', worktreePath, 'diff', '--name-only', '-z', fromSha, toSha, '--', ...paths], { encoding: 'utf8' }).split('\0').filter(Boolean)
+  private diffFiles(worktree: WorktreeGit, fromSha: string, toSha: string, paths: string[]) {
+    return worktreeGit(worktree, ['diff', '--name-only', '-z', fromSha, toSha, '--', ...paths]).split('\0').filter(Boolean)
   }
 
-  private treeFiles(worktreePath: string, sha: string, paths: string[]) {
-    return execFileSync('git', ['-C', worktreePath, 'ls-tree', '-r', '--name-only', '-z', sha, '--', ...paths], { encoding: 'utf8' }).split('\0').filter(Boolean)
+  private treeFiles(worktree: WorktreeGit, sha: string, paths: string[]) {
+    return worktreeGit(worktree, ['ls-tree', '-r', '--name-only', '-z', sha, '--', ...paths]).split('\0').filter(Boolean)
   }
 
   /**
@@ -239,11 +239,11 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
    * contain are removed, the rest are checked out. `previousFiles` is the file list of the revision
    * currently materialized, because `git checkout` alone never removes files.
    */
-  private materializeTestPaths(worktreePath: string, sha: string, paths: string[], previousFiles: string[]) {
-    const target = new Set(this.treeFiles(worktreePath, sha, paths))
-    for (const file of previousFiles) if (!target.has(file)) rmSync(resolve(worktreePath, file), { force: true })
+  private materializeTestPaths(worktree: WorktreeGit, sha: string, paths: string[], previousFiles: string[]) {
+    const target = new Set(this.treeFiles(worktree, sha, paths))
+    for (const file of previousFiles) if (!target.has(file)) rmSync(resolve(worktree.worktreePath, file), { force: true })
     const present = paths.filter((path) => target.has(path) || [...target].some((file) => file.startsWith(`${path}/`)))
-    if (present.length) execFileSync('git', ['-C', worktreePath, 'checkout', sha, '--', ...present], { encoding: 'utf8' })
+    if (present.length) worktreeGit(worktree, ['checkout', sha, '--', ...present])
   }
 
   /**
@@ -254,18 +254,18 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
   private executeBaselineChecks(input: AgentRunPostprocessorInput, kind: 'test' | 'evaluation', testPaths: string[], agentModifiedTestFiles: string[]): ExecutedCheck[] {
     const definitions = input.projectManifest.manifest.checks.filter((check) => check.kind === kind)
     if (!definitions.length) return []
-    const headFiles = this.treeFiles(input.worktreePath, input.proposal.headSha, testPaths)
-    const baseFiles = this.treeFiles(input.worktreePath, input.proposal.baseSha, testPaths)
+    const headFiles = this.treeFiles(input.git, input.proposal.headSha, testPaths)
+    const baseFiles = this.treeFiles(input.git, input.proposal.baseSha, testPaths)
     const results: ExecutedCheck[] = []
     try {
-      this.materializeTestPaths(input.worktreePath, input.proposal.baseSha, testPaths, headFiles)
+      this.materializeTestPaths(input.git, input.proposal.baseSha, testPaths, headFiles)
     } catch (error) {
       return [this.recordBaselineUnavailable(input, kind, error instanceof Error ? error.message : String(error))]
     }
     try {
       for (const definition of definitions) results.push(this.executeCheck({ name: `${definition.name}@baseline`, kind: definition.kind, executable: definition.command[0], args: definition.command.slice(1), timeoutMs: definition.timeoutMs }, input, { provenance: 'pre_existing', testTreeSha: input.proposal.baseSha, agentModifiedTestFiles }))
     } finally {
-      this.materializeTestPaths(input.worktreePath, input.proposal.headSha, testPaths, baseFiles)
+      this.materializeTestPaths(input.git, input.proposal.headSha, testPaths, baseFiles)
     }
     return results
   }
@@ -304,13 +304,13 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
   /**
    * With a holdout configured, the checks run head code on the host too, and could read the holdout from the data
    * directory and print it into the evidence package. Where Seatbelt is available they run denied the data directory
-   * (their own run directory and the repository's Git directory excepted) and a seal key kept elsewhere.
+   * (their own run directory excepted) and a seal key kept elsewhere, and with the repository's Git directory readable
+   * but not writable, so that nothing they write there runs later in the Control Plane's own Git commands.
    */
   private checkCommand(input: AgentRunPostprocessorInput, definition: LocalCheckDefinition) {
     if (!input.projectManifest.manifest.evaluation.holdout || !seatbeltAvailable()) return { executable: definition.executable, args: definition.args }
-    const gitCommonDirectory = resolve(input.worktreePath, execFileSync('git', ['-C', input.worktreePath, 'rev-parse', '--git-common-dir'], { encoding: 'utf8' }).trim())
     const keyPath = this.input.database.eventSeals.keyPath
-    return seatbeltCommand({ denied: [this.input.database.dataDirectory, ...(keyPath ? [keyPath] : [])], allowed: [dirname(input.worktreePath), gitCommonDirectory] }, definition.executable, definition.args)
+    return seatbeltCommand({ denied: [this.input.database.dataDirectory, ...(keyPath ? [keyPath] : [])], allowed: [dirname(input.worktreePath)], readOnly: [input.git.commonDirectory] }, definition.executable, definition.args)
   }
 
   private collectBuildArtifacts(input: AgentRunPostprocessorInput, checks: ExecutedCheck[]) {
@@ -389,7 +389,7 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
    * so the check does not itself spread the holdout.
    */
   private baseDataset(input: AgentRunPostprocessorInput) {
-    try { return execFileSync('git', ['-C', input.worktreePath, 'show', `${input.proposal.baseSha}:${input.projectManifest.manifest.evaluation.datasetPath!}`], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 }) } catch { return '' }
+    try { return worktreeGit(input.git, ['show', `${input.proposal.baseSha}:${input.projectManifest.manifest.evaluation.datasetPath!}`], { stdio: ['ignore', 'pipe', 'ignore'] }) } catch { return '' }
   }
 
   /** `datasetPath` is the repository path of an in-worktree dataset (excluded from the diff), or `holdout:<digest>`. */
@@ -398,7 +398,7 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const excluded = input.projectManifest.manifest.evaluation.datasetPath ? [`:(exclude)${input.projectManifest.manifest.evaluation.datasetPath}`] : []
     const added = new Map<string, string[]>()
     let file = ''
-    for (const line of execFileSync('git', ['-C', input.worktreePath, 'diff', '--unified=0', '--no-color', '--no-ext-diff', input.proposal.baseSha, input.proposal.headSha, '--', '.', ...excluded], { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024 }).split('\n')) {
+    for (const line of worktreeGit(input.git, ['diff', '--unified=0', '--no-color', '--no-ext-diff', input.proposal.baseSha, input.proposal.headSha, '--', '.', ...excluded]).split('\n')) {
       if (line.startsWith('+++ ')) file = line.slice(4).replace(/^b\//u, '')
       else if (line.startsWith('+')) added.set(file, [...(added.get(file) ?? []), line.slice(1)])
     }
@@ -428,7 +428,8 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
 
   /** Extracts `paths` (everything when empty) of a revision into `target`, from the object store rather than the worktree. */
   private extractRevision(input: AgentRunPostprocessorInput, sha: string, paths: string[], target: string) {
-    const archive = spawnSync('git', ['-C', input.worktreePath, 'archive', '--format=tar', sha, ...(paths.length ? ['--', ...paths] : [])], { maxBuffer: 512 * 1024 * 1024 })
+    assertWorktreeGitIntact(input.git)
+    const archive = spawnSync('git', worktreeGitArgs(input.git, ['archive', '--format=tar', sha, ...(paths.length ? ['--', ...paths] : [])]), worktreeGitOptions(input.git, { maxBuffer: 512 * 1024 * 1024 }))
     if (archive.status !== 0) throw new Error(`git archive ${sha.slice(0, 12)} failed: ${archive.stderr?.toString().trim() || archive.error?.message}`)
     const unpacked = spawnSync('tar', ['-x', '-f', '-', '-C', target], { input: archive.stdout, maxBuffer: 16 * 1024 * 1024 })
     if (unpacked.status !== 0) throw new Error(`tar failed: ${unpacked.stderr?.toString().trim() || unpacked.error?.message}`)

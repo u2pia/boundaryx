@@ -51,7 +51,7 @@ export type LocalProject = {
 
 /** The context a Run started now would be given, from the manifest on the project's default branch. */
 export type LocalProjectContextFile = { path: string; required: boolean; exists: boolean; sizeBytes?: number; lastCommit?: { sha: string; author: string; committedAt: string; subject: string }; editUrl?: string }
-export type LocalProjectContext = { projectId: string; branch: string; baseSha: string; manifestPath: string; manifestFound: boolean; manifestError?: string; files: LocalProjectContextFile[]; requiredBytes: number; budgetBytes: number; issues: { severity: 'error' | 'warning'; code: string; message: string; path?: string }[] }
+export type LocalProjectContext = { projectId: string; branch: string; baseSha: string; manifestPath: string; manifestFound: boolean; manifestError?: string; files: LocalProjectContextFile[]; requiredBytes: number; budgetBytes: number; builder?: { schemaVersion?: string; allowShell: boolean }; issues: { severity: 'error' | 'warning'; code: string; message: string; path?: string }[] }
 
 export type LocalProjectMember = { projectId: string; actorId: string; username: string; displayName: string; role: LocalProjectRole; addedByActorId?: string; addedAt: string }
 
@@ -95,6 +95,8 @@ export type LocalIntentVersion = {
   version: number
   goal: string
   constraints: string[]
+  nonGoals?: string[]
+  examples?: Array<{ input: string; expected: string }>
   riskLevel: 'low' | 'medium' | 'high'
   contentDigest: string
   createdBy: string
@@ -231,7 +233,7 @@ export type LocalEvidencePackageView = {
     generatedAt: string
     projectManifest?: { path: string; baseSha: string; digest: string; schemaVersion: string; policy: { maximumRisk: 'low' | 'medium' | 'high'; allowUnisolatedRuntime: boolean }; evaluation?: { profile: 'application_checks' | 'agent_dataset'; datasetPath?: string; datasetDigest?: string; thresholds: Array<{ metric: string; operator: 'gte' | 'lte'; threshold: number }> }; artifact?: { profile: 'application_build'; buildCheck: string; outputs: string[] } }
     workItem: { id: string; title: string; productType: 'application' | 'agent_system' }
-    intent: { id: string; version: number; goal: string; riskLevel: 'low' | 'medium' | 'high'; contentDigest: string; constraints: string[]; acceptanceCriteria: Array<{ id: string; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; ordinal: number }> }
+    intent: { id: string; version: number; goal: string; riskLevel: 'low' | 'medium' | 'high'; contentDigest: string; constraints: string[]; nonGoals?: string[]; examples?: Array<{ input: string; expected: string }>; acceptanceCriteria: Array<{ id: string; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; ordinal: number }> }
     git: { repositoryPath: string; baseRef: string; baseSha: string; headRef: string; headSha: string; changedFiles: number; additions: number; deletions: number }
     run: { id: string; adapterId: string; startSha?: string; revisionOfProposalId?: string; isolation: 'unisolated_process' | 'container'; networkEgress: 'denied' | 'allowlist' | 'unrestricted'; productionEligible: boolean; runtimeAttestationDigest?: string; stdoutDigest?: string; stderrDigest?: string }
     checks: Array<{ id: string; name: string; kind?: 'test' | 'evaluation' | 'build' | 'integrity'; conclusion: 'success' | 'failure' | 'neutral' | 'cancelled'; exitCode?: number; durationMs: number; stdoutDigest: string; stderrDigest: string; stdoutExcerpt: string; stderrExcerpt: string; metrics?: Record<string, number>; thresholdResults?: Array<{ metric: string; operator: 'gte' | 'lte'; threshold: number; actual?: number; passed: boolean }>; provenance?: 'all_tests' | 'pre_existing' | 'unverified' | 'isolated' | 'isolated_partial'; testTreeSha?: string; agentModifiedTestFiles?: string[] }>
@@ -407,7 +409,7 @@ export const localControlPlaneClient = {
   listWorkItems: (projectId?: string) => request<{ workItems: LocalWorkItem[] }>(scoped('/api/work-items', projectId)),
   getWorkItem: (workItemId: string) => request<{ workItem: LocalWorkItem; intentVersions: LocalIntentVersion[] }>(`/api/work-items/${workItemId}`),
   createWorkItem: (input: { title: string; description: string; productType: LocalWorkItem['productType']; ownerActorId?: string; projectId: string }) => post<{ workItem: LocalWorkItem }>('/api/work-items', input),
-  createIntentVersion: (workItemId: string, input: { goal: string; constraints: string[]; riskLevel: LocalIntentVersion['riskLevel']; acceptanceCriteria: Array<{ statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; verifiedBy?: string[] }> }) => post<{ intentVersion: LocalIntentVersion }>(`/api/work-items/${workItemId}/intent-versions`, input),
+  createIntentVersion: (workItemId: string, input: { goal: string; constraints: string[]; nonGoals?: string[]; examples?: Array<{ input: string; expected: string }>; riskLevel: LocalIntentVersion['riskLevel']; acceptanceCriteria: Array<{ statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; verifiedBy?: string[] }> }) => post<{ intentVersion: LocalIntentVersion }>(`/api/work-items/${workItemId}/intent-versions`, input),
   approveIntentVersion: (intentVersionId: string, input: { comment: string }) => post<{ intentVersion: LocalIntentVersion }>(`/api/intent-versions/${encodeURIComponent(intentVersionId)}/approve`, input),
   listAgentRuns: (projectId?: string) => request<{ agentRuns: LocalAgentRun[] }>(scoped('/api/agent-runs', projectId)),
   startAgentRun: (input: { workItemId: string; intentVersionId: string; baseRef?: string; declaredContextPaths: string[]; changeProposalId?: string }) => post<{ agentRun: LocalAgentRun; queuePosition?: number }>('/api/agent-runs', input),

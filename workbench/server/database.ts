@@ -7,7 +7,7 @@ import { criterionStatus, isSubstantiveHumanCriterion, mapCriteriaToChecks, ment
 import { requestContext } from './request-context.ts'
 import { loadEventSealKeyring, type EventSealKeyring } from './event-seal.ts'
 import { normalizeProjectHost, type ProjectHostInput } from './code-host/index.ts'
-import type { AcceptanceCriterionInput, BuilderStopReason, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentVersion, MergeEvidence, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
+import type { AcceptanceCriterionInput, BuilderStopReason, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentExample, IntentVersion, MergeEvidence, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
 import { AppError } from './types.ts'
 
 type SqlValue = string | number | null
@@ -603,7 +603,7 @@ export class ControlPlaneDatabase {
     return this.mapWorkItem(row)
   }
 
-  createIntentVersion(input: { workItemId: string; goal: string; constraints: string[]; riskLevel: IntentVersion['riskLevel']; acceptanceCriteria: AcceptanceCriterionInput[] }, actorId: string) {
+  createIntentVersion(input: { workItemId: string; goal: string; constraints: string[]; nonGoals?: string[]; examples?: IntentExample[]; riskLevel: IntentVersion['riskLevel']; acceptanceCriteria: AcceptanceCriterionInput[] }, actorId: string) {
     this.requireProjectRole(actorId, this.getWorkItem(input.workItemId).projectId, ALL_ROLES, 'intent_forbidden')
     if (!input.goal.trim() || !input.acceptanceCriteria.length) throw new AppError(400, 'Intent goal and acceptance criteria are required', 'invalid_intent')
     // 这两项校验放在 database 层而不是 HTTP 层：smoke 脚本与 real-case 都直接调用这个方法，只在 HTTP 边界
@@ -626,6 +626,12 @@ export class ControlPlaneDatabase {
         throw new AppError(400, `A critical human-verified criterion must say what the approver judges; "${criterion.statement.trim()}" is a placeholder`, 'human_criterion_not_substantive')
       }
     }
+    // Both go into the Builder's prompt whole, so their size is bounded here, like a criterion's statement.
+    if (!Array.isArray(input.nonGoals ?? [])) throw new AppError(400, 'nonGoals must be an array of statements', 'invalid_intent_non_goals')
+    const nonGoals = (input.nonGoals ?? []).map((item) => typeof item === 'string' ? item.trim() : item)
+    if (nonGoals.length > 20 || nonGoals.some((item) => typeof item !== 'string' || !item || item.length > 300)) throw new AppError(400, 'nonGoals must list up to 20 non-empty statements of at most 300 characters', 'invalid_intent_non_goals')
+    const examples = input.examples ?? []
+    if (!Array.isArray(examples) || examples.length > 10 || examples.some((example) => typeof example?.input !== 'string' || typeof example?.expected !== 'string' || !example.input.trim() || !example.expected.trim() || example.input.length > 2000 || example.expected.length > 2000)) throw new AppError(400, 'examples must list up to 10 pairs of non-empty input and expected text of at most 2000 characters each', 'invalid_intent_examples')
     // Only the declared fields enter the digest and the table, in a fixed order, so extra keys a caller sends cannot
     // change the digest and an Intent without verifiedBy hashes exactly as it did before verifiedBy existed.
     const acceptanceCriteria: AcceptanceCriterionInput[] = input.acceptanceCriteria.map((criterion) => ({ statement: criterion.statement, criticality: criterion.criticality, verificationType: criterion.verificationType, ...(criterion.verifiedBy?.length ? { verifiedBy: [...new Set(criterion.verifiedBy)] } : {}) }))
@@ -646,12 +652,13 @@ export class ControlPlaneDatabase {
       const version = Number((this.db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS version FROM intent_versions WHERE work_item_id = ?').get(input.workItemId) as { version: number }).version)
       const intentId = `${input.workItemId}:v${version}`
       const timestamp = nowIso()
-      const canonical = { workItemId: input.workItemId, version, goal: input.goal.trim(), constraints: input.constraints, riskLevel: input.riskLevel, acceptanceCriteria }
+      // nonGoals and examples enter only when present, so an Intent without them hashes as it did before they existed.
+      const canonical = { workItemId: input.workItemId, version, goal: input.goal.trim(), constraints: input.constraints, ...(nonGoals.length ? { nonGoals: [...new Set(nonGoals)] } : {}), ...(examples.length ? { examples: examples.map((example) => ({ input: example.input, expected: example.expected })) } : {}), riskLevel: input.riskLevel, acceptanceCriteria }
       // V0.3 §10.1: a low risk Intent becomes Ready through the lightweight rule; anything riskier waits for a named approver.
       const lowRisk = input.riskLevel === 'low'
       const intent: IntentVersion = { id: intentId, ...canonical, contentDigest: `sha256:${sha256(JSON.stringify(canonical))}`, createdBy: actorId, createdAt: timestamp, acceptanceCriteria: acceptanceCriteria.map((criterion, index) => ({ ...criterion, id: `${intentId}:AC-${index + 1}`, ordinal: index + 1 })), status: lowRisk ? 'approved' : 'draft', ...(lowRisk ? { approval: { basis: 'low_risk_rule' as const, approvedAt: timestamp } } : {}) }
       const superseded = this.db.prepare("UPDATE intent_versions SET status = 'superseded' WHERE work_item_id = ? AND status != 'superseded'").run(input.workItemId)
-      this.db.prepare('INSERT INTO intent_versions(id, work_item_id, version, goal, constraints_json, risk_level, content_digest, created_by, created_at, status, approved_at, approval_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(intent.id, intent.workItemId, intent.version, intent.goal, JSON.stringify(intent.constraints), intent.riskLevel, intent.contentDigest, actorId, timestamp, intent.status, lowRisk ? timestamp : null, lowRisk ? 'low_risk_rule' : null)
+      this.db.prepare('INSERT INTO intent_versions(id, work_item_id, version, goal, constraints_json, non_goals_json, examples_json, risk_level, content_digest, created_by, created_at, status, approved_at, approval_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(intent.id, intent.workItemId, intent.version, intent.goal, JSON.stringify(intent.constraints), intent.nonGoals ? JSON.stringify(intent.nonGoals) : null, intent.examples ? JSON.stringify(intent.examples) : null, intent.riskLevel, intent.contentDigest, actorId, timestamp, intent.status, lowRisk ? timestamp : null, lowRisk ? 'low_risk_rule' : null)
       const insertCriterion = this.db.prepare('INSERT INTO acceptance_criteria(id, intent_version_id, statement, criticality, verification_type, ordinal, verified_by_json) VALUES (?, ?, ?, ?, ?, ?, ?)')
       intent.acceptanceCriteria.forEach((criterion) => insertCriterion.run(criterion.id, intent.id, criterion.statement, criterion.criticality, criterion.verificationType, criterion.ordinal, criterion.verifiedBy ? JSON.stringify(criterion.verifiedBy) : null))
       this.db.prepare("UPDATE work_items SET status = 'ready', updated_at = ? WHERE id = ?").run(timestamp, input.workItemId)
@@ -691,7 +698,7 @@ export class ControlPlaneDatabase {
     const rows = this.db.prepare('SELECT * FROM intent_versions WHERE work_item_id = ? ORDER BY version DESC').all(workItemId) as Array<Record<string, SqlValue>>
     return rows.map((row) => {
       const criteria = this.db.prepare('SELECT * FROM acceptance_criteria WHERE intent_version_id = ? ORDER BY ordinal').all(String(row.id)) as Array<Record<string, SqlValue>>
-      return { id: String(row.id), workItemId: String(row.work_item_id), version: Number(row.version), goal: String(row.goal), constraints: parseJson<string[]>(String(row.constraints_json)), riskLevel: String(row.risk_level) as IntentVersion['riskLevel'], contentDigest: String(row.content_digest), createdBy: String(row.created_by), createdAt: String(row.created_at), status: String(row.status) as IntentVersion['status'], ...(row.approved_at ? { approval: { basis: String(row.approval_basis) as NonNullable<IntentVersion['approval']>['basis'], ...(row.approved_by ? { actorId: String(row.approved_by) } : {}), approvedAt: String(row.approved_at), ...(row.approval_comment ? { comment: String(row.approval_comment) } : {}) } } : {}), acceptanceCriteria: criteria.map((criterion) => ({ id: String(criterion.id), statement: String(criterion.statement), criticality: String(criterion.criticality) as AcceptanceCriterionInput['criticality'], verificationType: String(criterion.verification_type) as AcceptanceCriterionInput['verificationType'], ...(criterion.verified_by_json ? { verifiedBy: parseJson<string[]>(String(criterion.verified_by_json)) } : {}), ordinal: Number(criterion.ordinal) })) }
+      return { id: String(row.id), workItemId: String(row.work_item_id), version: Number(row.version), goal: String(row.goal), constraints: parseJson<string[]>(String(row.constraints_json)), ...(row.non_goals_json ? { nonGoals: parseJson<string[]>(String(row.non_goals_json)) } : {}), ...(row.examples_json ? { examples: parseJson<IntentExample[]>(String(row.examples_json)) } : {}), riskLevel: String(row.risk_level) as IntentVersion['riskLevel'], contentDigest: String(row.content_digest), createdBy: String(row.created_by), createdAt: String(row.created_at), status: String(row.status) as IntentVersion['status'], ...(row.approved_at ? { approval: { basis: String(row.approval_basis) as NonNullable<IntentVersion['approval']>['basis'], ...(row.approved_by ? { actorId: String(row.approved_by) } : {}), approvedAt: String(row.approved_at), ...(row.approval_comment ? { comment: String(row.approval_comment) } : {}) } } : {}), acceptanceCriteria: criteria.map((criterion) => ({ id: String(criterion.id), statement: String(criterion.statement), criticality: String(criterion.criticality) as AcceptanceCriterionInput['criticality'], verificationType: String(criterion.verification_type) as AcceptanceCriterionInput['verificationType'], ...(criterion.verified_by_json ? { verifiedBy: parseJson<string[]>(String(criterion.verified_by_json)) } : {}), ordinal: Number(criterion.ordinal) })) }
     })
   }
 

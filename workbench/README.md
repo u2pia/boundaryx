@@ -133,7 +133,7 @@ npm run server:start
 - **步数**：`APERTURE_BUILDER_MAX_STEPS`，默认 120 步。
 - **时间**：Runner 在启动 Agent 时通过 `APERTURE_RUN_DEADLINE`（epoch 毫秒）告诉它自己何时会被杀，默认是 10 分钟后；可用 `CONTROL_PLANE_AGENT_TIMEOUT_MS` 调整（10000–7200000 的整数，写错时服务拒绝启动）。
 
-从截止时间往回留出三段，按 10 分钟计：约 15 秒用于退出，约 90 秒用于最后一次写总结的模型调用，再往前约 2 分钟会提醒模型收尾。之后只提供 `finish`；`run_command` 和模型调用都会被截断，占不到这段预留时间。因时间停下的总结以 `Stopped at the time budget` 开头，标明改动可能不完整；连总结都来不及写时，引擎会代写一条。无论哪种情况，改动都会照常提交并跑完全部检查，再交给评审。
+从截止时间往回留出三段，按 10 分钟计：约 15 秒用于退出，约 90 秒用于最后一次写总结的模型调用，再往前约 2 分钟会提醒模型收尾。之后只提供 `finish`；`run_command`（仅在 manifest 允许 shell 时存在）和模型调用都会被截断，占不到这段预留时间。因时间停下的总结以 `Stopped at the time budget` 开头，标明改动可能不完整；连总结都来不及写时，引擎会代写一条。无论哪种情况，改动都会照常提交并跑完全部检查，再交给评审。
 
 `codex-builder` 和 `claude-builder` 没法让外部 CLI 收尾，因此它们在截止时间前（留出 10%，最多 30 秒）直接停掉 CLI，把 worktree 里已有的改动照常交出，总结同样以 `Stopped at the time budget` 开头；Codex 最后一条消息会附在后面。
 
@@ -371,6 +371,16 @@ Token 在每次使用时从环境变量读取：API 请求用 `Authorization: Be
 ```
 
 Control Plane 从 `baseSha` 读取并规范化 Manifest，生成 SHA-256 Digest。Run 声明的 Context 必须包含全部 `required` 路径且不得超出 `allowed`；Work Item 类型、Intent 风险和 Runtime 隔离必须满足 Manifest Policy；Check 命令只使用该基线 Manifest 中的定义。Manifest 路径、基线、Digest 和策略会进入 Run Request、Event Log 与 Evidence Package。`allowUnisolatedRuntime` 只用于当前本地探索，不能使 Process Runtime 获得生产资格。
+
+声明的 Context 由 Control Plane 从 `baseSha` 读出后写进 Builder 提示词（修订 Run 也一样，不用上一轮 Builder 改过的版本），合计预算 200 000 UTF-8 字节：`required` 先放，放不下或在基线上不存在时拒绝启动 Run；可追加文件按字符边界截断或略去，截断位置和摘要记入 Event Log。
+
+`aperture.project.v2` 在 v1 的基础上增加 `builder`，目前只有一个开关：
+
+```json
+{ "schemaVersion": "aperture.project.v2", "builder": { "allowShell": true } }
+```
+
+`allowShell` 默认 `false`：内置 chat 引擎只能列目录、读写文件，测试由 Control Plane 在 Builder 结束后运行；为 `true` 时它才有 `run_command`，可以在工作区执行任意命令。v1 Manifest 写 `builder` 会被拒绝，未知的 `builder` 键也会被拒绝。Claude Code 引擎不受这个开关影响，始终只有 Read / Write / Edit / Glob / Grep，并且不加载工作区里的 `.claude` 设置、hooks、`.mcp.json` 和项目 skills。
 
 Application 可以通过 `artifact.profile: application_build` 把 Build Check 与预期输出绑定。Build 成功后，Control Plane 对输出文件记录路径、大小、SHA-256、Source Commit 和生成 Check；声明输出缺失会新增失败门禁。当前只封存 Build Provenance，不持久保存 Artifact Blob，也不代表制品可部署或达到生产资格。契约见 `../docs/APPLICATION_BUILD_PROVENANCE_CONTRACT.md`。
 

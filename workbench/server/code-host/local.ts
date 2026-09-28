@@ -3,13 +3,14 @@ import { realpathSync } from 'node:fs'
 import { isAbsolute, resolve, sep } from 'node:path'
 import { AppError, type Project } from '../types.ts'
 import type { CodeHost, CodeHostConnection, CodeHostFactoryContext } from './types.ts'
+import { GIT_NO_EXEC } from '../worktree-git.ts'
 
 /** Directories the control plane writes itself. A project pointing into one could make a run edit platform state. */
 export const MANAGED_DATA_SUBDIRECTORIES = ['agent-runs', 'repositories', 'evidence']
 
 function gitOrUndefined(repositoryPath: string, args: string[]) {
   try {
-    return execFileSync('git', ['-C', repositoryPath, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    return execFileSync('git', [...GIT_NO_EXEC, '-C', repositoryPath, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
   } catch {
     return undefined
   }

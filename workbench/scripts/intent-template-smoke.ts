@@ -10,7 +10,8 @@ import { createControlPlaneRequestHandler } from '../server/http-server.ts'
 import { LocalCommandAgentRunner } from '../server/local-command-agent-runner.ts'
 import { LocalEvidenceStore } from '../server/local-evidence-store.ts'
 import { AppError } from '../server/types.ts'
-import { criteriaSyntaxHint, intentTemplates, lintIntentDraft, maximumStatementLength, parseAcceptanceCriteria, splitLines, type ParsedCriterion } from '../src/intent-templates.ts'
+import { criteriaSyntaxHint, intentTemplates, lintIntentDraft, maximumStatementLength, parseAcceptanceCriteria, parseIntentExamples, splitLines, type ParsedCriterion } from '../src/intent-templates.ts'
+import { sha256 } from '../server/security.ts'
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message)
@@ -249,6 +250,30 @@ try {
   const digestB = database.createIntentVersion({ workItemId: otherWorkItem.id, goal: '仅允许 CSV/JSON，最大 5 MiB', constraints: [], riskLevel: 'low', acceptanceCriteria: [{ statement: '超过 5 MiB 返回 file_too_large', criticality: 'normal', verificationType: 'human' }] }, owner.id).contentDigest
   assert(digestA !== digestB, 'criticality and verificationType must participate in contentDigest')
 
+  // nonGoals 与 examples 只在声明时进入摘要：没有它们的 Intent 与这两个字段出现之前哈希完全相同，已批准的 Intent 不会因升级失效。
+  const lowCriteria = [{ statement: '超过 5 MiB 返回 file_too_large', criticality: 'critical' as const, verificationType: 'deterministic' as const }]
+  const scopeWorkItem = database.createWorkItem({ title: '范围与示例', description: 'nonGoals / examples', productType: 'application', ownerActorId: owner.id }, owner.id)
+  const plain = database.createIntentVersion({ workItemId: scopeWorkItem.id, goal: '限制导入大小', constraints: [], riskLevel: 'low', acceptanceCriteria: lowCriteria }, owner.id)
+  assert(plain.contentDigest === `sha256:${sha256(JSON.stringify({ workItemId: scopeWorkItem.id, version: plain.version, goal: '限制导入大小', constraints: [], riskLevel: 'low', acceptanceCriteria: lowCriteria }))}`, 'an Intent without nonGoals or examples must hash as before they existed')
+  assert(!('nonGoals' in plain) && !('examples' in plain), 'absent fields stay absent')
+  const scoped = database.createIntentVersion({ workItemId: scopeWorkItem.id, goal: '限制导入大小', constraints: [], nonGoals: ['不修改 bankAiCases.ts', '不修改 bankAiCases.ts', '  不引入依赖 '], examples: [{ input: '6 MiB 的 CSV', expected: 'file_too_large' }], riskLevel: 'low', acceptanceCriteria: lowCriteria }, owner.id)
+  assert(scoped.contentDigest === `sha256:${sha256(JSON.stringify({ workItemId: scopeWorkItem.id, version: scoped.version, goal: '限制导入大小', constraints: [], nonGoals: ['不修改 bankAiCases.ts', '不引入依赖'], examples: [{ input: '6 MiB 的 CSV', expected: 'file_too_large' }], riskLevel: 'low', acceptanceCriteria: lowCriteria }))}`, 'nonGoals and examples are part of the digest the approver signs')
+  const scopedReread = database.getIntentVersion(scoped.id)
+  assert(JSON.stringify([scopedReread.nonGoals, scopedReread.examples]) === JSON.stringify([['不修改 bankAiCases.ts', '不引入依赖'], [{ input: '6 MiB 的 CSV', expected: 'file_too_large' }]]), 'nonGoals and examples must round-trip through SQLite')
+  assert(scopedReread.acceptanceCriteria.length === 1, 'examples never become acceptance criteria')
+  expectAppError('invalid_intent_non_goals', () => database.createIntentVersion({ workItemId: scopeWorkItem.id, goal: 'x', constraints: [], nonGoals: ['  '], riskLevel: 'low', acceptanceCriteria: lowCriteria }, owner.id))
+  expectAppError('invalid_intent_non_goals', () => database.createIntentVersion({ workItemId: scopeWorkItem.id, goal: 'x', constraints: [], nonGoals: 'not a list' as unknown as string[], riskLevel: 'low', acceptanceCriteria: lowCriteria }, owner.id))
+  expectAppError('invalid_intent_examples', () => database.createIntentVersion({ workItemId: scopeWorkItem.id, goal: 'x', constraints: [], examples: [{ input: 'a', expected: '' }], riskLevel: 'low', acceptanceCriteria: lowCriteria }, owner.id))
+  expectAppError('invalid_intent_examples', () => database.createIntentVersion({ workItemId: scopeWorkItem.id, goal: 'x', constraints: [], examples: [{ input: 'x'.repeat(2001), expected: 'y' }], riskLevel: 'low', acceptanceCriteria: lowCriteria }, owner.id))
+
+  // 示例文本框：「输入：」开始一个示例，「期望：」之后是期望，两者都可以跨行。
+  const parsedExamples = parseIntentExamples('输入：身份证号 123\n期望：提示长度错误\n\n输入: 第一行\n第二行\nExpected: ok')
+  assert(JSON.stringify(parsedExamples) === JSON.stringify({ examples: [{ input: '身份证号 123', expected: '提示长度错误' }, { input: '第一行\n第二行', expected: 'ok' }], errors: [] }), `examples must parse, got ${JSON.stringify(parsedExamples)}`)
+  assert(parseIntentExamples('期望：孤立').errors.length === 1, 'an expectation without an input is an error')
+  assert(parseIntentExamples('输入：只有输入').errors.join() === '示例 1 缺少期望', 'an input without an expectation is an error')
+  assert(parseIntentExamples('随便写').errors.join() === '示例要以「输入：」开头', 'free text before the first input is an error')
+  assert(JSON.stringify(parseIntentExamples('')) === JSON.stringify({ examples: [], errors: [] }), 'no examples is fine')
+
   // --- HTTP 边界：同一条不变量必须让绕过前端的调用者也撞到 400，而不是靠前端禁用按钮维持 ---
 
   const httpRoot = mkdtempSync(join(root, 'http-'))
@@ -326,6 +351,11 @@ try {
   assert(accepted.status === 201, `a compliant high risk intent must be accepted, got ${accepted.status} ${JSON.stringify(accepted.body)}`)
   assert(accepted.body?.intentVersion.acceptanceCriteria.map((criterion) => criterion.verificationType).join(',') === 'deterministic,human,deterministic', 'the HTTP layer must not rewrite verification types')
   assert(accepted.body?.intentVersion.acceptanceCriteria.map((criterion) => criterion.criticality).join(',') === 'critical,critical,normal', 'the HTTP layer must not rewrite criticalities')
+
+  const scopedOverHttp = await call<{ intentVersion: { nonGoals?: string[]; examples?: Array<{ input: string; expected: string }> } }>(`/api/work-items/${workItemId}/intent-versions`, { cookie, body: { goal: '限制导入大小', constraints: [], nonGoals: ['不引入依赖'], examples: [{ input: '6 MiB', expected: 'file_too_large' }], riskLevel: 'low', acceptanceCriteria: [{ statement: '超过 5 MiB 返回 file_too_large', criticality: 'critical', verificationType: 'deterministic' }] } })
+  assert(scopedOverHttp.status === 201 && scopedOverHttp.body?.intentVersion.nonGoals?.join() === '不引入依赖' && scopedOverHttp.body.intentVersion.examples?.[0]?.expected === 'file_too_large', `nonGoals and examples must pass the HTTP boundary, got ${scopedOverHttp.status} ${JSON.stringify(scopedOverHttp.body)}`)
+  const badExamplesOverHttp = await call<{ error: { code: string } }>(`/api/work-items/${workItemId}/intent-versions`, { cookie, body: { goal: 'x', constraints: [], examples: 'nope', riskLevel: 'low', acceptanceCriteria: [{ statement: 'x', criticality: 'critical', verificationType: 'deterministic' }] } })
+  assert(badExamplesOverHttp.status === 400 && badExamplesOverHttp.body?.error.code === 'invalid_intent_examples', `malformed examples must be a 400, got ${badExamplesOverHttp.status} ${badExamplesOverHttp.body?.error.code}`)
 
   console.log(`intent template smoke passed · ${Object.keys(intentTemplates).length} templates · ${stored.acceptanceCriteria.length} criteria stored as declared · HTTP boundary enforces the high risk invariant`)
 } finally {

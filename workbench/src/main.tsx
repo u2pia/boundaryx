@@ -68,7 +68,7 @@ import type { AgentRunEvent, AutonomyDecisionInput } from './adapters/contracts'
 import { LocalAutonomyDecisionProvider } from './adapters/local-autonomy-provider'
 import { LocalOtlpFileExportProvider } from './adapters/local-otlp-file-export-provider'
 import { providerCatalog, summarizeProviderCatalog, type ProviderStage } from './provider-catalog'
-import { criteriaSyntaxHint, criticalityLabels, inspectStatement, intentTemplates, lintIntentDraft, mentionsCriterion, parseAcceptanceCriteria, splitLines, verificationLabels, type ProductType, type RiskLevel } from './intent-templates'
+import { criteriaSyntaxHint, criticalityLabels, inspectStatement, intentTemplates, lintIntentDraft, mentionsCriterion, parseAcceptanceCriteria, parseIntentExamples, splitLines, verificationLabels, type ProductType, type RiskLevel } from './intent-templates'
 import type { WorkbenchState } from './store-model'
 import { useWorkbench } from './use-workbench'
 import { useLocalControlPlane } from './local-control-plane-context'
@@ -731,6 +731,8 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
   const [title, setTitle] = useState('')
   const [goal, setGoal] = useState('')
   const [constraints, setConstraints] = useState('')
+  const [nonGoals, setNonGoals] = useState('')
+  const [examples, setExamples] = useState('')
   const [criteria, setCriteria] = useState('')
   const [productType, setProductType] = useState<ProductType>('application')
   const [riskLevel, setRiskLevel] = useState<RiskLevel>('medium')
@@ -755,6 +757,7 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
   const filtered = useMemo(() => allIntents.filter((item) => `${item.id}${item.title}`.toLowerCase().includes(query.toLowerCase())), [allIntents, query])
   const template = intentTemplates[productType]
   const parsedCriteria = useMemo(() => parseAcceptanceCriteria(criteria), [criteria])
+  const parsedExamples = useMemo(() => parseIntentExamples(examples), [examples])
   const draftLint = useMemo(() => lintIntentDraft({ goal, constraints: splitLines(constraints), riskLevel, criteria: parsedCriteria }), [goal, constraints, riskLevel, parsedCriteria])
   const applyTemplate = () => {
     const hasDraft = [goal, constraints, criteria].some((value) => value.trim())
@@ -763,7 +766,7 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
     setConstraints(template.constraints)
     setCriteria(template.criteria)
   }
-  const submitBlocked = creating || Boolean(projectType.error) || !title.trim() || !goal.trim() || parsedCriteria.length === 0 || draftLint.blockers.length > 0
+  const submitBlocked = creating || Boolean(projectType.error) || !title.trim() || !goal.trim() || parsedCriteria.length === 0 || parsedExamples.errors.length > 0 || draftLint.blockers.length > 0
   const latestIntentFor = (workItemId: string) => local.intentVersions.filter((intent) => intent.workItemId === workItemId).sort((left, right) => right.version - left.version)[0]
   const actorName = (actorId?: string) => local.actors.find((candidate) => candidate.id === actorId)?.displayName ?? actorId ?? '—'
   const intentStatusLabel = (intent: LocalIntentVersion) => intent.status === 'draft' ? '待批准' : intent.status === 'superseded' ? '已被新版本取代' : intent.approval?.basis === 'low_risk_rule' ? '低风险 · 规则批准' : `已批准 · ${actorName(intent.approval?.actorId)}`
@@ -800,6 +803,8 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
           <label className="local-intent-goal"><span>业务目标</span><input value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="改完之后系统的可观察行为是什么" /></label>
           <label className="local-intent-risk"><span>风险等级</span><select value={riskLevel} onChange={(event) => setRiskLevel(event.target.value as RiskLevel)}><option value="low">低风险</option><option value="medium">中风险</option><option value="high">高风险</option></select></label>
           <label className="local-intent-constraints"><span>约束 · 每行一条</span><textarea value={constraints} onChange={(event) => setConstraints(event.target.value)} placeholder={'Agent 不得做什么\n例：不得删除或弱化既有测试'} /></label>
+          <label className="local-intent-nongoals"><span>不做什么 · 每行一条 · 可选</span><textarea value={nonGoals} onChange={(event) => setNonGoals(event.target.value)} placeholder={'明确排除的范围，Agent 看起来有帮助也不能做\n例：不修改 bankAiCases.ts'} /></label>
+          <label className="local-intent-examples"><span>输入 / 期望示例 · 可选 · 只作说明，不是验收标准</span><textarea value={examples} onChange={(event) => setExamples(event.target.value)} placeholder={'输入：身份证号 11010519491231002X\n期望：校验通过\n输入：身份证号 123\n期望：提示「身份证号应为 18 位」'} />{parsedExamples.errors.length > 0 && <small className="local-form-error">{parsedExamples.errors.join('；')}</small>}</label>
           <label className="local-intent-criteria"><span>验收标准 · 每行一条</span><textarea value={criteria} onChange={(event) => setCriteria(event.target.value)} placeholder={`${template.hint}\n${criteriaSyntaxHint}`} /></label>
           {parsedCriteria.length > 0 && <div className="local-criteria-preview">
             <span className="eyebrow">解析结果 · {parsedCriteria.length} 条 · 你声明的验证方式</span>
@@ -817,7 +822,7 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
             {draftLint.warnings.map((warning) => <p key={warning}><CircleDot size={13} />{warning}</p>)}
           </div>}
           <div className="local-intent-actions">
-            <button className="primary-button" disabled={submitBlocked} onClick={() => void (async () => { setCreating(true); setCreateError(undefined); try { await local.createIntentBundle({ title: title.trim(), description: goal.trim(), productType, goal: goal.trim(), constraints: splitLines(constraints), riskLevel, acceptanceCriteria: parsedCriteria.map(({ statement, criticality, verificationType, verifiedBy }) => ({ statement, criticality, verificationType, ...(verifiedBy?.length ? { verifiedBy } : {}) })) }); setTitle(''); setGoal(''); setConstraints(''); setCriteria('') } catch (error) { setCreateError(error instanceof Error ? error.message : String(error)) } finally { setCreating(false) } })()}><Plus size={15} />{creating ? '创建中…' : '创建本地 Intent'}</button>
+            <button className="primary-button" disabled={submitBlocked} onClick={() => void (async () => { setCreating(true); setCreateError(undefined); try { await local.createIntentBundle({ title: title.trim(), description: goal.trim(), productType, goal: goal.trim(), constraints: splitLines(constraints), nonGoals: splitLines(nonGoals), examples: parsedExamples.examples, riskLevel, acceptanceCriteria: parsedCriteria.map(({ statement, criticality, verificationType, verifiedBy }) => ({ statement, criticality, verificationType, ...(verifiedBy?.length ? { verifiedBy } : {}) })) }); setTitle(''); setGoal(''); setConstraints(''); setNonGoals(''); setExamples(''); setCriteria('') } catch (error) { setCreateError(error instanceof Error ? error.message : String(error)) } finally { setCreating(false) } })()}><Plus size={15} />{creating ? '创建中…' : '创建本地 Intent'}</button>
             <small>提示只是建议，不阻塞提交；红色项会被服务端拒绝，必须改。{riskLevel === 'low' ? '低风险 Intent 创建即按规则批准。' : '中、高风险 Intent 创建后需由另一位成员批准，才能启动 Run。'}</small>
             {projectType.type && <small>被开发对象由项目 .aperture/project.json 决定（{projectType.type === 'agent_system' ? 'agent_system' : 'application'}）。</small>}
             {projectType.type === null && <small>这个项目还没接入仓库，类型暂按你的选择；接入后以仓库的 .aperture/project.json 为准。</small>}
@@ -931,6 +936,7 @@ function ProjectContextPanel() {
           <span className={errors ? 'context-no' : warnings ? 'context-unused' : 'context-yes'}>{errors ? <ShieldAlert size={13} /> : <ShieldCheck size={13} />}{errors ? `${errors} 个错误` : warnings ? `${warnings} 个提醒` : '检查通过'}</span>
           <span>必需 {context.files.filter((file) => file.required).length} · 可追加 {context.files.filter((file) => !file.required).length}</span>
           <span className="project-context-budget" title="所有声明的上下文会被直接写进 Agent 提示词，超出预算的部分被截断"><i style={{ width: `${budgetPercent}%` }} className={context.requiredBytes > context.budgetBytes ? 'over' : undefined} />必需上下文 {(context.requiredBytes / 1024).toFixed(1)} KB / {(context.budgetBytes / 1024).toFixed(0)} KB</span>
+          {context.builder && <span className={context.builder.allowShell ? 'context-unused' : 'context-yes'} title={context.builder.allowShell ? 'manifest 设置了 builder.allowShell：内置 chat 引擎可以用 run_command 在工作区执行任意命令' : '内置 chat 引擎只能读写文件，测试由平台在 Builder 结束后运行；要开放 shell，manifest 需用 aperture.project.v2 并设置 builder.allowShell'}>chat 引擎 · {context.builder.allowShell ? '允许 shell' : '无 shell'}</span>}
         </div>
         {context.issues.length > 0 && <ul className="project-context-issues">{context.issues.map((issue) => <li key={`${issue.code}-${issue.path ?? ''}`} className={issue.severity}>{issue.severity === 'error' ? <ShieldAlert size={12} /> : <Eye size={12} />}{issue.message}</li>)}</ul>}
         {context.files.length > 0 && <div className="project-context-files">
@@ -1172,30 +1178,47 @@ function LocalRunContextDrawer({ detail, onClose }: { detail: LocalAgentRunDetai
     contentDigest: String(event.payload.contentDigest ?? ''),
     reportSource: String(event.payload.reportSource ?? 'unknown'),
     independentlyObserved: event.payload.independentlyObserved === true,
+    fileBytes: typeof event.payload.fileBytes === 'number' ? event.payload.fileBytes : undefined,
+    truncatedAt: typeof event.payload.truncatedAt === 'number' ? event.payload.truncatedAt : null,
+    tool: typeof event.payload.tool === 'string' ? event.payload.tool : undefined,
+    offset: typeof event.payload.offset === 'number' ? event.payload.offset : undefined,
+    limit: typeof event.payload.limit === 'number' ? event.payload.limit : undefined,
+    searchedDirectory: event.payload.searchedDirectory === true,
   }))
+  const sourceLabel = (source: string) => source === 'engine_stream' ? '引擎事件流' : source === 'agent_protocol' ? 'Builder 自报' : source
+  // Which part of a file a read covered: the Read tool's offset and limit are lines.
+  const readRange = (item: typeof consumed[number]) => item.offset === undefined && item.limit === undefined ? '' : ` · 第 ${(item.offset ?? 1)} 行起${item.limit === undefined ? '' : ` ${item.limit} 行`}`
+  // What the Control Plane put in the prompt, from the base revision, is a fact; what the Builder says it read is a report.
+  const injected = consumed.filter((item) => item.reportSource === 'control_plane_injection')
+  const reported = consumed.filter((item) => item.reportSource !== 'control_plane_injection')
+  const compiled = detail.events.find((event) => event.eventType === 'agent_run.context_compiled')?.payload as { omitted?: Array<{ path: string; reason: string }> } | undefined
+  const leftOut = compiled?.omitted ?? []
   const rejected = detail.events.filter((event) => event.eventType === 'agent_run.context_rejected')
   const consumedPaths = new Set(consumed.map((item) => item.path))
-  const undeclared = consumed.filter((item) => !item.declared)
+  const undeclared = reported.filter((item) => !item.declared)
   const unread = detail.declaredContextPaths.filter((path) => !consumedPaths.has(path))
+  const truncated = injected.filter((item) => item.truncatedAt !== null)
+  const row = (item: typeof consumed[number]) => <div className={`local-context-row ${item.declared ? 'declared' : 'undeclared'}`} key={`${item.reportSource}-${item.tool}-${item.path}-${item.offset}-${item.limit}-${item.contentDigest}`}>
+    <strong>{item.path}{item.searchedDirectory ? '/' : ''}</strong>
+    <span className={`local-check-provenance ${item.declared ? 'pre_existing' : 'unverified'}`}>{item.declared ? '在声明内' : '未声明'}</span>
+    <code>{item.searchedDirectory ? '目录内容搜索' : item.contentDigest}</code>
+    <em>{item.reportSource === 'control_plane_injection' ? `平台注入 · ${item.truncatedAt === null ? '完整' : `截断至 ${item.truncatedAt} / ${item.fileBytes} 字节`}` : `${sourceLabel(item.reportSource)}${item.tool ? ` · ${item.tool}` : ''}${readRange(item)} · ${item.independentlyObserved ? '已独立观测' : '未独立观测'}`}</em>
+  </div>
   return (
     <>
       <button className="local-evidence-overlay" aria-label="关闭运行详情" onClick={onClose} />
       <aside className="local-evidence-drawer">
         <header><div><span className="eyebrow">上下文对账</span><h3>{detail.agentRun.id}</h3><p>Manifest 是声明，实际读取是事实，两者不一致本身就是审查信息。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭"><X size={15} /></button></header>
-        <div className={`local-evidence-digest ${undeclared.length || unread.length ? 'drift' : ''}`}>
-          {undeclared.length || unread.length ? <ShieldAlert size={15} /> : <ShieldCheck size={15} />}
+        <div className={`local-evidence-digest ${undeclared.length || unread.length || truncated.length ? 'drift' : ''}`}>
+          {undeclared.length || unread.length || truncated.length ? <ShieldAlert size={15} /> : <ShieldCheck size={15} />}
           <div>
-            <strong>声明 {detail.declaredContextPaths.length} · 实际读取 {consumed.length} · 未声明读取 {undeclared.length} · 声明未读 {unread.length} · 被拒绝 {rejected.length}</strong>
-            <small>读取记录来自 Agent 自述协议（detective，未被独立观测）；它能发现不一致，但不能阻止未声明读取。</small>
+            <strong>声明 {detail.declaredContextPaths.length} · 平台注入 {injected.length}{truncated.length ? `（截断 ${truncated.length}）` : ''} · Builder 上报 {reported.length} · 未声明读取 {undeclared.length} · 未进入提示词 {unread.length} · 被拒绝 {rejected.length}</strong>
+            <small>平台注入的内容由控制面从 base {detail.agentRun.baseSha.slice(0, 12)} 读取并写进提示词，是独立记录的事实；Builder 上报的读取来自它自己的协议输出，未被独立观测，能发现不一致，但不能阻止未声明读取。</small>
           </div>
         </div>
-        <section><span>实际读取</span>{consumed.length ? <div className="local-context-rows">{consumed.map((item) => <div className={`local-context-row ${item.declared ? 'declared' : 'undeclared'}`} key={`${item.path}-${item.contentDigest}`}>
-          <strong>{item.path}</strong>
-          <span className={`local-check-provenance ${item.declared ? 'pre_existing' : 'unverified'}`}>{item.declared ? '在声明内' : '未声明'}</span>
-          <code>{item.contentDigest}</code>
-          <em>{item.reportSource} · {item.independentlyObserved ? '已独立观测' : '未独立观测'}</em>
-        </div>)}</div> : <p className="local-evidence-empty">这次运行没有上报任何读取；无法判断它到底看了什么。</p>}</section>
-        <section><span>声明但未读取</span>{unread.length ? <div className="local-context-rows">{unread.map((path) => <div className="local-context-row unread" key={path}><strong>{path}</strong><span className="local-check-provenance all_tests">未读取</span></div>)}</div> : <small>声明的路径都被读取了。</small>}</section>
+        <section><span>平台注入</span>{injected.length ? <div className="local-context-rows">{injected.map(row)}</div> : <p className="local-evidence-empty">这次运行没有平台注入记录（早于注入记录上线的 Run 只有 Builder 上报）。</p>}</section>
+        <section><span>Builder 上报的读取</span>{reported.length ? <div className="local-context-rows">{reported.map(row)}</div> : <small>Builder 没有上报额外读取。</small>}</section>
+        <section><span>声明但未进入提示词</span>{unread.length ? <div className="local-context-rows">{unread.map((path) => { const reason = leftOut.find((item) => item.path === path)?.reason; return <div className="local-context-row unread" key={path}><strong>{path}</strong><span className="local-check-provenance all_tests">{reason === 'budget' ? '超出预算' : reason === 'missing' ? 'base 中不存在' : '未读取'}</span></div> })}</div> : <small>声明的路径都进入了提示词。</small>}</section>
         {rejected.length > 0 && <section><span>被拒绝的读取</span><div className="local-context-rows">{rejected.map((event) => <div className="local-context-row rejected" key={event.id}><strong>{String(event.payload.reportedPath ?? '')}</strong><span className="local-check-provenance unverified">{String(event.payload.reason ?? 'rejected')}</span></div>)}</div></section>}
         <section><span>Run</span><div className="local-evidence-runtime"><code>{detail.agentRun.adapterId} · {detail.agentRun.status}</code><small>{detail.agentRun.isolation} · {detail.agentRun.networkEgress} egress · base {detail.agentRun.baseSha.slice(0, 12)} · {detail.events.length} 条事件</small></div></section>
       </aside>
@@ -2864,13 +2887,15 @@ function LocalIntentDrawer({ workItemId, projectType, onClose, approval }: { wor
             <section className="intent-section"><span className="intent-label">业务目标</span><p className="intent-goal">{intent?.goal ?? workItem.description}</p></section>
             <section className="intent-section"><span className="intent-label">成功结果 · 关键验收标准</span>{criteria.some((criterion) => criterion.criticality === 'critical') ? <div className="outcome-list">{criteria.filter((criterion) => criterion.criticality === 'critical').map((criterion) => <div key={criterion.id}><Check size={13} /><span>{criterion.statement}</span></div>)}</div> : <p className="local-intent-empty">没有关键验收标准，这个 Intent 不会阻塞任何审批。</p>}</section>
             <section className="intent-section"><span className="intent-label">约束</span>{intent?.constraints.length ? <div className="constraint-tags">{intent.constraints.map((constraint) => <span key={constraint}>{constraint}</span>)}</div> : <p className="local-intent-empty">未声明约束</p>}</section>
+            {intent?.nonGoals?.length ? <section className="intent-section"><span className="intent-label">不做什么</span><div className="constraint-tags">{intent.nonGoals.map((item) => <span key={item}>{item}</span>)}</div></section> : null}
+            {intent?.examples?.length ? <section className="intent-section"><span className="intent-label">示例 · 只作说明，不是验收标准</span><div className="intent-examples">{intent.examples.map((example, index) => <div key={index}><em>输入</em><pre>{example.input}</pre><em>期望</em><pre>{example.expected}</pre></div>)}</div></section> : null}
             <section className="intent-section"><div className="section-heading"><h3>未决问题</h3><span>{unknowns.length}</span></div>{unknowns.length ? <div className="unknown-list">{unknowns.map((unknown) => <div key={unknown}><span>?</span><p>{unknown}</p></div>)}</div> : <p className="local-intent-empty">起草检查没有发现问题。</p>}</section>
             {intent && projectType && workItem.productType !== projectType && <section className="intent-readiness local-intent-type-mismatch"><div><ShieldAlert size={16} /><span><strong>类型和项目不一致，无法启动 Run</strong><small>这个 Intent 是{workItem.productType === 'agent_system' ? ' Agent System' : ' App'}，项目的 .aperture/project.json 声明的是{projectType === 'agent_system' ? ' Agent System' : ' App'}。重建会按项目类型复制目标、约束和验收标准，生成一个新的 Intent；{intent.riskLevel === 'low' ? '低风险会自动批准' : '新 Intent 需要重新批准'}，原 Intent 保留不动。</small></span></div>
               <button className="secondary-button" disabled={rebuilding} onClick={() => void (async () => {
                 setRebuilding(true)
                 setRebuildError(undefined)
                 try {
-                  await local.createIntentBundle({ title: workItem.title, description: workItem.description, productType: projectType, goal: intent.goal, constraints: intent.constraints, riskLevel: intent.riskLevel, acceptanceCriteria: intent.acceptanceCriteria.map(({ statement, criticality, verificationType, verifiedBy }) => ({ statement, criticality, verificationType, ...(verifiedBy?.length ? { verifiedBy } : {}) })) })
+                  await local.createIntentBundle({ title: workItem.title, description: workItem.description, productType: projectType, goal: intent.goal, constraints: intent.constraints, nonGoals: intent.nonGoals, examples: intent.examples, riskLevel: intent.riskLevel, acceptanceCriteria: intent.acceptanceCriteria.map(({ statement, criticality, verificationType, verifiedBy }) => ({ statement, criticality, verificationType, ...(verifiedBy?.length ? { verifiedBy } : {}) })) })
                   onClose()
                 } catch (caught) {
                   setRebuildError(caught instanceof Error ? caught.message : String(caught))
