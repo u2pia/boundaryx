@@ -317,6 +317,13 @@ try {
   assert.ok((integrity.body?.integrity.eventCount ?? 0) > 0)
   assert.match(integrity.body!.integrity.chainHead, /^sha256:[0-9a-f]{64}$/u)
   assert.deepEqual(integrity.body?.integrity.faults, [])
+  assert.equal((await request('/api/trust-profile')).status, 401)
+  const trustProfile = await request<{ trustProfile: { level: string; capabilities: { governedHumanDecisions: boolean; productionEligibleAgentExecution: boolean }; controls: Array<{ id: string; status: string }> } }>('/api/trust-profile', { cookie: ownerCookie })
+  assert.equal(trustProfile.status, 200)
+  assert.equal(trustProfile.body?.trustProfile.level, 'local_exploration')
+  assert.equal(trustProfile.body?.trustProfile.capabilities.governedHumanDecisions, false)
+  assert.equal(trustProfile.body?.trustProfile.capabilities.productionEligibleAgentExecution, false)
+  assert.equal(trustProfile.body?.trustProfile.controls.find((control) => control.id === 'core_integrity')?.status, 'pass')
 
   const firstFailedLogin = await request<{ error: { code: string } }>('/api/auth/login', { body: { username: 'reviewer', password: 'wrong-reviewer-password' } })
   assert.equal(firstFailedLogin.status, 401)

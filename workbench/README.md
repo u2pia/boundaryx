@@ -116,6 +116,8 @@ npm run server:start
 
 全库可信性检查使用 `CONTROL_PLANE_DATA_DIR=.aperture-live npm run audit:verify`。它不仅验证所有 Event Chain 和 Seal，还会把 Actor、Intent、Proposal Revision、Check、Evidence、Review、Merge 与 Release 的当前状态和对应事件重新对账，并输出 JSON / Markdown 报告。存在 `critical` Finding 时命令失败；完整检查范围和不可证明的边界见 `../docs/CORE_INTEGRITY_AUDIT.md`。
 
+环境信任上限使用 `CONTROL_PLANE_DATA_DIR=.aperture-live npm run trust:report` 计算，也可由已登录成员读取 `GET /api/trust-profile`。等级只能由 Core Integrity、Identity、HTTPS / Cookie、Event Seal Key 和 Agent Runtime 事实推导，不能手工选择；`release_qualified` 只表示环境可以承载生产资格审查，不批准任何具体 Change。合同见 `../docs/TRUST_PROFILE.md`。
+
 ## Agent Runner 启动
 
 推荐只配置一个入口 `scripts/agents/builder.mjs`，执行引擎由集成页保存的 LLM Provider 在每次 Run 时自动选择，切换模型无需重启服务：

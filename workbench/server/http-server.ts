@@ -18,6 +18,7 @@ import { generateIntentDraft, maximumBriefLength, projectDraftingContext } from 
 import { independentTestSignalFromCriteria } from './criteria-coverage.ts'
 import { agentRunProgress } from './run-progress.ts'
 import { createSessionToken } from './security.ts'
+import { trustProfileForControlPlane } from './trust-profile.ts'
 import { AppError, type AgentRunner, type AgentRunnerDescriptor, type CodeHostKind, type MergeMode, type ProjectRole, type SessionActor, type TeamRole } from './types.ts'
 
 const SESSION_COOKIE = 'aperture_session'
@@ -159,7 +160,7 @@ function serveStatic(response: ServerResponse, staticDirectory: string, pathname
   return true
 }
 
-export function createControlPlaneRequestHandler(input: { database: ControlPlaneDatabase; staticDirectory?: string; agentRunner?: AgentRunner; agentRunQueue?: AgentRunQueue; agentRuntimeDescriptor?: AgentRunnerDescriptor; evidenceStore?: LocalEvidenceStore; githubOAuth?: GithubOAuthConfig; codeHostSyncer?: CodeHostSyncer; secureCookies?: boolean; loginProtection?: LoginProtectionOptions }) {
+export function createControlPlaneRequestHandler(input: { database: ControlPlaneDatabase; staticDirectory?: string; agentRunner?: AgentRunner; agentRunQueue?: AgentRunQueue; agentRuntimeDescriptor?: AgentRunnerDescriptor; evidenceStore?: LocalEvidenceStore; githubOAuth?: GithubOAuthConfig; codeHostSyncer?: CodeHostSyncer; secureCookies?: boolean; host?: string; loginProtection?: LoginProtectionOptions }) {
   const { database, staticDirectory, agentRunner, agentRunQueue } = input
   const secureCookies = input.secureCookies ?? false
   const loginThrottle = new LoginThrottle(input.loginProtection)
@@ -278,6 +279,12 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
       if (method === 'GET' && path === '/api/session') {
         const { actor } = requireActor(database, request)
         return sendJson(response, 200, { actor: sessionView(actor), identityMode: database.getIdentityMode() })
+      }
+
+      if (method === 'GET' && path === '/api/trust-profile') {
+        requireActor(database, request)
+        const trustProfile = trustProfileForControlPlane({ database, evidenceDirectory: input.evidenceStore?.root, runtime: agentRuntimeDescriptor, secureCookies, host: input.host })
+        return sendJson(response, 200, { trustProfile })
       }
 
       if (!path.startsWith('/api/') && (method === 'GET' || method === 'HEAD') && staticDirectory && serveStatic(response, staticDirectory, path, method === 'HEAD')) return

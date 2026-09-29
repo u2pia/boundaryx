@@ -38,7 +38,7 @@ const githubOAuth = githubOAuthConfigFromEnv(process.env, `http://127.0.0.1:${po
 const codeHostSyncer = new CodeHostSyncer({ database, publicUrl })
 const codeHostSyncSeconds = Number(process.env.CONTROL_PLANE_CODE_HOST_SYNC_SECONDS ?? 30)
 codeHostSyncer.start(codeHostSyncSeconds)
-const server = createControlPlaneServer({ database, staticDirectory: resolve(workbenchDirectory, 'dist'), agentRunner: configuredAgent.runner, agentRunQueue, agentRuntimeDescriptor: configuredAgent.descriptor, evidenceStore: configuredAgent.evidenceStore, githubOAuth, codeHostSyncer, secureCookies })
+const server = createControlPlaneServer({ database, staticDirectory: resolve(workbenchDirectory, 'dist'), agentRunner: configuredAgent.runner, agentRunQueue, agentRuntimeDescriptor: configuredAgent.descriptor, evidenceStore: configuredAgent.evidenceStore, githubOAuth, codeHostSyncer, secureCookies, host })
 
 server.listen(port, host, () => {
   console.log(`${new Date().toISOString()} Local Control Plane listening on http://${host}:${port}`)

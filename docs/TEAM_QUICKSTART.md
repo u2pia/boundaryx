@@ -106,3 +106,4 @@
 5. 在「集成」页确认 LLM Provider 可用，先自己跑通一条低风险需求。
 6. 每天运行 `CONTROL_PLANE_DATA_DIR=.aperture-live npm run backup:create -- <备份目录>`；它会创建一致快照并验证 Event Log、Evidence 与 Holdout。外置 Event Seal Key 和项目 Git 仓库要分开备份。每月至少按 `docs/BACKUP_RECOVERY.md` 恢复到新目录演练一次。
 7. 高风险发布前运行 `CONTROL_PLANE_DATA_DIR=.aperture-live npm run audit:verify`。出现 `critical` 时不要发布；先按 `docs/CORE_INTEGRITY_AUDIT.md` 定位状态、事件或证据不一致。
+8. 运行 `CONTROL_PLANE_DATA_DIR=.aperture-live npm run trust:report` 确认当前仍处于 `local_exploration`、`team_governed` 或 `release_qualified`。该等级是环境能力上限，不代替具体 Change 的审批。
