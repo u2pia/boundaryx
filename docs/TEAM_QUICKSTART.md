@@ -105,3 +105,4 @@
 4. 在仓库里提交 `.aperture/project.json`，写明 `productType`（`application` 或 `agent_system`）和测试命令。项目下所有 Intent 的类型都取自这里；没提交它之前，项目里建不了 Intent。如果有现成测试，用 `testPaths` 声明测试目录，这样能避开「仅自带测试」的卡点。格式见 `workbench/README.md` 的「Project Manifest」一节。
 5. 在「集成」页确认 LLM Provider 可用，先自己跑通一条低风险需求。
 6. 每天运行 `CONTROL_PLANE_DATA_DIR=.aperture-live npm run backup:create -- <备份目录>`；它会创建一致快照并验证 Event Log、Evidence 与 Holdout。外置 Event Seal Key 和项目 Git 仓库要分开备份。每月至少按 `docs/BACKUP_RECOVERY.md` 恢复到新目录演练一次。
+7. 高风险发布前运行 `CONTROL_PLANE_DATA_DIR=.aperture-live npm run audit:verify`。出现 `critical` 时不要发布；先按 `docs/CORE_INTEGRITY_AUDIT.md` 定位状态、事件或证据不一致。

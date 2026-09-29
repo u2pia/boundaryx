@@ -25,9 +25,9 @@ export type StoredEvidencePackage = {
 export class LocalEvidenceStore {
   readonly root: string
 
-  constructor(root: string) {
+  constructor(root: string, options: { create?: boolean } = {}) {
     this.root = resolve(root)
-    mkdirSync(this.root, { recursive: true })
+    if (options.create ?? true) mkdirSync(this.root, { recursive: true })
   }
 
   write(input: Omit<StoredEvidencePackage, 'packageDigest'>) {

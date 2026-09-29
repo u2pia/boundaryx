@@ -114,6 +114,8 @@ npm run server:start
 
 控制面备份使用 `npm run backup:create -- <目标目录>`，验证使用 `npm run backup:verify -- <备份目录>`，恢复到新数据目录使用 `npm run backup:restore -- <备份目录> <新数据目录>`。它会验证 SQLite、Event Log Seal、Evidence 和 Holdout，不包含项目 Git 仓库、GitHub 镜像或临时 Agent Worktree；外置和 retired Event Seal Key 必须另行保管。完整边界与恢复演练见 `../docs/BACKUP_RECOVERY.md`。
 
+全库可信性检查使用 `CONTROL_PLANE_DATA_DIR=.aperture-live npm run audit:verify`。它不仅验证所有 Event Chain 和 Seal，还会把 Actor、Intent、Proposal Revision、Check、Evidence、Review、Merge 与 Release 的当前状态和对应事件重新对账，并输出 JSON / Markdown 报告。存在 `critical` Finding 时命令失败；完整检查范围和不可证明的边界见 `../docs/CORE_INTEGRITY_AUDIT.md`。
+
 ## Agent Runner 启动
 
 推荐只配置一个入口 `scripts/agents/builder.mjs`，执行引擎由集成页保存的 LLM Provider 在每次 Run 时自动选择，切换模型无需重启服务：

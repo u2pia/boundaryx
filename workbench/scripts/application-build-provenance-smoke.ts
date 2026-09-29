@@ -11,6 +11,7 @@ import { LocalEvidenceStore } from '../server/local-evidence-store.ts'
 import { LocalGitAuthority } from '../server/local-git-authority.ts'
 import { LocalReleaseAuthority, releaseArtifactEvidence } from '../server/local-release-authority.ts'
 import { LocalRunPostprocessor } from '../server/local-run-postprocessor.ts'
+import { auditCoreIntegrity } from '../server/core-integrity-auditor.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'aperture-application-build-'))
 const repositoryPath = join(root, 'repository')
@@ -93,6 +94,8 @@ try {
   const approvedCandidate = database.approveReleaseCandidate(candidate.id, releaseApprover.id, 'Artifact binding and merged source verified.')
   assert.equal(approvedCandidate.status, 'approved')
   assert.equal(approvedCandidate.approval?.candidateContentDigest, candidate.contentDigest)
+  const integrity = auditCoreIntegrity({ database, evidenceDirectory: evidenceStore.root, env: { CONTROL_PLANE_HOST: '127.0.0.1' } })
+  assert.equal(integrity.valid, true, integrity.findings.filter((finding) => finding.severity === 'critical').map((finding) => `${finding.code}: ${finding.message}`).join('\n'))
 
   console.log(`application build provenance smoke passed · ${ready.run.id} · artifact bound through approved release candidate · missing output blocked`)
 } finally {

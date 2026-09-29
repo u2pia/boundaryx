@@ -3,6 +3,7 @@ import { copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, r
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { ControlPlaneDatabase } from './database.ts'
+import { auditCoreIntegrity } from './core-integrity-auditor.ts'
 import { COLOCATED_SEAL_KEY_FILE, loadEventSealKeyring } from './event-seal.ts'
 import { LocalEvidenceStore } from './local-evidence-store.ts'
 import { sha256 } from './security.ts'
@@ -207,6 +208,8 @@ export function verifyControlPlaneBackup(input: { backupDirectory: string; migra
         if (database.readEvaluationHoldout(event.aggregate_id, digest) !== undefined) verifiedHoldouts += 1
         else faults.push(`holdout ${event.aggregate_id}/${digest} is missing or has the wrong digest`)
       }
+      const coreAudit = auditCoreIntegrity({ database, evidenceDirectory: join(temporaryRoot, 'evidence'), env: input.env })
+      for (const finding of coreAudit.findings.filter((item) => item.severity === 'critical')) faults.push(`core integrity ${finding.code}: ${finding.message}`)
     } finally {
       database.close()
     }

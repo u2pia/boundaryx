@@ -15,6 +15,7 @@ CONTROL_PLANE_DATA_DIR=.aperture-live npm run backup:create -- ../output/backups
 - SQLite `quick_check`；
 - 数据库能迁移到当前程序支持的版本；
 - 每个 Event Log 聚合的 Digest 与 HMAC Seal；
+- Actor、Intent、Proposal、Review、Merge 与 Release 的关键状态和事件绑定；
 - 数据库引用的本地 Evidence Package Digest；
 - 已登记 Holdout 的内容 Digest；
 - 备份中每个文件的大小与 SHA-256。

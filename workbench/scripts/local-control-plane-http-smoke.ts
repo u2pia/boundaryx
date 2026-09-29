@@ -287,7 +287,7 @@ try {
   assert.deepEqual(injected.map((event) => [event.payload.path, event.payload.independentlyObserved, event.payload.truncatedAt, event.payload.contentDigest]), [['README.md', true, null, `sha256:${sha256('# HTTP Authority\n')}`]])
   assert.equal(consumedContext.filter((event) => event.payload.reportSource !== 'control_plane_injection').every((event) => event.payload.independentlyObserved === false && event.payload.reportSource === 'agent_protocol'), true)
   assert.equal(consumedContext.some((event) => event.payload.path === 'README.md' && event.payload.declared === true), true)
-  const generatedProposal = (await request<{ changeProposal: { id: string; headSha: string } }>(`/api/change-proposals/${agentRunResponse.body!.agentRun.changeProposalId}`, { cookie: authorCookie })).body!.changeProposal
+  const generatedProposal = (await request<{ changeProposal: { id: string; baseSha: string; headSha: string } }>(`/api/change-proposals/${agentRunResponse.body!.agentRun.changeProposalId}`, { cookie: authorCookie })).body!.changeProposal
   const revisionRequested = await request(`/api/change-proposals/${generatedProposal.id}/reviews`, { cookie: reviewerLogin.cookie!, body: { headSha: generatedProposal.headSha, decision: 'changes_requested', comment: 'Run the Builder again and update generated.ts.' } })
   assert.equal(revisionRequested.status, 201)
   const revisedRun = await request<{ agentRun: { id: string; status: string; changeProposalId: string; revisionOfProposalId: string; startSha: string } }>(`/api/change-proposals/${generatedProposal.id}/revise`, { cookie: authorCookie, body: {} })
@@ -299,11 +299,13 @@ try {
   // The revision starts from the previous head, where the last Builder rewrote README.md; it is given the reviewed one.
   assert.equal(git('show', `${generatedProposal.headSha}:README.md`), '# Rewritten by an unreviewed Builder')
   assert.equal(git('show', `${database.getAgentRun(revisedRun.body!.agentRun.id).branchRef}:injected.txt`), '# HTTP Authority')
-  const revisedDetail = await request<{ changeProposal: { status: string; headSha: string; runId: string }; events: Array<{ eventType: string }> }>(`/api/change-proposals/${generatedProposal.id}`, { cookie: authorCookie })
+  const revisedDetail = await request<{ changeProposal: { status: string; baseSha: string; headSha: string; runId: string }; events: Array<{ eventType: string; payload: Record<string, unknown> }> }>(`/api/change-proposals/${generatedProposal.id}`, { cookie: authorCookie })
   assert.equal(revisedDetail.body?.changeProposal.status, 'review_ready')
   assert.equal(revisedDetail.body?.changeProposal.runId, revisedRun.body?.agentRun.id)
   assert.notEqual(revisedDetail.body?.changeProposal.headSha, generatedProposal.headSha)
-  assert.equal(revisedDetail.body?.events.some((event) => event.eventType === 'change_proposal.revision_changed'), true)
+  const revisionEvent = revisedDetail.body?.events.findLast((event) => event.eventType === 'change_proposal.revision_changed')
+  assert.equal(revisionEvent?.payload.previousBaseSha, generatedProposal.baseSha)
+  assert.equal(revisionEvent?.payload.baseSha, revisedDetail.body?.changeProposal.baseSha)
 
   const session = await request<{ actor: { id: string } }>('/api/session', { cookie: ownerCookie })
   assert.equal(session.body?.actor.id, ownerId)
