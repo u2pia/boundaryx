@@ -33,6 +33,10 @@ export class LocalReleaseAuthority {
   }
 
   createReleaseCandidate(proposalId: string, actorId: string) {
+    return this.createReleaseCandidateResult(proposalId, actorId).releaseCandidate
+  }
+
+  createReleaseCandidateResult(proposalId: string, actorId: string) {
     const proposal = this.database.getChangeProposal(proposalId)
     if (proposal.status !== 'merged') throw new AppError(409, 'Release Candidate requires a merged change proposal', 'release_requires_merge')
     const mergeEvidence = this.database.getMergeEvidence(proposalId)
@@ -43,6 +47,8 @@ export class LocalReleaseAuthority {
       if (!hostMerge || hostMerge.contentCheck === 'mismatch') throw new AppError(409, 'The revision merged on the host does not contain the approved change', 'release_merge_evidence_mismatch')
       if (hostMerge.outsideGate) throw new AppError(409, `The host merged this proposal outside the gate (${hostMerge.outsideGateReasons.join('; ')}); it cannot be released`, 'release_merge_outside_gate')
     } else if (mergeEvidence.mergedSha !== proposal.headSha) throw new AppError(409, 'Merge Evidence does not match the proposal Head SHA', 'release_merge_evidence_mismatch')
+    const existing = this.database.findReleaseCandidate(proposalId, mergeEvidence.mergedSha)
+    if (existing) return { releaseCandidate: this.verifyReleaseCandidate(existing.id), changed: false }
     const commitSha = git(proposal.repositoryPath, ['rev-parse', '--verify', `${mergeEvidence.mergedSha}^{commit}`])
     const mergedTreeSha = git(proposal.repositoryPath, ['rev-parse', '--verify', `${commitSha}^{tree}`])
     const approvedTreeSha = git(proposal.repositoryPath, ['rev-parse', '--verify', `${mergeEvidence.approvedHeadSha}^{tree}`])
@@ -54,7 +60,7 @@ export class LocalReleaseAuthority {
     if (workItem.productType === 'application' && artifactEvidence.length === 0) throw new AppError(409, 'Application Release Candidate requires Build Artifact Evidence in Merge Evidence', 'release_application_artifact_missing')
     if (artifactEvidence.length && mergedTreeSha !== approvedTreeSha) throw new AppError(409, 'Merged source tree differs from the approved Head tree that produced the build artifacts', 'release_build_source_tree_mismatch')
     const artifactClass = artifactEvidence.length ? 'source_with_build_attestation' as const : 'source_snapshot' as const
-    return this.database.createReleaseCandidate({ proposalId, mergeEvidenceId: mergeEvidence.id, repositoryPath: proposal.repositoryPath, sourceRef: proposal.baseRef, commitSha, sourceTreeDigest, sourceFileCount, artifactClass, artifactEvidence }, actorId)
+    return { releaseCandidate: this.database.createReleaseCandidate({ proposalId, mergeEvidenceId: mergeEvidence.id, repositoryPath: proposal.repositoryPath, sourceRef: proposal.baseRef, commitSha, sourceTreeDigest, sourceFileCount, artifactClass, artifactEvidence }, actorId), changed: true }
   }
 
   verifyReleaseCandidate(candidateId: string) {

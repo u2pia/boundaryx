@@ -685,15 +685,17 @@ export class ControlPlaneDatabase {
    */
   approveIntentVersion(intentVersionId: string, actorId: string, comment = '') {
     const intent = this.getIntentVersion(intentVersionId)
+    const normalizedComment = comment.trim()
     this.assertDecisionActor(actorId, ['owner', 'maintainer', 'reviewer'], 'intent_approval_forbidden', this.getWorkItem(intent.workItemId).projectId)
     if (intent.createdBy === actorId) throw new AppError(403, 'The author of an Intent cannot approve it', 'self_intent_approval_forbidden')
     if (intent.status === 'superseded') throw new AppError(409, 'A newer Intent version exists; approve that one instead', 'intent_superseded')
+    if (intent.status === 'approved' && intent.approval?.basis === 'named_approval' && intent.approval.actorId === actorId && (intent.approval.comment ?? '') === normalizedComment) return intent
     if (intent.status === 'approved') throw new AppError(409, 'Intent version is already approved', 'intent_already_approved')
     const identity = this.decisionIdentity(actorId)
     return this.inTransaction(() => {
       const timestamp = nowIso()
-      this.db.prepare("UPDATE intent_versions SET status = 'approved', approved_by = ?, approved_at = ?, approval_basis = 'named_approval', approval_comment = ? WHERE id = ? AND status = 'draft'").run(actorId, timestamp, comment.trim() || null, intentVersionId)
-      this.appendEvent({ aggregateType: 'work_item', aggregateId: intent.workItemId, eventType: 'intent.approved', actorId, payload: { intentVersionId, contentDigest: intent.contentDigest, basis: 'named_approval', riskLevel: intent.riskLevel, comment: comment.trim(), identity } })
+      this.db.prepare("UPDATE intent_versions SET status = 'approved', approved_by = ?, approved_at = ?, approval_basis = 'named_approval', approval_comment = ? WHERE id = ? AND status = 'draft'").run(actorId, timestamp, normalizedComment || null, intentVersionId)
+      this.appendEvent({ aggregateType: 'work_item', aggregateId: intent.workItemId, eventType: 'intent.approved', actorId, payload: { intentVersionId, contentDigest: intent.contentDigest, basis: 'named_approval', riskLevel: intent.riskLevel, comment: normalizedComment, identity } })
       return this.getIntentVersion(intentVersionId)
     })
   }
@@ -762,9 +764,9 @@ export class ControlPlaneDatabase {
     const startedAt = nowIso()
     const run: AgentRun = { ...input, projectId: workItem.projectId, status: input.status ?? 'running', startedAt }
     return this.inTransaction(() => {
-      this.db.prepare('INSERT INTO agent_runs(id, project_id, work_item_id, intent_version_id, repository_path, base_ref, base_sha, start_sha, revision_of_proposal_id, branch_ref, worktree_path, adapter_id, isolation, runtime_image_ref, runtime_attestation_digest, network_egress, production_eligible, status, started_by_actor_id, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(run.id, run.projectId, run.workItemId, run.intentVersionId, run.repositoryPath, run.baseRef, run.baseSha, run.startSha, run.revisionOfProposalId ?? null, run.branchRef, run.worktreePath, run.adapterId, run.isolation, run.runtimeImageRef ?? null, run.runtimeAttestationDigest ?? null, run.networkEgress, run.productionEligible ? 1 : 0, run.status, run.startedByActorId, run.startedAt)
+      this.db.prepare('INSERT INTO agent_runs(id, project_id, work_item_id, intent_version_id, repository_path, base_ref, base_sha, start_sha, revision_of_proposal_id, branch_ref, worktree_path, adapter_id, isolation, runtime_image_ref, runtime_attestation_digest, network_egress, production_eligible, status, request_key, admission_request_digest, started_by_actor_id, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(run.id, run.projectId, run.workItemId, run.intentVersionId, run.repositoryPath, run.baseRef, run.baseSha, run.startSha, run.revisionOfProposalId ?? null, run.branchRef, run.worktreePath, run.adapterId, run.isolation, run.runtimeImageRef ?? null, run.runtimeAttestationDigest ?? null, run.networkEgress, run.productionEligible ? 1 : 0, run.status, run.requestKey ?? null, run.admissionRequestDigest ?? null, run.startedByActorId, run.startedAt)
       if (run.status === 'queued') this.db.prepare('UPDATE agent_runs SET queued_at = ? WHERE id = ?').run(startedAt, run.id)
-      this.appendEvent({ aggregateType: 'agent_run', aggregateId: run.id, eventType: run.status === 'queued' ? 'agent_run.queued' : 'agent_run.started', actorId: run.startedByActorId, payload: { workItemId: run.workItemId, intentVersionId: run.intentVersionId, repositoryPath: run.repositoryPath, baseRef: run.baseRef, baseSha: run.baseSha, startSha: run.startSha, revisionOfProposalId: run.revisionOfProposalId ?? null, branchRef: run.branchRef, worktreePath: run.worktreePath, adapterId: run.adapterId, isolation: run.isolation, runtimeImageRef: run.runtimeImageRef ?? null, runtimeAttestationDigest: run.runtimeAttestationDigest ?? null, networkEgress: run.networkEgress, productionEligible: run.productionEligible } })
+      this.appendEvent({ aggregateType: 'agent_run', aggregateId: run.id, eventType: run.status === 'queued' ? 'agent_run.queued' : 'agent_run.started', actorId: run.startedByActorId, payload: { workItemId: run.workItemId, intentVersionId: run.intentVersionId, repositoryPath: run.repositoryPath, baseRef: run.baseRef, baseSha: run.baseSha, startSha: run.startSha, revisionOfProposalId: run.revisionOfProposalId ?? null, branchRef: run.branchRef, worktreePath: run.worktreePath, adapterId: run.adapterId, isolation: run.isolation, runtimeImageRef: run.runtimeImageRef ?? null, runtimeAttestationDigest: run.runtimeAttestationDigest ?? null, networkEgress: run.networkEgress, productionEligible: run.productionEligible, requestKey: run.requestKey ?? null, admissionRequestDigest: run.admissionRequestDigest ?? null } })
       return run
     })
   }
@@ -783,6 +785,14 @@ export class ControlPlaneDatabase {
     const row = this.db.prepare('SELECT * FROM agent_run_plans WHERE agent_run_id = ?').get(runId) as Record<string, SqlValue> | undefined
     if (!row) throw new AppError(404, `Agent run ${runId} has no execution plan`, 'agent_run_plan_not_found')
     return { declaredContextPaths: parseJson<string[]>(String(row.declared_context_paths)), requestPath: String(row.request_path), timeoutMs: Number(row.timeout_ms) }
+  }
+
+  getAgentRunByRequestKey(actorId: string, requestKey: string, admissionRequestDigest: string) {
+    const row = this.db.prepare('SELECT * FROM agent_runs WHERE started_by_actor_id = ? AND request_key = ?').get(actorId, requestKey) as Record<string, SqlValue> | undefined
+    if (!row) return undefined
+    const run = this.mapAgentRun(row)
+    if (run.admissionRequestDigest !== admissionRequestDigest) throw new AppError(409, 'Idempotency-Key was already used for a different Agent Run request', 'idempotency_key_reused')
+    return run
   }
 
   /**
@@ -870,11 +880,44 @@ export class ControlPlaneDatabase {
   requestAgentRunCancellation(runId: string, actorId: string) {
     return this.inTransaction(() => {
       const current = this.getAgentRun(runId)
+      if (current.status === 'cancelled') return current
       if (current.status !== 'queued' && current.status !== 'running') throw new AppError(409, `Agent run ${runId} is already terminal`, 'agent_run_terminal')
       if (!this.isAgentRunCancellationRequested(runId)) {
         this.db.prepare('UPDATE agent_runs SET cancellation_requested_at = ?, cancellation_requested_by = ? WHERE id = ?').run(nowIso(), actorId, runId)
         this.appendEvent({ aggregateType: 'agent_run', aggregateId: runId, eventType: 'agent_run.cancellation_requested', actorId, payload: { previousStatus: current.status, workerPid: this.getAgentRunWorkerPid(runId) ?? null } })
       }
+      return this.getAgentRun(runId)
+    })
+  }
+
+  /** Cancels a queued run in one transaction so a restart cannot turn an accepted cancellation into `failed`. */
+  cancelQueuedAgentRun(runId: string, actorId: string) {
+    return this.inTransaction(() => {
+      const current = this.getAgentRun(runId)
+      if (current.status === 'cancelled') return current
+      if (current.status !== 'queued') throw new AppError(409, `Agent run ${runId} is not waiting in the queue`, 'agent_run_not_queued')
+      const timestamp = nowIso()
+      if (!current.cancellationRequestedAt) this.appendEvent({ aggregateType: 'agent_run', aggregateId: runId, eventType: 'agent_run.cancellation_requested', actorId, payload: { previousStatus: current.status, workerPid: null } })
+      this.db.prepare("UPDATE agent_runs SET status = 'cancelled', cancellation_requested_at = COALESCE(cancellation_requested_at, ?), cancellation_requested_by = COALESCE(cancellation_requested_by, ?), worker_pid = NULL, error_message = ?, completed_at = ? WHERE id = ?").run(timestamp, actorId, 'Agent run was cancelled before execution started', timestamp, runId)
+      this.appendEvent({ aggregateType: 'agent_run', aggregateId: runId, eventType: 'agent_run.cancelled', actorId, payload: { changeProposalId: null, exitCode: null, stdoutDigest: null, stderrDigest: null, errorMessage: 'Agent run was cancelled before execution started' } })
+      return this.getAgentRun(runId)
+    })
+  }
+
+  /** Atomically closes an orphaned queued/running run during startup recovery. */
+  reconcileAgentRunAfterWorkerLoss(runId: string) {
+    return this.inTransaction(() => {
+      const current = this.getAgentRun(runId)
+      if (current.status !== 'queued' && current.status !== 'running') return current
+      const cancellation = this.db.prepare('SELECT cancellation_requested_by FROM agent_runs WHERE id = ?').get(runId) as { cancellation_requested_by: string | null }
+      const cancelled = Boolean(current.cancellationRequestedAt)
+      const actorId = cancelled && cancellation.cancellation_requested_by ? cancellation.cancellation_requested_by : current.startedByActorId
+      const status = cancelled ? 'cancelled' as const : 'failed' as const
+      const errorMessage = cancelled ? 'Control Plane restarted after cancellation was requested; the worker process no longer exists' : 'Control Plane restarted while the run was in flight; the worker process no longer exists'
+      const completedAt = nowIso()
+      this.appendEvent({ aggregateType: 'agent_run', aggregateId: runId, eventType: 'agent_run.worker_lost', actorId, payload: { previousStatus: current.status, workerPid: current.workerPid ?? null, cancellationRequested: cancelled } })
+      this.db.prepare('UPDATE agent_runs SET status = ?, worker_pid = NULL, error_message = ?, completed_at = ? WHERE id = ?').run(status, errorMessage, completedAt, runId)
+      this.appendEvent({ aggregateType: 'agent_run', aggregateId: runId, eventType: `agent_run.${status}`, actorId, payload: { changeProposalId: null, exitCode: null, stdoutDigest: null, stderrDigest: null, errorMessage } })
       return this.getAgentRun(runId)
     })
   }
@@ -906,10 +949,18 @@ export class ControlPlaneDatabase {
 
   completeAgentRun(input: { runId: string; status: 'succeeded' | 'failed' | 'cancelled'; actorId: string; changeProposalId?: string; exitCode?: number; stdoutDigest?: string; stderrDigest?: string; errorMessage?: string }) {
     const current = this.getAgentRun(input.runId)
+    if (current.status === input.status) {
+      const matches = (input.changeProposalId === undefined || input.changeProposalId === current.changeProposalId)
+        && (input.exitCode === undefined || input.exitCode === current.exitCode)
+        && (input.stdoutDigest === undefined || input.stdoutDigest === current.stdoutDigest)
+        && (input.stderrDigest === undefined || input.stderrDigest === current.stderrDigest)
+        && (input.errorMessage === undefined || input.errorMessage === current.errorMessage)
+      if (matches) return current
+    }
     if (current.status !== 'running' && current.status !== 'queued') throw new AppError(409, `Agent run ${input.runId} is already terminal`, 'agent_run_terminal')
     const completedAt = nowIso()
     return this.inTransaction(() => {
-      this.db.prepare('UPDATE agent_runs SET status = ?, change_proposal_id = ?, exit_code = ?, stdout_digest = ?, stderr_digest = ?, error_message = ?, completed_at = ? WHERE id = ?').run(input.status, input.changeProposalId ?? null, input.exitCode ?? null, input.stdoutDigest ?? null, input.stderrDigest ?? null, input.errorMessage ?? null, completedAt, input.runId)
+      this.db.prepare('UPDATE agent_runs SET status = ?, worker_pid = NULL, change_proposal_id = ?, exit_code = ?, stdout_digest = ?, stderr_digest = ?, error_message = ?, completed_at = ? WHERE id = ?').run(input.status, input.changeProposalId ?? null, input.exitCode ?? null, input.stdoutDigest ?? null, input.stderrDigest ?? null, input.errorMessage ?? null, completedAt, input.runId)
       this.appendEvent({ aggregateType: 'agent_run', aggregateId: input.runId, eventType: `agent_run.${input.status}`, actorId: input.actorId, payload: { changeProposalId: input.changeProposalId ?? null, exitCode: input.exitCode ?? null, stdoutDigest: input.stdoutDigest ?? null, stderrDigest: input.stderrDigest ?? null, errorMessage: input.errorMessage ?? null } })
       return this.getAgentRun(input.runId)
     })
@@ -1087,6 +1138,11 @@ export class ControlPlaneDatabase {
     })
   }
 
+  findReleaseCandidate(proposalId: string, commitSha: string) {
+    const row = this.db.prepare('SELECT * FROM release_candidates WHERE change_proposal_id = ? AND commit_sha = ?').get(proposalId, commitSha) as Record<string, SqlValue> | undefined
+    return row ? this.verifyReleaseCandidate(this.mapReleaseCandidate(row)) : undefined
+  }
+
   getReleaseCandidate(candidateId: string) {
     const row = this.db.prepare('SELECT * FROM release_candidates WHERE id = ?').get(candidateId) as Record<string, SqlValue> | undefined
     if (!row) throw new AppError(404, `Release Candidate ${candidateId} not found`, 'release_candidate_not_found')
@@ -1100,7 +1156,9 @@ export class ControlPlaneDatabase {
 
   approveReleaseCandidate(candidateId: string, approverActorId: string, comment: string) {
     const candidate = this.getReleaseCandidate(candidateId)
-    if (candidate.status === 'approved') return candidate
+    const normalizedComment = comment.trim()
+    if (candidate.status === 'approved' && candidate.approval?.approverActorId === approverActorId && candidate.approval.comment === normalizedComment) return candidate
+    if (candidate.status === 'approved') throw new AppError(409, 'Release Candidate is already approved by a different decision', 'release_already_approved')
     if (candidate.status !== 'review_ready') throw new AppError(409, 'Release Candidate is not ready for approval', 'release_not_review_ready')
     if (candidate.createdByActorId === approverActorId) throw new AppError(403, 'Release Candidate creators cannot approve their own candidate', 'release_self_approval_forbidden')
     this.requireProjectRole(approverActorId, candidate.projectId, ['owner', 'maintainer'], 'release_approval_forbidden')
@@ -1108,9 +1166,9 @@ export class ControlPlaneDatabase {
     const timestamp = nowIso()
     const approvalId = id('RAP')
     return this.inTransaction(() => {
-      this.db.prepare('INSERT INTO release_approvals(id, release_candidate_id, approver_actor_id, comment, candidate_content_digest, approved_at) VALUES (?, ?, ?, ?, ?, ?)').run(approvalId, candidateId, approverActorId, comment.trim(), candidate.contentDigest, timestamp)
+      this.db.prepare('INSERT INTO release_approvals(id, release_candidate_id, approver_actor_id, comment, candidate_content_digest, approved_at) VALUES (?, ?, ?, ?, ?, ?)').run(approvalId, candidateId, approverActorId, normalizedComment, candidate.contentDigest, timestamp)
       this.db.prepare("UPDATE release_candidates SET status = 'approved', approved_at = ? WHERE id = ?").run(timestamp, candidateId)
-      this.appendEvent({ aggregateType: 'release_candidate', aggregateId: candidateId, eventType: 'release_candidate.approved', actorId: approverActorId, payload: { approvalId, commitSha: candidate.commitSha, sourceTreeDigest: candidate.sourceTreeDigest, candidateContentDigest: candidate.contentDigest, comment: comment.trim(), identity } })
+      this.appendEvent({ aggregateType: 'release_candidate', aggregateId: candidateId, eventType: 'release_candidate.approved', actorId: approverActorId, payload: { approvalId, commitSha: candidate.commitSha, sourceTreeDigest: candidate.sourceTreeDigest, candidateContentDigest: candidate.contentDigest, comment: normalizedComment, identity } })
       return this.getReleaseCandidate(candidateId)
     })
   }
@@ -1207,6 +1265,9 @@ export class ControlPlaneDatabase {
     // assignee, and taking the review over is a reassignment that leaves a record, not a quiet approval.
     const assignment = this.activeAssignment(input.proposalId)
     if (assignment && input.decision !== 'commented' && assignment.assigneeActorId !== input.reviewerActorId) throw new AppError(403, `Review is assigned to ${assignment.assigneeDisplayName}; reassign it before deciding`, 'review_not_assigned')
+    const normalizedComment = input.comment.trim()
+    const matching = this.findMatchingActiveReview({ ...input, comment: normalizedComment })
+    if (matching) return matching
     const readiness = this.getReviewReadiness(input.proposalId)
     const intent = this.getIntentVersion(proposal.intentVersionId)
     const evidenceViewed = readiness.evidence.length > 0 && readiness.evidence.every((evidence) => Number((this.db.prepare('SELECT COUNT(*) AS count FROM evidence_views WHERE evidence_id = ? AND reviewer_actor_id = ? AND viewed_sha256 = ?').get(evidence.id, input.reviewerActorId, evidence.sha256) as { count: number }).count) > 0)
@@ -1218,21 +1279,21 @@ export class ControlPlaneDatabase {
     // Human-verified criteria are evidenced by this approval, so the reviewer signs each one by name: a blanket "ok"
     // under three human criteria says nothing about which of them was actually judged.
     const humanCriteria = readiness.criteria.filter((item) => item.verificationType === 'human' && item.criticality === 'critical')
-    const unsignedHumanCriteria = humanCriteria.filter((item) => !mentionsCriterion(input.comment, item.label))
+    const unsignedHumanCriteria = humanCriteria.filter((item) => !mentionsCriterion(normalizedComment, item.label))
     if (input.decision === 'approved' && unsignedHumanCriteria.length) throw new AppError(409, `Approving signs off human-verified criteria; the comment must name ${unsignedHumanCriteria.map((item) => item.label).join(', ')} and record the judgement on each`, 'review_human_criteria_unsigned')
     // A criterion whose only independent evidence is the old tests still passing, in a run that changed the tests, is
     // otherwise proven only by tests the run wrote: the approver confirms by name that they read those tests.
-    const unconfirmedTestCriteria = readiness.criteria.filter((item) => item.criticality === 'critical' && item.status === 'needs_test_review' && !mentionsCriterion(input.comment, item.label))
+    const unconfirmedTestCriteria = readiness.criteria.filter((item) => item.criticality === 'critical' && item.status === 'needs_test_review' && !mentionsCriterion(normalizedComment, item.label))
     if (input.decision === 'approved' && unconfirmedTestCriteria.length) throw new AppError(409, `${unconfirmedTestCriteria.map((item) => item.label).join(', ')} rest only on tests this run wrote (the base revision's tests still pass, which does not show they exercise the criterion); read those tests and name each criterion in the comment to confirm it`, 'review_agent_tests_unconfirmed')
     // DOMAIN_MODEL.md §9.1.1: a change to the files that govern runs goes through a stricter approval. Only an owner
     // may accept it, and the comment has to say so — the checks on this head ran under the base manifest, so nothing
     // in the evidence speaks to whether the new rules are acceptable.
     const policyFiles = readiness.policyFiles ?? []
     if (input.decision === 'approved' && policyFiles.length && reviewerRole !== 'owner') throw new AppError(403, `This change modifies policy files (${policyFiles.join(', ')}); only an owner can approve it`, 'review_policy_change_requires_owner')
-    if (input.decision === 'approved' && policyFiles.length && !input.comment.trim()) throw new AppError(409, `This change modifies policy files (${policyFiles.join(', ')}); the approval comment must record why the new rules are acceptable`, 'review_policy_change_unacknowledged')
+    if (input.decision === 'approved' && policyFiles.length && !normalizedComment) throw new AppError(409, `This change modifies policy files (${policyFiles.join(', ')}); the approval comment must record why the new rules are acceptable`, 'review_policy_change_unacknowledged')
     // A Builder stopped at its budget handed over whatever it had; the checks say what works, not what is missing, so
     // the reviewer has to say why the change is acceptable as it stands.
-    if (input.decision === 'approved' && readiness.builderStop && !input.comment.trim()) throw new AppError(409, `The Builder was stopped at its ${readiness.builderStop.reason === 'time_budget' ? 'time' : 'step'} budget, so this change may be partial; the approval comment must record why it is acceptable as it stands`, 'review_partial_change_unacknowledged')
+    if (input.decision === 'approved' && readiness.builderStop && !normalizedComment) throw new AppError(409, `The Builder was stopped at its ${readiness.builderStop.reason === 'time_budget' ? 'time' : 'step'} budget, so this change may be partial; the approval comment must record why it is acceptable as it stands`, 'review_partial_change_unacknowledged')
     if (input.decision === 'approved' && intent.riskLevel !== 'low' && readiness.status !== 'ready') throw new AppError(409, 'Medium and high risk changes require complete checks and evidence', 'review_evidence_incomplete')
     if (input.decision === 'approved' && intent.riskLevel !== 'low' && !evidenceViewed) throw new AppError(409, 'Reviewer must view the current evidence package before approval', 'review_evidence_not_viewed')
     // A comment decides nothing, so it is open to any session; the two terminal decisions carry a frozen identity.
@@ -1242,7 +1303,7 @@ export class ControlPlaneDatabase {
     const decisionLatencySeconds = Math.max(0, Math.floor((Date.parse(timestamp) - Date.parse(proposal.reviewCycleStartedAt)) / 1000))
     return this.inTransaction(() => {
       const superseded = Number(this.db.prepare('UPDATE review_decisions SET invalidated_at = ? WHERE change_proposal_id = ? AND head_sha = ? AND reviewer_actor_id = ? AND invalidated_at IS NULL').run(timestamp, input.proposalId, input.headSha, input.reviewerActorId).changes)
-      this.db.prepare('INSERT INTO review_decisions(id, change_proposal_id, head_sha, reviewer_actor_id, decision, comment, decision_latency_seconds, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(reviewId, input.proposalId, input.headSha, input.reviewerActorId, input.decision, input.comment.trim(), decisionLatencySeconds, timestamp)
+      this.db.prepare('INSERT INTO review_decisions(id, change_proposal_id, head_sha, reviewer_actor_id, decision, comment, decision_latency_seconds, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(reviewId, input.proposalId, input.headSha, input.reviewerActorId, input.decision, normalizedComment, decisionLatencySeconds, timestamp)
       const activeDecisions = (this.db.prepare('SELECT decision FROM review_decisions WHERE change_proposal_id = ? AND head_sha = ? AND invalidated_at IS NULL').all(input.proposalId, input.headSha) as Array<{ decision: ReviewDecision }>).map((row) => row.decision)
       const status = activeDecisions.includes('changes_requested') ? 'changes_requested' : activeDecisions.includes('approved') ? 'approved' : 'review_ready'
       this.db.prepare('UPDATE change_proposals SET status = ?, updated_at = ? WHERE id = ?').run(status, timestamp, input.proposalId)
@@ -1251,9 +1312,15 @@ export class ControlPlaneDatabase {
       // An approval by someone who never opened the evidence is the direct observable of a rubber stamp; it is allowed
       // on the low risk light path but always flagged.
       const evidenceOpenedBeforeDecision = assignment ? Boolean(assignment.evidenceOpenedAt) : evidenceViewed
-      this.appendEvent({ aggregateType: 'change_proposal', aggregateId: input.proposalId, eventType: `review.${input.decision}`, actorId: input.reviewerActorId, payload: { reviewId, headSha: input.headSha, comment: input.comment.trim(), decisionLatencySeconds, supersededDecisionCount: superseded, resultingStatus: status, riskLevel: intent.riskLevel, evidenceReadiness: readiness.status, evidenceViewed, checkIds: readiness.checks.map((check) => check.id), evidenceIds: readiness.evidence.map((evidence) => evidence.id), blockers: readiness.blockers, criteria: readiness.criteria.map((item) => ({ criterionId: item.criterionId, status: item.status, overrideDecisionId: item.override?.decisionId ?? null })), waivedCheckCount: readiness.waivedCheckCount, humanCriteriaSignedOff: input.decision === 'approved' ? humanCriteria.map((item) => item.criterionId) : [], policyFilesAcknowledged: input.decision === 'approved' ? policyFiles : [], partialChangeAcknowledged: input.decision === 'approved' && readiness.builderStop ? readiness.builderStop.runId : null, assignmentId: decidesAssignment ? assignment.id : null, evidenceOpenedBeforeDecision, unopenedApproval: input.decision === 'approved' && !evidenceOpenedBeforeDecision, identity } })
-      return { id: reviewId, ...input, decisionLatencySeconds, createdAt: timestamp }
+      this.appendEvent({ aggregateType: 'change_proposal', aggregateId: input.proposalId, eventType: `review.${input.decision}`, actorId: input.reviewerActorId, payload: { reviewId, headSha: input.headSha, comment: normalizedComment, decisionLatencySeconds, supersededDecisionCount: superseded, resultingStatus: status, riskLevel: intent.riskLevel, evidenceReadiness: readiness.status, evidenceViewed, checkIds: readiness.checks.map((check) => check.id), evidenceIds: readiness.evidence.map((evidence) => evidence.id), blockers: readiness.blockers, criteria: readiness.criteria.map((item) => ({ criterionId: item.criterionId, status: item.status, overrideDecisionId: item.override?.decisionId ?? null })), waivedCheckCount: readiness.waivedCheckCount, humanCriteriaSignedOff: input.decision === 'approved' ? humanCriteria.map((item) => item.criterionId) : [], policyFilesAcknowledged: input.decision === 'approved' ? policyFiles : [], partialChangeAcknowledged: input.decision === 'approved' && readiness.builderStop ? readiness.builderStop.runId : null, assignmentId: decidesAssignment ? assignment.id : null, evidenceOpenedBeforeDecision, unopenedApproval: input.decision === 'approved' && !evidenceOpenedBeforeDecision, identity } })
+      return { id: reviewId, ...input, comment: normalizedComment, decisionLatencySeconds, createdAt: timestamp }
     })
+  }
+
+  findMatchingActiveReview(input: { proposalId: string; headSha: string; reviewerActorId: string; decision: ReviewDecision; comment: string }) {
+    const proposal = this.getChangeProposal(input.proposalId)
+    const normalizedComment = input.comment.trim()
+    return this.listReviews([proposal.projectId]).find((review) => review.changeProposalId === input.proposalId && review.headSha === input.headSha && review.reviewerActorId === input.reviewerActorId && !review.invalidatedAt && review.decision === input.decision && review.comment === normalizedComment)
   }
 
   private assertProposalOpen(proposal: ChangeProposal) {
@@ -1990,7 +2057,7 @@ export class ControlPlaneDatabase {
   }
 
   private mapAgentRun(row: Record<string, SqlValue>): AgentRun {
-    return { id: String(row.id), projectId: String(row.project_id ?? DEFAULT_PROJECT_ID), workItemId: String(row.work_item_id), intentVersionId: String(row.intent_version_id), repositoryPath: String(row.repository_path), baseRef: String(row.base_ref), baseSha: String(row.base_sha), startSha: String(row.start_sha ?? row.base_sha), revisionOfProposalId: row.revision_of_proposal_id ? String(row.revision_of_proposal_id) : undefined, branchRef: String(row.branch_ref), worktreePath: String(row.worktree_path), adapterId: String(row.adapter_id), isolation: String(row.isolation) as AgentRun['isolation'], runtimeImageRef: row.runtime_image_ref ? String(row.runtime_image_ref) : undefined, runtimeAttestationDigest: row.runtime_attestation_digest ? String(row.runtime_attestation_digest) : undefined, networkEgress: String(row.network_egress ?? 'unrestricted') as AgentRun['networkEgress'], productionEligible: Number(row.production_eligible ?? 0) === 1, status: String(row.status) as AgentRun['status'], queuedAt: row.queued_at ? String(row.queued_at) : undefined, workerPid: row.worker_pid ? Number(row.worker_pid) : undefined, cancellationRequestedAt: row.cancellation_requested_at ? String(row.cancellation_requested_at) : undefined, startedByActorId: String(row.started_by_actor_id), changeProposalId: row.change_proposal_id ? String(row.change_proposal_id) : undefined, exitCode: row.exit_code === null ? undefined : Number(row.exit_code), stdoutDigest: row.stdout_digest ? String(row.stdout_digest) : undefined, stderrDigest: row.stderr_digest ? String(row.stderr_digest) : undefined, errorMessage: row.error_message ? String(row.error_message) : undefined, startedAt: String(row.started_at), completedAt: row.completed_at ? String(row.completed_at) : undefined }
+    return { id: String(row.id), projectId: String(row.project_id ?? DEFAULT_PROJECT_ID), workItemId: String(row.work_item_id), intentVersionId: String(row.intent_version_id), repositoryPath: String(row.repository_path), baseRef: String(row.base_ref), baseSha: String(row.base_sha), startSha: String(row.start_sha ?? row.base_sha), revisionOfProposalId: row.revision_of_proposal_id ? String(row.revision_of_proposal_id) : undefined, branchRef: String(row.branch_ref), worktreePath: String(row.worktree_path), adapterId: String(row.adapter_id), isolation: String(row.isolation) as AgentRun['isolation'], runtimeImageRef: row.runtime_image_ref ? String(row.runtime_image_ref) : undefined, runtimeAttestationDigest: row.runtime_attestation_digest ? String(row.runtime_attestation_digest) : undefined, networkEgress: String(row.network_egress ?? 'unrestricted') as AgentRun['networkEgress'], productionEligible: Number(row.production_eligible ?? 0) === 1, status: String(row.status) as AgentRun['status'], queuedAt: row.queued_at ? String(row.queued_at) : undefined, workerPid: row.worker_pid ? Number(row.worker_pid) : undefined, cancellationRequestedAt: row.cancellation_requested_at ? String(row.cancellation_requested_at) : undefined, requestKey: row.request_key ? String(row.request_key) : undefined, admissionRequestDigest: row.admission_request_digest ? String(row.admission_request_digest) : undefined, startedByActorId: String(row.started_by_actor_id), changeProposalId: row.change_proposal_id ? String(row.change_proposal_id) : undefined, exitCode: row.exit_code === null ? undefined : Number(row.exit_code), stdoutDigest: row.stdout_digest ? String(row.stdout_digest) : undefined, stderrDigest: row.stderr_digest ? String(row.stderr_digest) : undefined, errorMessage: row.error_message ? String(row.error_message) : undefined, startedAt: String(row.started_at), completedAt: row.completed_at ? String(row.completed_at) : undefined }
   }
 
   private mapEvent(row: Record<string, SqlValue>): DomainEvent {

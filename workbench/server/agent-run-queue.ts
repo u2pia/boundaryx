@@ -36,16 +36,16 @@ export class AgentRunQueue {
   reconcile() {
     const orphaned = this.input.database.listUnfinishedAgentRuns()
     const reconciled: AgentRun[] = []
-    for (const run of orphaned) {
-      this.input.database.recordAgentRunEvent(run.id, 'agent_run.worker_lost', { previousStatus: run.status, workerPid: run.workerPid ?? null }, run.startedByActorId)
-      reconciled.push(this.input.database.completeAgentRun({ runId: run.id, status: 'failed', actorId: run.startedByActorId, errorMessage: 'Control Plane restarted while the run was in flight; the worker process no longer exists' }))
-    }
+    for (const run of orphaned) reconciled.push(this.input.database.reconcileAgentRunAfterWorkerLoss(run.id))
     for (const run of this.input.database.listTerminalAgentRunsWithWorktree()) this.cleanUpWorktree(run)
     return reconciled.map((run) => run.id)
   }
 
   enqueue(runId: string) {
     if (this.closed) throw new AppError(503, 'Control Plane is shutting down', 'queue_closed')
+    if (this.running.has(runId) || this.pending.includes(runId)) return this.position(runId)
+    const run = this.input.database.getAgentRun(runId)
+    if (run.status !== 'queued') throw new AppError(409, `Agent run ${runId} is not queued`, 'agent_run_not_queued')
     this.pending.push(runId)
     this.pump()
     return this.position(runId)
@@ -59,17 +59,19 @@ export class AgentRunQueue {
   }
 
   cancel(runId: string, actorId: string): AgentRun {
-    const run = this.input.database.requestAgentRunCancellation(runId, actorId)
     const entry = this.running.get(runId)
     if (!entry) {
+      const current = this.input.database.getAgentRun(runId)
+      if (current.status === 'cancelled') return current
       this.pending = this.pending.filter((pending) => pending !== runId)
       // Cancelled while waiting in line: no worker ever claimed it, so the worktree it was admitted with is
       // removed right here rather than in a worker process that will never run.
-      const cancelled = this.input.database.completeAgentRun({ runId, status: 'cancelled', actorId, errorMessage: 'Agent run was cancelled before execution started' })
+      const cancelled = this.input.database.cancelQueuedAgentRun(runId, actorId)
       this.cleanUpWorktree(cancelled)
       this.pump()
       return cancelled
     }
+    const run = this.input.database.requestAgentRunCancellation(runId, actorId)
     this.signal(runId, entry, 'SIGTERM')
     return run
   }

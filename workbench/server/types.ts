@@ -459,6 +459,8 @@ export type AgentRun = {
   queuedAt?: string
   workerPid?: number
   cancellationRequestedAt?: string
+  requestKey?: string
+  admissionRequestDigest?: string
   startedByActorId: string
   changeProposalId?: string
   exitCode?: number
@@ -477,6 +479,9 @@ export type AgentRunRequest = {
   baseRef: string
   declaredContextPaths: string[]
   changeProposalId?: string
+  /** Internal HTTP retry binding; never included in the Builder request document. */
+  requestKey?: string
+  admissionRequestDigest?: string
 }
 
 export type AgentRunnerDescriptor = {

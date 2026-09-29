@@ -60,12 +60,12 @@ const server = createControlPlaneServer({ database, agentRunner: configured.runn
 
 let cookie = ''
 
-async function request<T>(path: string, options: { method?: string; body?: unknown } = {}) {
+async function request<T>(path: string, options: { method?: string; body?: unknown; idempotencyKey?: string } = {}) {
   const { port } = server.address() as AddressInfo
   const started = Date.now()
   const response = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: options.method ?? (options.body === undefined ? 'GET' : 'POST'),
-    headers: { ...(options.body === undefined ? {} : { 'content-type': 'application/json' }), ...(cookie ? { cookie } : {}) },
+    headers: { ...(options.body === undefined ? {} : { 'content-type': 'application/json' }), ...(options.idempotencyKey ? { 'idempotency-key': options.idempotencyKey } : {}), ...(cookie ? { cookie } : {}) },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   })
   const setCookie = response.headers.get('set-cookie')
@@ -99,13 +99,20 @@ try {
     database.approveIntentVersion(intentVersionId, approver.id)
     return intentVersionId
   }
-  const startRun = async (intentVersionId: string) => request<{ agentRun: { id: string; status: string }; queuePosition?: number }>('/api/agent-runs', { body: { workItemId, intentVersionId, baseRef: 'main', declaredContextPaths: ['README.md'] } })
+  const startRun = async (intentVersionId: string, requestKey?: string) => request<{ agentRun: { id: string; status: string }; queuePosition?: number; idempotentReplay: boolean }>('/api/agent-runs', { body: { workItemId, intentVersionId, baseRef: 'main', declaredContextPaths: ['README.md'] }, idempotencyKey: requestKey })
 
   // 1. Starting a run returns immediately with a queued run, and the control plane answers throughout.
-  const slowRun = await startRun(await createApprovedIntent('生成变更，耗时 2500ms'))
+  const slowIntent = await createApprovedIntent('生成变更，耗时 2500ms')
+  const slowRun = await startRun(slowIntent, 'queue-run-retry-001')
   assert.equal(slowRun.status, 202)
   assert.equal(slowRun.body!.agentRun.status, 'queued')
   assert.ok(slowRun.latencyMs < 2_000, `admitting a run took ${slowRun.latencyMs}ms`)
+  const replayedSlowRun = await startRun(slowIntent, 'queue-run-retry-001')
+  assert.equal(replayedSlowRun.status, 200)
+  assert.equal(replayedSlowRun.body!.agentRun.id, slowRun.body!.agentRun.id)
+  assert.equal(replayedSlowRun.body!.idempotentReplay, true)
+  const conflictingReplay = await startRun(await createApprovedIntent('另一个请求，耗时 1000ms'), 'queue-run-retry-001')
+  assert.equal(conflictingReplay.status, 409)
 
   const probes: number[] = []
   let sawRunningInQueue = false
@@ -139,8 +146,13 @@ try {
   const cancelEvents = (await request<{ events: Array<{ eventType: string }> }>(`/api/agent-runs/${longRunId}`)).body!.events.map((event) => event.eventType)
   assert.equal(cancelEvents.includes('agent_run.cancellation_requested'), true)
   assert.equal(cancelEvents.at(-1), 'agent_run.cancelled')
-  // Cancelling a terminal run is a conflict, not a silent no-op.
-  assert.equal((await request(`/api/agent-runs/${longRunId}/cancel`, { method: 'POST' })).status, 409)
+  // A client can safely retry after losing the first response; no second cancellation event is written.
+  const repeatedCancel = await request<{ agentRun: { status: string } }>(`/api/agent-runs/${longRunId}/cancel`, { method: 'POST' })
+  assert.equal(repeatedCancel.status, 200)
+  assert.equal(repeatedCancel.body!.agentRun.status, 'cancelled')
+  const repeatedCancelEvents = (await request<{ events: Array<{ eventType: string }> }>(`/api/agent-runs/${longRunId}`)).body!.events.map((event) => event.eventType)
+  assert.equal(repeatedCancelEvents.filter((event) => event === 'agent_run.cancellation_requested').length, 1)
+  assert.equal(repeatedCancelEvents.filter((event) => event === 'agent_run.cancelled').length, 1)
 
   // 3. A run still waiting in line is cancelled without ever executing.
   const blocking = await startRun(await createApprovedIntent('生成变更，耗时 8000ms'))
@@ -154,7 +166,26 @@ try {
   await request(`/api/agent-runs/${blocking.body!.agentRun.id}/cancel`, { method: 'POST' })
   await poll(blocking.body!.agentRun.id, 30_000)
 
-  console.log(`agent run queue smoke passed · worst /api/health latency during a run: ${worstProbe}ms over ${probes.length} probes · ${longRunId} cancelled mid-flight`)
+  // 4. Startup recovery is atomic and preserves an accepted cancellation instead of misclassifying it as failure.
+  const recoveryIntent = await createApprovedIntent('生成变更，耗时 1000ms')
+  const orphanCancelled = configured.runner!.prepare({ workItemId, intentVersionId: recoveryIntent, baseRef: 'main', declaredContextPaths: ['README.md'] }, setup.body!.actor.id)
+  database.requestAgentRunCancellation(orphanCancelled.id, setup.body!.actor.id)
+  const recoveryQueue = new AgentRunQueue({ database, databasePath, dataDirectory, concurrency: 1, env, runner: configured.runner })
+  assert.deepEqual(recoveryQueue.reconcile(), [orphanCancelled.id])
+  assert.equal(database.getAgentRun(orphanCancelled.id).status, 'cancelled')
+  const recoveredCancellationEvents = database.listAggregateEvents('agent_run', orphanCancelled.id).map((event) => event.eventType)
+  assert.equal(recoveredCancellationEvents.filter((event) => event === 'agent_run.worker_lost').length, 1)
+  assert.equal(recoveredCancellationEvents.filter((event) => event === 'agent_run.cancelled').length, 1)
+
+  const orphanFailed = configured.runner!.prepare({ workItemId, intentVersionId: recoveryIntent, baseRef: 'main', declaredContextPaths: ['README.md'] }, setup.body!.actor.id)
+  assert.deepEqual(recoveryQueue.reconcile(), [orphanFailed.id])
+  const recoveredFailure = database.getAgentRun(orphanFailed.id)
+  assert.equal(recoveredFailure.status, 'failed')
+  const failureEventCount = database.listAggregateEvents('agent_run', orphanFailed.id).filter((event) => event.eventType === 'agent_run.failed').length
+  database.completeAgentRun({ runId: orphanFailed.id, status: 'failed', actorId: setup.body!.actor.id, errorMessage: recoveredFailure.errorMessage })
+  assert.equal(database.listAggregateEvents('agent_run', orphanFailed.id).filter((event) => event.eventType === 'agent_run.failed').length, failureEventCount)
+
+  console.log(`agent run queue smoke passed · worst /api/health latency during a run: ${worstProbe}ms over ${probes.length} probes · cancellation retry and restart recovery are idempotent`)
 } finally {
   agentRunQueue.close()
   await new Promise<void>((closed) => server.close(() => closed()))

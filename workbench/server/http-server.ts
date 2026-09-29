@@ -18,7 +18,7 @@ import { probeAgentProvider } from './provider-probe.ts'
 import { generateIntentDraft, maximumBriefLength, projectDraftingContext } from './intent-drafter.ts'
 import { independentTestSignalFromCriteria } from './criteria-coverage.ts'
 import { agentRunProgress } from './run-progress.ts'
-import { createSessionToken } from './security.ts'
+import { createSessionToken, sha256 } from './security.ts'
 import { trustProfileForControlPlane } from './trust-profile.ts'
 import { AppError, type AgentRunner, type AgentRunnerDescriptor, type CodeHostKind, type MergeMode, type ProjectRole, type SessionActor, type TeamRole } from './types.ts'
 
@@ -123,6 +123,15 @@ function requireRole(actor: SessionActor, allowed: TeamRole[]) {
   if (!allowed.includes(actor.role)) throw new AppError(403, 'Actor does not have permission for this operation', 'forbidden')
 }
 
+function idempotencyKey(request: IncomingMessage) {
+  const header = request.headers['idempotency-key']
+  const value = Array.isArray(header) ? header[0] : header
+  if (value === undefined) return undefined
+  const key = value.trim()
+  if (!/^[A-Za-z0-9._:-]{1,128}$/u.test(key)) throw new AppError(400, 'Idempotency-Key must be 1-128 letters, digits, dot, underscore, colon or hyphen', 'invalid_idempotency_key')
+  return key
+}
+
 const ALL_ROLES: TeamRole[] = ['owner', 'maintainer', 'reviewer', 'developer']
 
 /** Browsers used to name the repository a run edits; it now comes from the project, and a stray path is an error. */
@@ -178,11 +187,17 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
    * holding the event loop for the length of the run. Without a queue the run executes in process; that
    * path exists only for in-process tests.
    */
-  function startAgentRun(request: Parameters<AgentRunner['prepare']>[0], actorId: string) {
+  function startAgentRun(request: Parameters<AgentRunner['prepare']>[0], actorId: string, requestKey?: string, operation = 'agent_run.start') {
     if (!agentRunner) throw new AppError(503, 'Local Agent Runner is not configured', 'agent_runner_unavailable')
-    if (!agentRunQueue) return { agentRun: agentRunner.run(request, actorId), status: 201, queuePosition: undefined }
-    const agentRun = agentRunner.prepare(request, actorId)
-    return { agentRun, status: 202, queuePosition: agentRunQueue.enqueue(agentRun.id) }
+    const admissionRequestDigest = `sha256:${sha256(JSON.stringify({ operation, request }))}`
+    if (requestKey) {
+      const existing = database.getAgentRunByRequestKey(actorId, requestKey, admissionRequestDigest)
+      if (existing) return { agentRun: existing, status: 200, queuePosition: agentRunQueue?.position(existing.id), idempotentReplay: true }
+    }
+    const boundRequest = requestKey ? { ...request, requestKey, admissionRequestDigest } : request
+    if (!agentRunQueue) return { agentRun: agentRunner.run(boundRequest, actorId), status: 201, queuePosition: undefined, idempotentReplay: false }
+    const agentRun = agentRunner.prepare(boundRequest, actorId)
+    return { agentRun, status: 202, queuePosition: agentRunQueue.enqueue(agentRun.id), idempotentReplay: false }
   }
 
   function sessionView(actor: SessionActor) {
@@ -494,8 +509,8 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         const workItem = database.getWorkItem(requireString(body, 'workItemId'))
         requireIn(workItem.projectId, ['owner', 'maintainer', 'developer'])
         const declaredContextPaths = Array.isArray(body.declaredContextPaths) ? body.declaredContextPaths.filter((value): value is string => typeof value === 'string' && Boolean(value.trim())).map((value) => value.trim()) : []
-        const started = startAgentRun({ workItemId: workItem.id, intentVersionId: requireString(body, 'intentVersionId'), baseRef: optionalString(body, 'baseRef') ?? database.getProject(workItem.projectId).defaultBranch, declaredContextPaths, changeProposalId: optionalString(body, 'changeProposalId') }, actor.id)
-        return sendJson(response, started.status, { agentRun: started.agentRun, queuePosition: started.queuePosition })
+        const started = startAgentRun({ workItemId: workItem.id, intentVersionId: requireString(body, 'intentVersionId'), baseRef: optionalString(body, 'baseRef') ?? database.getProject(workItem.projectId).defaultBranch, declaredContextPaths, changeProposalId: optionalString(body, 'changeProposalId') }, actor.id, idempotencyKey(request))
+        return sendJson(response, started.status, { agentRun: started.agentRun, queuePosition: started.queuePosition, idempotentReplay: started.idempotentReplay })
       }
 
       const agentRunCancelRoute = routeMatch(path, /^\/api\/agent-runs\/(?<runId>[^/]+)\/cancel$/u)
@@ -679,24 +694,25 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         const proposal = database.getChangeProposal(reviseRoute.proposalId)
         const role = requireIn(proposal.projectId, ['owner', 'maintainer', 'developer'])
         if (role === 'developer' && proposal.authorActorId !== actor.id) throw new AppError(403, 'Developers can only revise their own change proposals', 'revision_forbidden')
-        const started = startAgentRun({ workItemId: proposal.workItemId, intentVersionId: proposal.intentVersionId, baseRef: proposal.baseRef, declaredContextPaths: [], changeProposalId: proposal.id }, actor.id)
-        return sendJson(response, started.status, { agentRun: started.agentRun, queuePosition: started.queuePosition })
+        const started = startAgentRun({ workItemId: proposal.workItemId, intentVersionId: proposal.intentVersionId, baseRef: proposal.baseRef, declaredContextPaths: [], changeProposalId: proposal.id }, actor.id, idempotencyKey(request), 'agent_run.revise')
+        return sendJson(response, started.status, { agentRun: started.agentRun, queuePosition: started.queuePosition, idempotentReplay: started.idempotentReplay })
       }
 
       const releaseCandidateRoute = routeMatch(path, /^\/api\/change-proposals\/(?<proposalId>[^/]+)\/release-candidates$/u)
       if (method === 'POST' && releaseCandidateRoute) {
         requireIn(proposalProject(releaseCandidateRoute.proposalId), ['owner', 'maintainer'])
-        const releaseCandidate = releaseAuthority.createReleaseCandidate(releaseCandidateRoute.proposalId, actor.id)
-        return sendJson(response, 201, { releaseCandidate })
+        const result = releaseAuthority.createReleaseCandidateResult(releaseCandidateRoute.proposalId, actor.id)
+        return sendJson(response, result.changed ? 201 : 200, result)
       }
 
       const releaseApprovalRoute = routeMatch(path, /^\/api\/release-candidates\/(?<candidateId>[^/]+)\/approve$/u)
       if (method === 'POST' && releaseApprovalRoute) {
-        requireIn(database.getReleaseCandidate(releaseApprovalRoute.candidateId).projectId, ['owner', 'maintainer'], 'release_approval_forbidden')
+        const current = database.getReleaseCandidate(releaseApprovalRoute.candidateId)
+        requireIn(current.projectId, ['owner', 'maintainer'], 'release_approval_forbidden')
         const body = await readJson(request)
         releaseAuthority.verifyReleaseCandidate(releaseApprovalRoute.candidateId)
         const releaseCandidate = database.approveReleaseCandidate(releaseApprovalRoute.candidateId, actor.id, typeof body.comment === 'string' ? body.comment : '')
-        return sendJson(response, 201, { releaseCandidate })
+        return sendJson(response, current.status === 'approved' ? 200 : 201, { releaseCandidate })
       }
 
       const checkRoute = routeMatch(path, /^\/api\/change-proposals\/(?<proposalId>[^/]+)\/checks$/u)
@@ -747,9 +763,11 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
       const reviewRoute = routeMatch(path, /^\/api\/change-proposals\/(?<proposalId>[^/]+)\/reviews$/u)
       if (method === 'POST' && reviewRoute) {
         const body = await readJson(request)
-        const review = database.recordReview({ proposalId: reviewRoute.proposalId, headSha: requireString(body, 'headSha'), reviewerActorId: actor.id, decision: requireString(body, 'decision') as 'approved' | 'changes_requested' | 'commented', comment: typeof body.comment === 'string' ? body.comment : '' })
+        const reviewInput = { proposalId: reviewRoute.proposalId, headSha: requireString(body, 'headSha'), reviewerActorId: actor.id, decision: requireString(body, 'decision') as 'approved' | 'changes_requested' | 'commented', comment: typeof body.comment === 'string' ? body.comment : '' }
+        const existing = database.findMatchingActiveReview(reviewInput)
+        const review = database.recordReview(reviewInput)
         codeHostSyncer.nudge(proposalProject(reviewRoute.proposalId))
-        return sendJson(response, 201, { review })
+        return sendJson(response, existing ? 200 : 201, { review })
       }
 
       // Role checks for Override / Reject live in the database layer, next to the decision they guard.
