@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { progress } from './progress.mjs'
 import { cliTimeoutMs, partialMessage, stoppedAtDeadline } from './run-deadline.mjs'
-import { declaredContextSections, taskPrompt } from './run-request.mjs'
+import { declaredContextSections, skillCatalogSections, taskPrompt } from './run-request.mjs'
 
 const [codexExecutable, ...configuredArgs] = process.argv.slice(2)
 const requestPath = process.env.APERTURE_RUN_REQUEST
@@ -16,10 +16,12 @@ if (!codexExecutable || !requestPath || !worktreePath) {
 
 const request = JSON.parse(readFileSync(requestPath, 'utf8'))
 const contextSections = declaredContextSections(request)
+const skillSections = skillCatalogSections(request, 'When a Skill applies, read its exact declared path before implementing it. Do not claim that a Skill was used unless you actually read it.')
 const prompt = `${taskPrompt(request)}
 
 Operate only inside the current Git worktree. Implement the requested change, add or update relevant tests when appropriate, and do not create a Git commit. Do not use network access unless the surrounding sandbox explicitly allows it. Finish with a concise summary of changed files and remaining risks.
-${contextSections.join('\n')}`
+${contextSections.join('\n')}
+${skillSections.join('\n')}`
 
 // Which LLM to use comes from the Control Plane, not from the operator's own ~/.codex/config.toml: the
 // runner passes it in the environment and it is translated into `-c` overrides here, so a run's model is

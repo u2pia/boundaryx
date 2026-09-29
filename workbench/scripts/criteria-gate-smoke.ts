@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { criterionStatus, mapCriteriaToChecks } from '../server/criteria-coverage.ts'
+import { criterionStatus, independentTestSignalFromCriteria, mapCriteriaToChecks } from '../server/criteria-coverage.ts'
 import { ControlPlaneDatabase } from '../server/database.ts'
 import { useProjectRepository } from './fixtures.ts'
 import { LocalGitAuthority } from '../server/local-git-authority.ts'
@@ -121,6 +121,8 @@ try {
     assert.equal(withBaseline[0].independent, true, 'a re-run on the base test files is independent')
     assert.equal(withBaseline[0].regressionOnly, true, 'but when the run also edited the tests, the base run only shows nothing regressed')
     assert.equal(criterionStatus(withBaseline[0], [{ name: 'unit', status: 'completed', conclusion: 'success' }, { name: 'unit@baseline', status: 'completed', conclusion: 'success' }]), 'needs_test_review')
+    assert.equal(independentTestSignalFromCriteria(withBaseline, [{ name: 'unit', conclusion: 'success' }, { name: 'unit@baseline', conclusion: 'success' }]), false, 'a regression-only baseline is not an independent passing signal')
+    assert.equal(independentTestSignalFromCriteria(withBaseline, [{ name: 'unit', conclusion: 'success' }, { name: 'unit@baseline', conclusion: 'failure' }]), false, 'a failed baseline is not an independent passing signal')
     assert.equal(mapCriteriaToChecks(intent, [{ name: 'unit', kind: 'test', provenance: 'pre_existing' }])[0].regressionOnly, undefined, 'tests the run did not touch are not regression-only')
     // A build shows the code builds, not how it behaves: matched by rule it is no independent proof. A criterion
     // that names the build explicitly (a build criterion) is evidenced by it.

@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { loadProjectManifest } from '../server/project-manifest.ts'
+import { bindProjectSkills, PROJECT_SKILL_MAX_BYTES } from '../server/project-skills.ts'
 import { sha256 } from '../server/security.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'aperture-project-manifest-'))
@@ -17,7 +18,9 @@ execFileSync('git', ['init', '--quiet', '--initial-branch=main', root])
 git('config', 'user.name', 'Aperture Test')
 git('config', 'user.email', 'test@aperture.invalid')
 mkdirSync(join(root, '.aperture'))
+mkdirSync(join(root, '.aperture/skills'))
 writeFileSync(join(root, 'README.md'), '# Fixture\n')
+writeFileSync(join(root, '.aperture/skills/review-change.md'), '# Review change\n')
 function load(manifest: object) {
   writeFileSync(join(root, '.aperture/project.json'), JSON.stringify(manifest))
   git('add', '-A')
@@ -38,12 +41,24 @@ try {
   assert.deepEqual(shell.manifest.builder, { allowShell: true })
   assert.notEqual(shell.digest, v2.digest, 'the digest records whether a shell was allowed')
 
+  const withSkills = load({ schemaVersion: 'aperture.project.v2', ...base, skills: [{ name: 'review-change', path: '.aperture/skills/review-change.md', description: 'Review a proposed change against its Intent and Evidence.' }] })
+  assert.deepEqual(withSkills.manifest.skills, [{ name: 'review-change', path: '.aperture/skills/review-change.md', description: 'Review a proposed change against its Intent and Evidence.' }])
+  assert.notEqual(withSkills.digest, v2.digest, 'the manifest digest records the governed Skill catalog')
+  assert.match(bindProjectSkills(root, withSkills.baseSha, withSkills.manifest.skills)[0].contentDigest, /^sha256:[0-9a-f]{64}$/u)
+  assert.throws(() => bindProjectSkills(root, withSkills.baseSha, [{ name: 'missing', path: '.aperture/skills/missing.md', description: 'Missing.' }]), refused('project_skill_missing'))
+  writeFileSync(join(root, '.aperture/skills/too-large.md'), 'x'.repeat(PROJECT_SKILL_MAX_BYTES + 1))
+  const tooLarge = load({ schemaVersion: 'aperture.project.v2', ...base, skills: [{ name: 'too-large', path: '.aperture/skills/too-large.md', description: 'Too large.' }] })
+  assert.throws(() => bindProjectSkills(root, tooLarge.baseSha, tooLarge.manifest.skills), refused('project_skill_too_large'))
+
   assert.throws(() => load({ schemaVersion: 'aperture.project.v2', ...base, builder: { allowShell: 'yes' } }), refused('invalid_project_manifest', /builder\.allowShell must be boolean/u))
   assert.throws(() => load({ schemaVersion: 'aperture.project.v2', ...base, builder: { allowShell: true, network: true } }), refused('invalid_project_manifest', /Unknown builder settings: network/u))
   assert.throws(() => load({ schemaVersion: 'aperture.project.v2', ...base, builder: [] }), refused('invalid_project_manifest'))
+  assert.throws(() => load({ schemaVersion: 'aperture.project.v2', ...base, skills: [{ name: 'same', path: '.aperture/skills/a.md', description: 'a' }, { name: 'same', path: '.aperture/skills/b.md', description: 'b' }] }), refused('invalid_project_manifest', /Duplicate skill name/u))
+  assert.throws(() => load({ schemaVersion: 'aperture.project.v2', ...base, skills: [{ name: 'outside-policy', path: 'docs/outside-skill.md', description: 'Outside the governed policy tree.' }] }), refused('invalid_project_manifest', /must be under \.aperture\/skills\//u))
+  assert.throws(() => load({ schemaVersion: 'aperture.project.v2', ...base, skills: [{ name: 'bad', path: '../outside.md', description: 'bad' }] }), refused('invalid_project_manifest', /normalized repository-relative path/u))
   assert.throws(() => load({ schemaVersion: 'aperture.project.v3', ...base }), refused('unsupported_project_manifest'))
 
-  console.log('project manifest smoke passed · v1 unchanged · v2 builder.allowShell defaults to no shell')
+  console.log('project manifest smoke passed · v1 unchanged · v2 builder.allowShell defaults to no shell · Skills catalog validated and digested')
 } finally {
   rmSync(root, { recursive: true, force: true })
 }

@@ -51,7 +51,8 @@ export type LocalProject = {
 
 /** The context a Run started now would be given, from the manifest on the project's default branch. */
 export type LocalProjectContextFile = { path: string; required: boolean; exists: boolean; sizeBytes?: number; lastCommit?: { sha: string; author: string; committedAt: string; subject: string }; editUrl?: string }
-export type LocalProjectContext = { projectId: string; branch: string; baseSha: string; manifestPath: string; manifestFound: boolean; manifestError?: string; files: LocalProjectContextFile[]; requiredBytes: number; budgetBytes: number; builder?: { schemaVersion?: string; allowShell: boolean }; issues: { severity: 'error' | 'warning'; code: string; message: string; path?: string }[] }
+export type LocalProjectSkill = { name: string; path: string; description: string; exists: boolean; sizeBytes?: number; contentDigest?: string; lastCommit?: { sha: string; author: string; committedAt: string; subject: string }; editUrl?: string }
+export type LocalProjectContext = { projectId: string; branch: string; baseSha: string; manifestPath: string; manifestFound: boolean; manifestError?: string; files: LocalProjectContextFile[]; skills: LocalProjectSkill[]; requiredBytes: number; budgetBytes: number; builder?: { schemaVersion?: string; allowShell: boolean }; issues: { severity: 'error' | 'warning'; code: string; message: string; path?: string }[] }
 
 export type LocalProjectMember = { projectId: string; actorId: string; username: string; displayName: string; role: LocalProjectRole; addedByActorId?: string; addedAt: string }
 
@@ -178,7 +179,7 @@ export type LocalReleaseCandidate = {
   sourceTreeDigest: string
   sourceFileCount: number
   artifactClass: 'source_snapshot' | 'source_with_build_attestation'
-  artifactEvidence: Array<{ evidenceId: string; packageDigest: string; artifactCount: number }>
+  artifactEvidence: Array<{ evidenceId: string; packageDigest: string; artifactCount: number; artifactDigests: string[]; sourceCommitSha: string; buildCheckName: string }>
   artifactBindingDigest?: string
   contentDigest: string
   status: 'review_ready' | 'approved' | 'cancelled'
@@ -213,6 +214,9 @@ export type LocalReviewMetrics = {
   activeReviewerCount: number
   approvalDecisionCount: number
   evidenceExpandedApprovalCount: number
+  decisionBriefViewCount: number
+  decisionBriefOpenedDecisionCount: number
+  medianBriefToDecisionSeconds: number
   decidedProposalCount: number
   firstPassApprovalCount: number
   reworkedProposalCount: number
@@ -245,16 +249,31 @@ export type LocalReviewReadiness = {
   builderStop: { runId: string; reason: 'time_budget' | 'step_budget'; summary: string } | null
 }
 
+export type LocalDecisionBrief = {
+  generatedAt: string
+  proposal: Pick<LocalChangeProposal, 'id' | 'status' | 'baseRef' | 'baseSha' | 'headRef' | 'headSha' | 'changedFiles' | 'additions' | 'deletions' | 'policyFiles' | 'reviewCycleStartedAt'>
+  workItem: Pick<LocalWorkItem, 'id' | 'sequence' | 'title' | 'description' | 'productType'>
+  intent: Pick<LocalIntentVersion, 'id' | 'version' | 'goal' | 'constraints' | 'nonGoals' | 'examples' | 'riskLevel' | 'contentDigest' | 'draft'>
+  gate: { state: LocalReviewReadiness['status']; nextAction: 'resolve_blockers' | 'review_human_judgement' | 'review_and_decide' | 'already_decided' | 'await_revision' | 'completed'; blockers: string[]; criteria: LocalReviewReadiness['criteria']; checks: { successful: number; failed: number; waived: number; pending: number } }
+  context: { observation: 'available' | 'unavailable'; controlPlaneInjected: number; builderReported: number; rejected: number; undeclared: number; skillsLoaded: number; skillsRejected: number }
+  execution: { source: 'local_agent_run' | 'external_run_reference' | 'manual'; runId?: string; status?: LocalAgentRun['status']; adapterId?: string; isolation?: LocalAgentRun['isolation']; productionEligible?: boolean; builderStop: LocalReviewReadiness['builderStop'] }
+  evidence: Array<{ id: string; runId: string; sha256: string; status?: string; artifactCount: number; independentTestSignal?: boolean; viewedByReviewer: boolean; createdAt: string }>
+  review: { assignment?: LocalReviewAssignment; currentDecisions: Array<Pick<LocalReviewRecord, 'id' | 'decision' | 'comment' | 'reviewerDisplayName' | 'decisionLatencySeconds' | 'createdAt'>>; briefOpenedAt?: string; evidenceOpenedAt?: string; assignmentCycleElapsedSeconds?: number }
+  viewer: { role: LocalActor['role']; relationship: 'author' | 'assignee' | 'reviewer'; canComment: boolean; canRecordTerminalDecision: boolean; approvalRestrictedToOwner: boolean; restriction?: 'self_review_forbidden' | 'review_not_assigned' | 'proposal_completed' }
+  attention: string[]
+}
+
 export type LocalEvidencePackageView = {
   evidence: { id: string; changeProposalId: string; runId: string; headSha: string; uri: string; sha256: string; summary: Record<string, unknown>; createdAt: string }
   evidencePackage: {
     schemaVersion: 'aperture.evidence.v1'
     generatedAt: string
-    projectManifest?: { path: string; baseSha: string; digest: string; schemaVersion: string; policy: { maximumRisk: 'low' | 'medium' | 'high'; allowUnisolatedRuntime: boolean }; evaluation?: { profile: 'application_checks' | 'agent_dataset'; datasetPath?: string; datasetDigest?: string; thresholds: Array<{ metric: string; operator: 'gte' | 'lte'; threshold: number }> }; artifact?: { profile: 'application_build'; buildCheck: string; outputs: string[] } }
+    projectManifest?: { path: string; baseSha: string; digest: string; schemaVersion: string; skills?: Array<{ name: string; path: string; description: string; baseSha: string; fileBytes: number; contentDigest: string }>; policy: { maximumRisk: 'low' | 'medium' | 'high'; allowUnisolatedRuntime: boolean }; evaluation?: { profile: 'application_checks' | 'agent_dataset'; datasetPath?: string; datasetDigest?: string; thresholds: Array<{ metric: string; operator: 'gte' | 'lte'; threshold: number }> }; artifact?: { profile: 'application_build'; buildCheck: string; outputs: string[] } }
     workItem: { id: string; title: string; productType: 'application' | 'agent_system' }
     intent: { id: string; version: number; goal: string; riskLevel: 'low' | 'medium' | 'high'; contentDigest: string; constraints: string[]; nonGoals?: string[]; examples?: Array<{ input: string; expected: string }>; acceptanceCriteria: Array<{ id: string; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; ordinal: number }>; draft?: LocalIntentVersion['draft'] }
     git: { repositoryPath: string; baseRef: string; baseSha: string; headRef: string; headSha: string; changedFiles: number; additions: number; deletions: number }
     run: { id: string; adapterId: string; startSha?: string; revisionOfProposalId?: string; isolation: 'unisolated_process' | 'container'; networkEgress: 'denied' | 'allowlist' | 'unrestricted'; productionEligible: boolean; runtimeAttestationDigest?: string; stdoutDigest?: string; stderrDigest?: string }
+    skillUsage?: { loaded: Array<{ name: string; path: string; contentDigest: string; reportSource: string; independentlyObserved: boolean }>; rejected: Array<{ name: string; path: string; reason: string }> }
     checks: Array<{ id: string; name: string; kind?: 'test' | 'evaluation' | 'build' | 'integrity'; conclusion: 'success' | 'failure' | 'neutral' | 'cancelled'; exitCode?: number; durationMs: number; stdoutDigest: string; stderrDigest: string; stdoutExcerpt: string; stderrExcerpt: string; metrics?: Record<string, number>; thresholdResults?: Array<{ metric: string; operator: 'gte' | 'lte'; threshold: number; actual?: number; passed: boolean }>; provenance?: 'all_tests' | 'pre_existing' | 'unverified' | 'isolated' | 'isolated_partial'; testTreeSha?: string; agentModifiedTestFiles?: string[] }>
     /** Which test conclusions the change under review could have authored the tests for. */
     testProvenance?: { declaredTestPaths: string[]; baseSha: string; agentModifiedTestFiles: string[]; headConclusions: Array<{ name: string; conclusion: string }>; baselineConclusions: Array<{ name: string; conclusion: string }>; independent: boolean; note: string }
@@ -440,6 +459,8 @@ export const localControlPlaneClient = {
   listReviews: (projectId?: string) => request<{ reviews: LocalReviewRecord[]; metrics: LocalReviewMetrics; readiness: LocalReviewReadiness[]; assignments: LocalReviewAssignment[]; reviewerLoad: LocalReviewerLoad[] }>(scoped('/api/reviews', projectId)),
   createChangeProposal: (input: { workItemId: string; intentVersionId: string; baseRef?: string; headRef: string; runId?: string }) => post<{ changeProposal: LocalChangeProposal }>('/api/change-proposals', input),
   refreshChangeProposal: (proposalId: string) => post<{ proposal: LocalChangeProposal; changed: boolean; invalidated: { reviews: number; checks: number; evidence: number } }>(`/api/change-proposals/${proposalId}/refresh`),
+  getDecisionBrief: (proposalId: string) => request<{ decisionBrief: LocalDecisionBrief }>(`/api/change-proposals/${proposalId}/decision-brief`),
+  recordDecisionBriefView: (proposalId: string) => post<{ view: { reviewerActorId: string; viewedAt: string }; decisionBrief: LocalDecisionBrief }>(`/api/change-proposals/${proposalId}/decision-brief`, {}),
   reviewChangeProposal: (proposalId: string, input: { headSha: string; decision: 'approved' | 'changes_requested' | 'commented'; comment: string }) => post<{ review: { id: string } }>(`/api/change-proposals/${proposalId}/reviews`, input),
   overrideCriterion: (proposalId: string, input: { headSha: string; criterionId: string; reason: string }) => post<{ decision: LocalGovernanceDecision }>(`/api/change-proposals/${proposalId}/overrides`, input),
   assignReviewer: (proposalId: string, input: { assigneeActorId?: string; dueHours?: number; reason?: string }) => post<{ assignment: LocalReviewAssignment }>(`/api/change-proposals/${proposalId}/assignments`, input),

@@ -5,8 +5,9 @@ import type { ControlPlaneDatabase } from './database.ts'
 import type { AgentRunPostprocessor, AgentRunPostprocessorInput } from './git-worktree-agent-runner.ts'
 import type { LocalEvidenceStore } from './local-evidence-store.ts'
 import type { ProjectEvaluationProcess, ProjectEvaluationThreshold } from './project-manifest.ts'
+import { bindProjectSkills } from './project-skills.ts'
 import { seatbeltAvailable, seatbeltCommand } from './seatbelt.ts'
-import { mapCriteriaToChecks } from './criteria-coverage.ts'
+import { independentTestSignalFromCriteria, mapCriteriaToChecks } from './criteria-coverage.ts'
 import { POLICY_PATH_PREFIX } from './local-git-authority.ts'
 import { sha256 } from './security.ts'
 import { assertWorktreeGitIntact, worktreeGit, worktreeGitArgs, worktreeGitOptions, type WorktreeGit } from './worktree-git.ts'
@@ -193,6 +194,11 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     } : undefined
     const criteriaCoverage = mapCriteriaToChecks(input.intent, checks)
     const runEvents = this.input.database.listAggregateEvents('agent_run', input.runId)
+    const skillCatalog = bindProjectSkills(input.proposal.repositoryPath, input.projectManifest.baseSha, input.projectManifest.manifest.skills)
+    const skillUsage = {
+      loaded: runEvents.filter((event) => event.eventType === 'agent_run.skill_loaded').map((event) => ({ name: String(event.payload.name ?? ''), path: String(event.payload.path ?? ''), contentDigest: String(event.payload.contentDigest ?? ''), reportSource: String(event.payload.reportSource ?? 'unknown'), independentlyObserved: event.payload.independentlyObserved === true })),
+      rejected: runEvents.filter((event) => event.eventType === 'agent_run.skill_rejected').map((event) => ({ name: String(event.payload.name ?? ''), path: String(event.payload.path ?? ''), reason: String(event.payload.reason ?? 'rejected') })),
+    }
     const proposalEvents = this.input.database.listAggregateEvents('change_proposal', input.proposal.id)
     // Which project and host this evidence is about. The pull request, if any, is opened after the package is sealed
     // and is linked from the proposal instead.
@@ -202,13 +208,14 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
     const stored = this.input.evidenceStore.write({
       schemaVersion: 'aperture.evidence.v1',
       generatedAt: new Date().toISOString(),
-      projectManifest: { path: input.projectManifest.path, baseSha: input.projectManifest.baseSha, digest: input.projectManifest.digest, schemaVersion: input.projectManifest.manifest.schemaVersion, policy: input.projectManifest.manifest.policy, evaluation: { ...input.projectManifest.manifest.evaluation, datasetDigest: input.projectManifest.evaluationDatasetDigest }, artifact: input.projectManifest.manifest.artifact },
+      projectManifest: { path: input.projectManifest.path, baseSha: input.projectManifest.baseSha, digest: input.projectManifest.digest, schemaVersion: input.projectManifest.manifest.schemaVersion, skills: skillCatalog, policy: input.projectManifest.manifest.policy, evaluation: { ...input.projectManifest.manifest.evaluation, datasetDigest: input.projectManifest.evaluationDatasetDigest }, artifact: input.projectManifest.manifest.artifact },
       workItem: { id: input.workItem.id, title: input.workItem.title, productType: input.workItem.productType },
       intent: { id: input.intent.id, version: input.intent.version, goal: input.intent.goal, riskLevel: input.intent.riskLevel, contentDigest: input.intent.contentDigest, constraints: input.intent.constraints, ...(input.intent.nonGoals ? { nonGoals: input.intent.nonGoals } : {}), ...(input.intent.examples ? { examples: input.intent.examples } : {}), acceptanceCriteria: input.intent.acceptanceCriteria, ...(input.intent.draft ? { draft: input.intent.draft } : {}) },
       project: { id: project.id, slug: project.slug },
       codeHost: { provider: project.codeHost, mergeMode: project.mergeMode, defaultBranch: project.defaultBranch, ...hosted },
       git: { repositoryPath: input.proposal.repositoryPath, baseRef: input.proposal.baseRef, baseSha: input.proposal.baseSha, headRef: input.proposal.headRef, headSha: input.proposal.headSha, changedFiles: input.proposal.changedFiles, additions: input.proposal.additions, deletions: input.proposal.deletions },
       run: { id: input.runId, adapterId: input.adapterId, startSha: input.startSha, revisionOfProposalId: input.revisionOfProposalId, isolation: input.attestation.isolation, networkEgress: input.attestation.networkEgress, productionEligible: input.attestation.productionEligible, runtimeAttestationDigest: input.attestation.attestationDigest, stdoutDigest: input.stdoutDigest, stderrDigest: input.stderrDigest, builderStopped: input.builderStopped ?? null },
+      skillUsage,
       checks,
       criteriaCoverage,
       testProvenance,
@@ -220,7 +227,10 @@ export class LocalRunPostprocessor implements AgentRunPostprocessor {
       provenance: { ...eventChainHeads, generatedBy: 'local-run-postprocessor@0.1' },
     })
     const failedChecks = checks.filter((check) => check.conclusion === 'failure' || check.conclusion === 'cancelled').length
-    const evidence = this.input.database.recordEvidence({ proposalId: input.proposal.id, runId: input.runId, headSha: input.proposal.headSha, uri: stored.uri, sha256: stored.sha256, summary: { status: failedChecks ? 'blocked' : checks.length ? 'ready' : 'incomplete', totalChecks: checks.length, failedChecks, testProvenance: headProvenance, independentTestSignal: testProvenance.baselineConclusions.length > 0 || headProvenance === 'pre_existing', agentModifiedTestFileCount: agentModifiedTestFiles.length, evaluationProfile: input.projectManifest.manifest.evaluation.profile, evaluationDatasetDigest: input.projectManifest.evaluationDatasetDigest, artifactCount: artifacts.length, policyFiles: input.proposal.policyFiles ?? [], builderStopped: input.builderStopped ?? null, criteriaCoverage, eventChainHeads, packageSchema: stored.value.schemaVersion, generatedAt: stored.value.generatedAt, trustMode: this.input.database.getIdentityMode() } }, input.actorId)
+    const independentTestSignal = independentTestSignalFromCriteria(criteriaCoverage, checks)
+    const buildCheckName = input.projectManifest.manifest.artifact?.buildCheck
+    const buildCheckConclusion = buildCheckName ? checks.find((check) => check.name === buildCheckName)?.conclusion : undefined
+    const evidence = this.input.database.recordEvidence({ proposalId: input.proposal.id, runId: input.runId, headSha: input.proposal.headSha, uri: stored.uri, sha256: stored.sha256, summary: { status: failedChecks ? 'blocked' : checks.length ? 'ready' : 'incomplete', totalChecks: checks.length, failedChecks, testProvenance: headProvenance, ...(independentTestSignal === undefined ? {} : { independentTestSignal }), agentModifiedTestFileCount: agentModifiedTestFiles.length, evaluationProfile: input.projectManifest.manifest.evaluation.profile, evaluationDatasetDigest: input.projectManifest.evaluationDatasetDigest, artifactCount: artifacts.length, ...(buildCheckName ? { buildCheckName, buildCheckConclusion } : {}), ...(artifacts.length ? { artifactDigests: artifacts.map((artifact) => artifact.sha256), artifactSourceCommitShas: artifacts.map((artifact) => artifact.sourceCommitSha) } : {}), skillCatalogCount: skillCatalog.length, skillLoadedCount: skillUsage.loaded.length, skillRejectedCount: skillUsage.rejected.length, policyFiles: input.proposal.policyFiles ?? [], builderStopped: input.builderStopped ?? null, criteriaCoverage, eventChainHeads, packageSchema: stored.value.schemaVersion, generatedAt: stored.value.generatedAt, trustMode: this.input.database.getIdentityMode() } }, input.actorId)
     this.input.database.recordAgentRunEvent(input.runId, 'agent_run.evidence_packaged', { evidenceId: evidence.id, changeProposalId: input.proposal.id, headSha: input.proposal.headSha, uri: stored.uri, sha256: stored.sha256, totalChecks: checks.length, failedChecks }, input.actorId)
     return { evidenceId: evidence.id, packageDigest: stored.sha256, checks }
   }

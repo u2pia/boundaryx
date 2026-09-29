@@ -94,6 +94,21 @@ export function criterionStatus(coverage: CriterionCoverage, checks: Array<{ nam
 }
 
 /**
+ * Summarises whether the package contains independent passing evidence for every critical non-human criterion.
+ * Human criteria are intentionally excluded because the reviewer, not a test, supplies that evidence. Unknown or
+ * incomplete coverage stays unknown instead of being promoted to a passing signal.
+ */
+export function independentTestSignalFromCriteria(coverage: CriterionCoverage[] | undefined, checks: Array<{ name: string; status?: string; conclusion?: string }>): boolean | undefined {
+  if (!coverage) return undefined
+  const critical = coverage.filter((criterion) => criterion.criticality === 'critical' && criterion.verificationType !== 'human')
+  if (!critical.length) return undefined
+  const completedChecks = checks.map((check) => ({ ...check, status: check.status ?? 'completed' }))
+  const statuses = critical.map((criterion) => criterionStatus(criterion, completedChecks))
+  if (statuses.some((status) => status === 'self_graded' || status === 'needs_test_review' || status === 'failed')) return false
+  return statuses.every((status) => status === 'passed') ? true : undefined
+}
+
+/**
  * A critical human criterion is what the approver signs, so it has to say what they judge: no template placeholder
  * and at least 8 characters, which rules out 「ok」「人工审核通过」 and the like. Deterministic and model criteria have
  * checks to keep them honest; this one only has its wording. Same rule as src/intent-templates.ts, which blocks it

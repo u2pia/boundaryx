@@ -48,3 +48,12 @@ export function declaredContextSections(request) {
     ...(leftOut.length ? [`\nDeclared context left out because the prompt budget was spent: ${leftOut.join(', ')}. Read them from the working directory if you need them.`] : []),
   ]
 }
+
+/** The governed Skill catalog bound to the same base revision as the run. Content is loaded only when needed. */
+export function skillCatalogSections(request, loadInstruction) {
+  const skills = request.projectManifest?.skills ?? []
+  if (!skills.length) return []
+  return [
+    `\n## Available Skills\n\nThese reusable methods are declared by the reviewed project manifest and fixed to base revision ${String(request.projectManifest.baseSha ?? '').slice(0, 12)}. ${loadInstruction}\n${skills.map((skill) => `- ${skill.name}: ${skill.description} (${skill.path}, ${skill.contentDigest})`).join('\n')}`,
+  ]
+}

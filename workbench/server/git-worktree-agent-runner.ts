@@ -6,6 +6,7 @@ import type { ControlPlaneDatabase } from './database.ts'
 import { resolveProjectRepository } from './code-host/index.ts'
 import { LocalGitAuthority } from './local-git-authority.ts'
 import { applyProjectManifest, loadProjectManifest, type ProjectManifestBinding } from './project-manifest.ts'
+import { bindProjectSkills, type ProjectSkillBinding } from './project-skills.ts'
 import { progressPathFor, readBuilderSteps } from './run-progress.ts'
 import { removeRunWorktree, runRootFor, type PruneOutcome } from './run-worktree-lifecycle.ts'
 import { compileDeclaredContext, declaredContextSummary, type DeclaredContextEntry } from './declared-context.ts'
@@ -91,7 +92,8 @@ export interface AgentRunPostprocessor {
  * run, so it is not independently observed.
  */
 type ContextReport = { type: 'context_consumed'; path: string; source: 'agent_protocol' | 'engine_stream'; tool?: string; offset?: number; limit?: number }
-type AgentProtocolMessage = ContextReport | { type: 'message'; summary: string; stopped?: BuilderStopReason }
+type SkillLoadReport = { type: 'skill_loaded'; name: string; path: string; contentDigest: string; source: 'builder_tool' | 'engine_stream' | 'agent_protocol' }
+type AgentProtocolMessage = ContextReport | SkillLoadReport | { type: 'message'; summary: string; stopped?: BuilderStopReason }
 const builderStopReasons: readonly string[] = ['time_budget', 'step_budget'] satisfies BuilderStopReason[]
 
 function git(repositoryPath: string, args: string[]) {
@@ -123,6 +125,7 @@ function parseProtocol(stdout: string) {
         const limit = count(value.limit)
         messages.push({ type: 'context_consumed', path: value.path, source: value.source === 'engine_stream' ? 'engine_stream' : 'agent_protocol', ...(typeof value.tool === 'string' ? { tool: value.tool.slice(0, 40) } : {}), ...(offset === undefined ? {} : { offset }), ...(limit === undefined ? {} : { limit }) })
       }
+      if (value.type === 'skill_loaded' && typeof value.name === 'string' && typeof value.path === 'string' && typeof value.contentDigest === 'string') messages.push({ type: 'skill_loaded', name: value.name.slice(0, 80), path: value.path, contentDigest: value.contentDigest, source: value.source === 'engine_stream' ? 'engine_stream' : value.source === 'agent_protocol' ? 'agent_protocol' : 'builder_tool' })
       if (value.type === 'message' && typeof value.summary === 'string') messages.push({ type: 'message', summary: value.summary.slice(0, 1000), ...(typeof value.stopped === 'string' && builderStopReasons.includes(value.stopped) ? { stopped: value.stopped as BuilderStopReason } : {}) })
     } catch {}
   }
@@ -174,6 +177,7 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     const reviewFeedback = revisionProposal ? this.input.database.listCurrentChangeRequests(revisionProposal.id) : []
     if (revisionProposal && !reviewFeedback.length) throw new AppError(409, 'Revision run requires current changes_requested feedback', 'revision_feedback_missing')
     const projectManifest = loadProjectManifest(repositoryPath, baseSha)
+    const projectSkills = bindProjectSkills(repositoryPath, baseSha, projectManifest.manifest.skills)
     const holdout = projectManifest.manifest.evaluation.holdout
     if (holdout && this.input.database.readEvaluationHoldout(workItem.projectId, holdout.digest) === undefined) throw new AppError(422, `The evaluation holdout ${holdout.digest} named by the project manifest is not registered with this Control Plane, or no longer has that digest`, 'evaluation_holdout_missing')
     const declaredContextPaths = applyProjectManifest({ binding: projectManifest, workItem, intent, runtime: this.descriptor, declaredContextPaths: request.declaredContextPaths })
@@ -189,14 +193,14 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     const worktree = worktreeGitDirectories(repositoryPath, worktreePath)
     gitIn(worktree, ['config', 'user.name', 'BoundaryX Local Agent'])
     gitIn(worktree, ['config', 'user.email', 'local-agent@aperture.invalid'])
-    writeFileSync(requestPath, JSON.stringify({ runId, workItem, intent, workspace: worktreePath, projectManifest: { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, evaluation: { profile: projectManifest.manifest.evaluation.profile, datasetPath: projectManifest.manifest.evaluation.datasetPath, holdout: Boolean(holdout), datasetDigest: projectManifest.evaluationDatasetDigest, thresholds: projectManifest.manifest.evaluation.thresholds }, artifact: projectManifest.manifest.artifact ?? null, builder: { allowShell: projectManifest.manifest.builder?.allowShell === true } }, declaredContextPaths, declaredContext: { baseSha, entries: declaredContext.entries.map((entry) => ({ path: entry.path, required: entry.required, fileBytes: entry.fileBytes, truncatedAt: entry.truncatedAt, content: entry.content })), omitted: declaredContext.omitted }, revision: revisionProposal ? { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedback: reviewFeedback } : null }, null, 2))
+    writeFileSync(requestPath, JSON.stringify({ runId, workItem, intent, workspace: worktreePath, projectManifest: { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, skills: projectSkills, evaluation: { profile: projectManifest.manifest.evaluation.profile, datasetPath: projectManifest.manifest.evaluation.datasetPath, holdout: Boolean(holdout), datasetDigest: projectManifest.evaluationDatasetDigest, thresholds: projectManifest.manifest.evaluation.thresholds }, artifact: projectManifest.manifest.artifact ?? null, builder: { allowShell: projectManifest.manifest.builder?.allowShell === true } }, declaredContextPaths, declaredContext: { baseSha, entries: declaredContext.entries.map((entry) => ({ path: entry.path, required: entry.required, fileBytes: entry.fileBytes, truncatedAt: entry.truncatedAt, content: entry.content })), omitted: declaredContext.omitted }, revision: revisionProposal ? { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedback: reviewFeedback } : null }, null, 2))
     const runtimeContext = { runId, worktreePath, git: worktree, requestPath, timeoutMs }
     const attestation = this.input.runtime.attest(runtimeContext)
     const run = this.input.database.createAgentRun({ id: runId, workItemId: workItem.id, intentVersionId: intent.id, repositoryPath, baseRef: request.baseRef, baseSha, startSha, revisionOfProposalId: revisionProposal?.id, branchRef, worktreePath, adapterId: this.id, isolation: attestation.isolation, runtimeImageRef: attestation.imageRef, runtimeAttestationDigest: attestation.attestationDigest, networkEgress: attestation.networkEgress, productionEligible: attestation.productionEligible, startedByActorId: actorId, status: 'queued' })
     this.input.database.saveAgentRunPlan({ runId, declaredContextPaths, requestPath, timeoutMs })
     this.input.database.recordAgentRunEvent(runId, 'agent_run.runtime_attested', attestation, actorId)
     if (revisionProposal) this.input.database.recordAgentRunEvent(runId, 'agent_run.revision_feedback_bound', { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedbackReviewIds: reviewFeedback.map((feedback) => feedback.reviewId), feedbackDigest: `sha256:${sha256(JSON.stringify(reviewFeedback))}` }, actorId)
-    this.input.database.recordAgentRunEvent(runId, 'agent_run.project_manifest_bound', { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, schemaVersion: projectManifest.manifest.schemaVersion, productType: projectManifest.manifest.productType, requiredContextCount: projectManifest.manifest.context.required.length, allowedContextCount: projectManifest.manifest.context.allowed.length, checks: projectManifest.manifest.checks.map((check) => ({ name: check.name, kind: check.kind })), evaluationProfile: projectManifest.manifest.evaluation.profile, evaluationDatasetPath: projectManifest.manifest.evaluation.datasetPath ?? null, evaluationHoldout: Boolean(holdout), evaluationDatasetDigest: projectManifest.evaluationDatasetDigest ?? null, artifact: projectManifest.manifest.artifact ?? null, policy: projectManifest.manifest.policy, builder: { allowShell: projectManifest.manifest.builder?.allowShell === true } }, actorId)
+    this.input.database.recordAgentRunEvent(runId, 'agent_run.project_manifest_bound', { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, schemaVersion: projectManifest.manifest.schemaVersion, productType: projectManifest.manifest.productType, requiredContextCount: projectManifest.manifest.context.required.length, allowedContextCount: projectManifest.manifest.context.allowed.length, skills: projectSkills.map((skill) => ({ name: skill.name, path: skill.path, contentDigest: skill.contentDigest, fileBytes: skill.fileBytes })), checks: projectManifest.manifest.checks.map((check) => ({ name: check.name, kind: check.kind })), evaluationProfile: projectManifest.manifest.evaluation.profile, evaluationDatasetPath: projectManifest.manifest.evaluation.datasetPath ?? null, evaluationHoldout: Boolean(holdout), evaluationDatasetDigest: projectManifest.evaluationDatasetDigest ?? null, artifact: projectManifest.manifest.artifact ?? null, policy: projectManifest.manifest.policy, builder: { allowShell: projectManifest.manifest.builder?.allowShell === true } }, actorId)
     this.input.database.recordAgentRunEvent(runId, 'agent_run.context_compiled', declaredContextSummary(declaredContext), actorId)
     this.input.database.recordAgentRunEvent(runId, 'agent_run.workspace_prepared', { worktreePath, branchRef, requestDigest: `sha256:${sha256(readFileSync(requestPath))}`, isolation: attestation.isolation, productionEligible: attestation.productionEligible }, actorId)
     return run
@@ -228,6 +232,7 @@ export class GitWorktreeAgentRunner implements AgentRunner {
       return this.terminal(runId, repositoryPath, actorId, { status: 'failed', errorMessage: 'Runtime attestation changed between admission and execution' })
     }
     const projectManifest = loadProjectManifest(repositoryPath, baseSha)
+    const projectSkills = bindProjectSkills(repositoryPath, baseSha, projectManifest.manifest.skills)
     if (projectManifest.digest !== this.input.database.listAggregateEvents('agent_run', runId).find((event) => event.eventType === 'agent_run.project_manifest_bound')?.payload.digest) {
       this.input.database.recordAgentRunEvent(runId, 'agent_run.project_manifest_drift', { observed: projectManifest.digest }, actorId)
       return this.terminal(runId, repositoryPath, actorId, { status: 'failed', errorMessage: 'Project manifest changed between admission and execution' })
@@ -254,7 +259,8 @@ export class GitWorktreeAgentRunner implements AgentRunner {
           // The agent's own report; review readiness reads `stopped` from the run behind the current head.
           this.input.database.recordAgentRunEvent(runId, 'agent_run.message', { summary: message.summary, ...(message.stopped ? { stopped: message.stopped } : {}) }, actorId)
           builderStopped = message.stopped ?? builderStopped
-        } else this.recordContextConsumption(runId, worktreePath, declaredContextPaths, message, actorId)
+        } else if (message.type === 'skill_loaded') this.recordSkillLoad(runId, projectSkills, message, actorId)
+        else this.recordContextConsumption(runId, worktreePath, declaredContextPaths, projectSkills, message, actorId)
       }
       if (this.input.database.isAgentRunCancellationRequested(runId)) return this.terminal(runId, repositoryPath, actorId, { status: 'cancelled', exitCode, stdoutDigest, stderrDigest, errorMessage: 'Agent run was cancelled while the agent was generating' })
       if (result.error) throw new AppError((result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT' ? 408 : 422, `Agent runtime failed: ${result.error.message}`, 'agent_runtime_failed')
@@ -363,7 +369,16 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     for (const entry of compiled?.entries ?? []) this.input.database.recordAgentRunEvent(runId, 'agent_run.context_consumed', { path: entry.path, declared: true, required: entry.required, contentDigest: entry.injectedDigest, fileDigest: entry.fileDigest, fileBytes: entry.fileBytes, injectedBytes: entry.injectedBytes, truncatedAt: entry.truncatedAt, revision: compiled!.baseSha, reportSource: 'control_plane_injection', independentlyObserved: true }, actorId)
   }
 
-  private recordContextConsumption(runId: string, worktreePath: string, declaredContextPaths: string[], report: ContextReport, actorId: string) {
+  private recordSkillLoad(runId: string, projectSkills: ProjectSkillBinding[], report: SkillLoadReport, actorId: string) {
+    const skill = projectSkills.find((candidate) => candidate.name === report.name && candidate.path === report.path)
+    if (!skill || skill.contentDigest !== report.contentDigest) {
+      this.input.database.recordAgentRunEvent(runId, 'agent_run.skill_rejected', { name: report.name, path: report.path, reportedDigest: report.contentDigest, reason: skill ? 'digest_mismatch' : 'not_declared', reportSource: report.source }, actorId)
+      return
+    }
+    this.input.database.recordAgentRunEvent(runId, 'agent_run.skill_loaded', { name: skill.name, path: skill.path, description: skill.description, revision: skill.baseSha, contentDigest: skill.contentDigest, fileBytes: skill.fileBytes, reportSource: report.source, independentlyObserved: false }, actorId)
+  }
+
+  private recordContextConsumption(runId: string, worktreePath: string, declaredContextPaths: string[], projectSkills: ProjectSkillBinding[], report: ContextReport, actorId: string) {
     const reported = { reportSource: report.source, ...(report.tool ? { tool: report.tool } : {}), ...(report.offset === undefined ? {} : { offset: report.offset }), ...(report.limit === undefined ? {} : { limit: report.limit }) }
     const candidate = resolve(worktreePath, report.path)
     const insideWorktree = candidate === worktreePath || candidate.startsWith(`${worktreePath}${sep}`)
@@ -376,7 +391,10 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     // A search across a directory (Grep in content mode) read the matching lines of files under it, which cannot be
     // named one by one from the report; it is recorded as the directory searched, with nothing to digest.
     const declared = kind === 'file' ? declaredContextPaths.includes(normalizedPath) : false
-    this.input.database.recordAgentRunEvent(runId, 'agent_run.context_consumed', { path: normalizedPath, declared, ...(kind === 'file' ? { contentDigest: `sha256:${sha256(readFileSync(candidate))}` } : { searchedDirectory: true }), ...reported, independentlyObserved: false }, actorId)
+    const contentDigest = kind === 'file' ? `sha256:${sha256(readFileSync(candidate))}` : undefined
+    this.input.database.recordAgentRunEvent(runId, 'agent_run.context_consumed', { path: normalizedPath, declared, ...(contentDigest ? { contentDigest } : { searchedDirectory: true }), ...reported, independentlyObserved: false }, actorId)
+    const skill = kind === 'file' ? projectSkills.find((candidateSkill) => candidateSkill.path === normalizedPath) : undefined
+    if (skill && contentDigest) this.recordSkillLoad(runId, projectSkills, { type: 'skill_loaded', name: skill.name, path: skill.path, contentDigest, source: report.source }, actorId)
   }
 
 }

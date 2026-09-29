@@ -235,7 +235,7 @@ export type ReleaseCandidate = {
   sourceTreeDigest: string
   sourceFileCount: number
   artifactClass: 'source_snapshot' | 'source_with_build_attestation'
-  artifactEvidence: Array<{ evidenceId: string; packageDigest: string; artifactCount: number }>
+  artifactEvidence: Array<{ evidenceId: string; packageDigest: string; artifactCount: number; artifactDigests: string[]; sourceCommitSha: string; buildCheckName: string }>
   artifactBindingDigest?: string
   contentDigest: string
   status: 'review_ready' | 'approved' | 'cancelled'
@@ -306,10 +306,39 @@ export type ReviewMetrics = {
    */
   approvalDecisionCount: number
   evidenceExpandedApprovalCount: number
+  decisionBriefViewCount: number
+  decisionBriefOpenedDecisionCount: number
+  medianBriefToDecisionSeconds: number
   decidedProposalCount: number
   firstPassApprovalCount: number
   reworkedProposalCount: number
   acceptedChangeCount: number
+}
+
+export type DecisionBrief = {
+  generatedAt: string
+  proposal: Pick<ChangeProposal, 'id' | 'status' | 'baseRef' | 'baseSha' | 'headRef' | 'headSha' | 'changedFiles' | 'additions' | 'deletions' | 'policyFiles' | 'reviewCycleStartedAt'>
+  workItem: Pick<WorkItem, 'id' | 'sequence' | 'title' | 'description' | 'productType'>
+  intent: Pick<IntentVersion, 'id' | 'version' | 'goal' | 'constraints' | 'nonGoals' | 'examples' | 'riskLevel' | 'contentDigest' | 'draft'>
+  gate: {
+    state: ReviewReadiness['status']
+    nextAction: 'resolve_blockers' | 'review_human_judgement' | 'review_and_decide' | 'already_decided' | 'await_revision' | 'completed'
+    blockers: string[]
+    criteria: ReviewReadiness['criteria']
+    checks: { successful: number; failed: number; waived: number; pending: number }
+  }
+  context: { observation: 'available' | 'unavailable'; controlPlaneInjected: number; builderReported: number; rejected: number; undeclared: number; skillsLoaded: number; skillsRejected: number }
+  execution: { source: 'local_agent_run' | 'external_run_reference' | 'manual'; runId?: string; status?: AgentRun['status']; adapterId?: string; isolation?: AgentRun['isolation']; productionEligible?: boolean; builderStop: ReviewReadiness['builderStop'] }
+  evidence: Array<{ id: string; runId: string; sha256: string; status?: string; artifactCount: number; independentTestSignal?: boolean; viewedByReviewer: boolean; createdAt: string }>
+  review: {
+    assignment?: ReviewAssignment
+    currentDecisions: Array<Pick<ReviewRecord, 'id' | 'decision' | 'comment' | 'reviewerDisplayName' | 'decisionLatencySeconds' | 'createdAt'>>
+    briefOpenedAt?: string
+    evidenceOpenedAt?: string
+    assignmentCycleElapsedSeconds?: number
+  }
+  viewer: { role: TeamRole; relationship: 'author' | 'assignee' | 'reviewer'; canComment: boolean; canRecordTerminalDecision: boolean; approvalRestrictedToOwner: boolean; restriction?: 'self_review_forbidden' | 'review_not_assigned' | 'proposal_completed' }
+  attention: string[]
 }
 
 export type ReviewCheckRecord = {

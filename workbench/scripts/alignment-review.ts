@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { administrationPageLabels, corePageLabels, labPageLabels } from '../src/product-surfaces.ts'
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url))
 const workbenchDirectory = resolve(scriptDirectory, '..')
@@ -20,8 +21,6 @@ function countOccurrences(content: string, pattern: RegExp) {
 
 const sourceFiles = [...files(sourceDirectory, '.ts'), ...files(sourceDirectory, '.tsx')]
 const sourceContent = sourceFiles.map((file) => readFileSync(file, 'utf8')).join('\n')
-const pageDeclaration = mainSource.match(/type Page = (?<pages>[^\n]+)/u)?.groups?.pages ?? ''
-const pages = pageDeclaration.split('|').map((value) => value.trim()).filter(Boolean)
 const adapterFiles = readdirSync(adapterDirectory).filter((file) => file.endsWith('.ts') && file !== 'contracts.ts')
 const smokeTests = readdirSync(resolve(workbenchDirectory, 'scripts')).filter((file) => file.endsWith('-smoke.ts'))
 
@@ -34,7 +33,10 @@ const report = {
     reviewTemplate: existsSync(resolve(controlPlaneDirectory, 'docs/reviews/ALIGNMENT_REVIEW_TEMPLATE.md')),
   },
   scopeEvidence: {
-    defaultPageCount: pages.length,
+    defaultWorkspacePageCount: corePageLabels.length,
+    administrationPageCount: administrationPageLabels.length,
+    labPageCount: labPageLabels.length,
+    labDefaultEnabled: false,
     adapterFileCount: adapterFiles.length,
     smokeTestCount: smokeTests.length,
     mockReferenceCount: countOccurrences(sourceContent, /\bMock[A-Z]\w*/gu),

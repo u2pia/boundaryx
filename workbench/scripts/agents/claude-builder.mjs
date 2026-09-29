@@ -3,7 +3,7 @@ import { readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
 import { progress } from './progress.mjs'
 import { cliTimeoutMs, partialMessage } from './run-deadline.mjs'
-import { declaredContextSections, taskPrompt } from './run-request.mjs'
+import { declaredContextSections, skillCatalogSections, taskPrompt } from './run-request.mjs'
 
 const [claudeExecutable, ...configuredArgs] = process.argv.slice(2)
 const requestPath = process.env.APERTURE_RUN_REQUEST
@@ -40,6 +40,7 @@ if (overriding.length) {
 
 const request = JSON.parse(readFileSync(requestPath, 'utf8'))
 const contextSections = declaredContextSections(request)
+const skillSections = skillCatalogSections(request, 'When a Skill applies, read its exact declared path before implementing it; a successful Read is recorded as Skill usage evidence.')
 const prompt = `${taskPrompt(request)}
 
 Operate only inside the current working directory, which is an isolated Git worktree.
@@ -47,7 +48,8 @@ You have file read and write tools only; you cannot run commands. The Control Pl
 project's declared checks after you finish, so do not try to execute the tests yourself.
 Do not delete, skip or weaken existing tests. Do not add dependencies. Do not create a Git commit.
 Finish with a concise summary of changed files and remaining risks.
-${contextSections.join('\n')}`
+${contextSections.join('\n')}
+${skillSections.join('\n')}`
 
 const promptPath = resolve(dirname(requestPath), 'claude-prompt.txt')
 writeFileSync(promptPath, prompt)

@@ -6,7 +6,7 @@ import type { ControlPlaneDatabase } from './database.ts'
 import { codeHostFor } from './code-host/index.ts'
 import { CodeHostSyncer } from './code-host/syncer.ts'
 import { createPkcePair, fetchGithubIdentity, githubAuthorizeUrl, type GithubOAuthConfig } from './github-oauth.ts'
-import type { LocalEvidenceStore } from './local-evidence-store.ts'
+import type { LocalEvidenceStore, StoredEvidencePackage } from './local-evidence-store.ts'
 import { LocalGitAuthority } from './local-git-authority.ts'
 import { LocalReleaseAuthority } from './local-release-authority.ts'
 import { requestContext, type RequestContext } from './request-context.ts'
@@ -14,6 +14,7 @@ import { projectContext, projectContextFile } from './project-context.ts'
 import { projectProductType } from './project-product-type.ts'
 import { probeAgentProvider } from './provider-probe.ts'
 import { generateIntentDraft, maximumBriefLength, projectDraftingContext } from './intent-drafter.ts'
+import { independentTestSignalFromCriteria } from './criteria-coverage.ts'
 import { agentRunProgress } from './run-progress.ts'
 import { createSessionToken } from './security.ts'
 import { AppError, type AgentRunner, type AgentRunnerDescriptor, type CodeHostKind, type MergeMode, type ProjectRole, type SessionActor, type TeamRole } from './types.ts'
@@ -75,6 +76,37 @@ function requireString(body: Record<string, unknown>, key: string) {
 
 function optionalString(body: Record<string, unknown>, key: string) {
   return typeof body[key] === 'string' && body[key].trim() ? body[key].trim() : undefined
+}
+
+function evidenceSummaryFromPackage(stored: StoredEvidencePackage, trustMode: string) {
+  const failedChecks = stored.checks.filter((check) => check.conclusion === 'failure' || check.conclusion === 'cancelled').length
+  const passedChecks = stored.checks.filter((check) => check.conclusion === 'success').length
+  const independentTestSignal = independentTestSignalFromCriteria(stored.criteriaCoverage, stored.checks)
+  const buildCheckName = stored.projectManifest?.artifact?.buildCheck
+  const buildCheckConclusion = buildCheckName ? stored.checks.find((check) => check.name === buildCheckName)?.conclusion : undefined
+  const artifactDigests = stored.artifacts?.map((artifact) => artifact.sha256) ?? []
+  const artifactSourceCommitShas = stored.artifacts?.map((artifact) => artifact.sourceCommitSha) ?? []
+  return {
+    status: failedChecks ? 'blocked' : stored.checks.length ? 'ready' : 'incomplete',
+    totalChecks: stored.checks.length,
+    passed: passedChecks,
+    failed: failedChecks,
+    failedChecks,
+    ...(independentTestSignal === undefined ? {} : { independentTestSignal }),
+    artifactCount: stored.artifacts?.length ?? 0,
+    ...(buildCheckName ? { buildCheckName, buildCheckConclusion } : {}),
+    ...(artifactDigests.length ? { artifactDigests, artifactSourceCommitShas } : {}),
+    skillCatalogCount: stored.projectManifest?.skills?.length ?? 0,
+    skillLoadedCount: stored.skillUsage?.loaded.length ?? 0,
+    skillRejectedCount: stored.skillUsage?.rejected.length ?? 0,
+    policyFiles: stored.policyChanges?.files ?? [],
+    builderStopped: stored.run.builderStopped ?? null,
+    ...(stored.criteriaCoverage ? { criteriaCoverage: stored.criteriaCoverage } : {}),
+    eventChainHeads: { runEventChainHead: stored.provenance.runEventChainHead, proposalEventChainHead: stored.provenance.proposalEventChainHead },
+    packageSchema: stored.schemaVersion,
+    generatedAt: stored.generatedAt,
+    trustMode,
+  }
 }
 
 function requireActor(database: ControlPlaneDatabase, request: IncomingMessage) {
@@ -550,6 +582,17 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
       if (method === 'GET' && proposalRoute) requireIn(proposalProject(proposalRoute.proposalId))
       if (method === 'GET' && proposalRoute) return sendJson(response, 200, { changeProposal: database.getChangeProposal(proposalRoute.proposalId), mergeEvidence: database.getMergeEvidenceOptional(proposalRoute.proposalId), codeHostLink: database.getCodeHostLink(proposalRoute.proposalId) ?? null, events: database.listAggregateEvents('change_proposal', proposalRoute.proposalId) })
 
+      const decisionBriefRoute = routeMatch(path, /^\/api\/change-proposals\/(?<proposalId>[^/]+)\/decision-brief$/u)
+      if (method === 'GET' && decisionBriefRoute) {
+        requireIn(proposalProject(decisionBriefRoute.proposalId), ['owner', 'maintainer', 'reviewer'])
+        return sendJson(response, 200, { decisionBrief: database.getDecisionBrief(decisionBriefRoute.proposalId, actor.id) })
+      }
+      if (method === 'POST' && decisionBriefRoute) {
+        requireIn(proposalProject(decisionBriefRoute.proposalId), ['owner', 'maintainer', 'reviewer'])
+        const view = database.recordDecisionBriefView(decisionBriefRoute.proposalId, actor.id)
+        return sendJson(response, 200, { view, decisionBrief: database.getDecisionBrief(decisionBriefRoute.proposalId, actor.id) })
+      }
+
       const refreshRoute = routeMatch(path, /^\/api\/change-proposals\/(?<proposalId>[^/]+)\/refresh$/u)
       if (method === 'POST' && refreshRoute) requireIn(proposalProject(refreshRoute.proposalId))
       if (method === 'POST' && refreshRoute) {
@@ -635,11 +678,9 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         // The digest only proves the package is intact, not that it is about this proposal: a package from another
         // run or revision would otherwise vouch for this one.
         if (stored.git?.headSha !== headSha || stored.intent?.id !== proposal.intentVersionId || stored.run?.id !== runId) throw new AppError(409, 'The evidence package describes a different revision, intent or run than this change proposal', 'evidence_package_mismatch')
-        // Readiness trusts summary.criteriaCoverage, so it comes from the verified package, never from the request body.
-        // So are the event chain heads the merge gate checks against the live chains.
-        const { criteriaCoverage: _claimed, eventChainHeads: _claimedHeads, ...summary } = body.summary && typeof body.summary === 'object' && !Array.isArray(body.summary) ? body.summary as Record<string, unknown> : {}
-        const heads = stored.provenance && typeof stored.provenance.runEventChainHead === 'string' && typeof stored.provenance.proposalEventChainHead === 'string' ? { eventChainHeads: { runEventChainHead: stored.provenance.runEventChainHead, proposalEventChainHead: stored.provenance.proposalEventChainHead } } : {}
-        const evidence = database.recordEvidence({ proposalId: evidenceRoute.proposalId, runId, headSha, uri, sha256: digest, summary: { ...summary, ...(Array.isArray(stored.criteriaCoverage) ? { criteriaCoverage: stored.criteriaCoverage } : {}), ...heads } }, actor.id)
+        // Every field used by readiness, release or Decision Brief comes from the digest-verified package. The request
+        // may point at a package, but it cannot upgrade that package's status, artifact count or independence claim.
+        const evidence = database.recordEvidence({ proposalId: evidenceRoute.proposalId, runId, headSha, uri, sha256: digest, summary: evidenceSummaryFromPackage(stored, database.getIdentityMode()) }, actor.id)
         return sendJson(response, 201, { evidence })
       }
 

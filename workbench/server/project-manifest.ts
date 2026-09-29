@@ -5,6 +5,7 @@ import { AppError, type AgentRunnerDescriptor, type IntentVersion, type WorkItem
 import { GIT_NO_EXEC } from './worktree-git.ts'
 
 export const PROJECT_MANIFEST_PATH = '.aperture/project.json'
+export const PROJECT_SKILLS_PATH_PREFIX = '.aperture/skills/'
 
 export type ProjectManifestCheck = {
   name: string
@@ -24,6 +25,12 @@ export type ProjectEvaluationThreshold = {
   threshold: number
 }
 
+export type ProjectManifestSkill = {
+  name: string
+  path: string
+  description: string
+}
+
 export const PROJECT_MANIFEST_VERSIONS = ['aperture.project.v1', 'aperture.project.v2'] as const
 
 export type ProjectManifest = {
@@ -33,6 +40,8 @@ export type ProjectManifest = {
     required: string[]
     allowed: string[]
   }
+  /** Versioned, repository-owned operating instructions that a Builder may load explicitly. */
+  skills?: ProjectManifestSkill[]
   checks: ProjectManifestCheck[]
   /**
    * Repository paths that hold the project's own acceptance tests. Files under these paths
@@ -129,6 +138,29 @@ function parseManifest(raw: string): ProjectManifest {
   const allowed = stringArray(context.allowed, 'context.allowed')
   const allowedSet = new Set(allowed)
   for (const requiredPath of required) if (!allowedSet.has(requiredPath)) throw new AppError(422, `Required context path is not allowed: ${requiredPath}`, 'invalid_project_manifest')
+
+  let skills: ProjectManifestSkill[] | undefined
+  if (root.skills !== undefined) {
+    if (!Array.isArray(root.skills)) throw new AppError(422, 'skills must be an array', 'invalid_project_manifest')
+    const names = new Set<string>()
+    const paths = new Set<string>()
+    skills = root.skills.map((item, index) => {
+      const skill = requireObject(item, `skills[${index}]`)
+      if (typeof skill.name !== 'string' || !skill.name.trim()) throw new AppError(422, `skills[${index}].name is required`, 'invalid_project_manifest')
+      const name = skill.name.trim()
+      if (name.length > 80) throw new AppError(422, `skills[${index}].name must be at most 80 characters`, 'invalid_project_manifest')
+      if (names.has(name)) throw new AppError(422, `Duplicate skill name: ${name}`, 'invalid_project_manifest')
+      names.add(name)
+      const path = normalizeRepositoryPath(skill.path, `skills[${index}].path`)
+      if (!path.startsWith(PROJECT_SKILLS_PATH_PREFIX)) throw new AppError(422, `skills[${index}].path must be under ${PROJECT_SKILLS_PATH_PREFIX}`, 'invalid_project_manifest')
+      if (paths.has(path)) throw new AppError(422, `Duplicate skill path: ${path}`, 'invalid_project_manifest')
+      paths.add(path)
+      if (typeof skill.description !== 'string' || !skill.description.trim()) throw new AppError(422, `skills[${index}].description is required`, 'invalid_project_manifest')
+      const description = skill.description.trim()
+      if (description.length > 200) throw new AppError(422, `skills[${index}].description must be at most 200 characters`, 'invalid_project_manifest')
+      return { name, path, description }
+    })
+  }
 
   if (!Array.isArray(root.checks) || root.checks.length === 0) throw new AppError(422, 'checks must contain at least one deterministic check', 'invalid_project_manifest')
   const checkNames = new Set<string>()
@@ -227,6 +259,7 @@ function parseManifest(raw: string): ProjectManifest {
     schemaVersion,
     productType: root.productType,
     context: { required, allowed },
+    ...(skills ? { skills } : {}),
     checks,
     testPaths,
     evaluation,

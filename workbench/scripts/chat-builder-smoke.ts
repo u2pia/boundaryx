@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -14,18 +15,23 @@ const secret = 'sk-test-never-leaves-the-builder'
 
 mkdirSync(workspace)
 writeFileSync(join(workspace, 'README.md'), '# Fixture\n')
+mkdirSync(join(workspace, '.aperture/skills'), { recursive: true })
+const skillContent = '# Generate fixture\nCreate the generated module without changing README.\n'
+writeFileSync(join(workspace, '.aperture/skills/generate-fixture.md'), skillContent)
+const skillDigest = `sha256:${createHash('sha256').update(skillContent).digest('hex')}`
 writeFileSync(join(root, 'outside.txt'), 'not yours\n')
 spawnSync('git', ['init', '--quiet', workspace])
-writeFileSync(requestPath, JSON.stringify({ runId: 'RUN-CHAT', workItem: { title: 'Build fixture', productType: 'application' }, intent: { goal: 'Create src/generated.ts', constraints: ['offline'], nonGoals: ['Do not touch README.md'], examples: [{ input: 'import it', expected: 'generated === true' }], acceptanceCriteria: [{ statement: 'File exists', criticality: 'critical', verificationType: 'deterministic' }] }, declaredContextPaths: ['README.md'], declaredContext: { baseSha: 'a'.repeat(40), budgetBytes: 200000, entries: [{ path: 'README.md', required: true, fileBytes: 20, fileDigest: 'sha256:x', injectedBytes: 20, injectedDigest: 'sha256:x', truncatedAt: null, content: '# Reviewed fixture\n' }], omitted: [{ path: 'docs/big.md', required: false, reason: 'budget' }] }, projectManifest: { builder: { allowShell: true } } }))
+writeFileSync(requestPath, JSON.stringify({ runId: 'RUN-CHAT', workItem: { title: 'Build fixture', productType: 'application' }, intent: { goal: 'Create src/generated.ts', constraints: ['offline'], nonGoals: ['Do not touch README.md'], examples: [{ input: 'import it', expected: 'generated === true' }], acceptanceCriteria: [{ statement: 'File exists', criticality: 'critical', verificationType: 'deterministic' }] }, declaredContextPaths: ['README.md'], declaredContext: { baseSha: 'a'.repeat(40), budgetBytes: 200000, entries: [{ path: 'README.md', required: true, fileBytes: 20, fileDigest: 'sha256:x', injectedBytes: 20, injectedDigest: 'sha256:x', truncatedAt: null, content: '# Reviewed fixture\n' }], omitted: [{ path: 'docs/big.md', required: false, reason: 'budget' }] }, projectManifest: { baseSha: 'a'.repeat(40), skills: [{ name: 'generate-fixture', path: '.aperture/skills/generate-fixture.md', description: 'Generate the fixture module safely.', fileBytes: Buffer.byteLength(skillContent), contentDigest: skillDigest }], builder: { allowShell: true } } }))
 // The same run under a manifest that does not allow a shell, which is the default.
 const noShellRequestPath = join(root, 'request-no-shell.json')
-writeFileSync(noShellRequestPath, JSON.stringify({ ...JSON.parse(readFileSync(requestPath, 'utf8')), projectManifest: { builder: { allowShell: false } } }))
+const noShellRequest = JSON.parse(readFileSync(requestPath, 'utf8'))
+writeFileSync(noShellRequestPath, JSON.stringify({ ...noShellRequest, projectManifest: { ...noShellRequest.projectManifest, builder: { allowShell: false } } }))
 
 type ChatRequest = { model: string; messages: Array<{ role: string; content: string | null; tool_call_id?: string }>; tools: Array<{ function: { name: string } }>; tool_choice?: unknown }
 const call = (id: string, name: string, args: Record<string, unknown>) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } })
 // The model's side of the conversation, one reply per request.
 const script = [
-  { tool_calls: [call('c1', 'list_files', {}), call('c2', 'read_file', { path: 'README.md' }), call('c3', 'read_file', { path: '../outside.txt' }), call('c4', 'write_file', { path: '.git/hooks/pre-commit', content: 'x' })] },
+  { tool_calls: [call('c0', 'load_skill', { name: 'generate-fixture' }), call('c1', 'list_files', {}), call('c2', 'read_file', { path: 'README.md' }), call('c3', 'read_file', { path: '../outside.txt' }), call('c4', 'write_file', { path: '.git/hooks/pre-commit', content: 'x' })] },
   { tool_calls: [call('c5', 'write_file', { path: 'src/generated.ts', content: 'export const generated = 1\n' }), call('c6', 'replace_in_file', { path: 'src/generated.ts', old_string: '= 1', new_string: '= true' }), call('c7', 'run_command', { command: 'git commit -am sneaky' }), call('c8', 'run_command', { command: 'env' })] },
   { tool_calls: [call('c9', 'finish', { summary: 'Created src/generated.ts.' })] },
 ]
@@ -97,11 +103,13 @@ try {
   assert.match(result.stderr, /deepseek · wire API chat → chat-builder/u)
   assert.equal(requests.length, 3)
   assert.equal(requests[0].model, 'deepseek-chat')
-  assert.deepEqual(requests[0].tools.map((tool) => tool.function.name), ['list_files', 'read_file', 'write_file', 'replace_in_file', 'run_command', 'finish'])
+  assert.deepEqual(requests[0].tools.map((tool) => tool.function.name), ['list_files', 'load_skill', 'read_file', 'write_file', 'replace_in_file', 'run_command', 'finish'])
   assert.match(String(requests[0].messages[0].content), /Target product type: application[\s\S]*base revision aaaaaaaaaaaa[\s\S]*Declared context: README\.md\n\n# Reviewed fixture[\s\S]*left out because the prompt budget was spent: docs\/big\.md/u, 'the prompt carries the compiled context, not the worktree file')
   assert.match(String(requests[0].messages[0].content), /Out of scope[^\n]*\n- Do not touch README\.md[\s\S]*Acceptance criteria:[\s\S]*Examples of the intended behaviour[\s\S]*Input:\nimport it\nExpected:\ngenerated === true/u, 'nonGoals and examples reach the prompt')
+  assert.match(String(requests[0].messages[0].content), /Available Skills[\s\S]*load_skill[\s\S]*generate-fixture/u)
   assert.equal(headers.every((header) => header.authorization === `Bearer ${secret}`), true)
   const toolResult = (id: string) => String(requests.flatMap((request) => request.messages).find((message) => message.tool_call_id === id)?.content)
+  assert.match(toolResult('c0'), /Create the generated module/u)
   assert.match(toolResult('c1'), /README\.md/u)
   assert.match(toolResult('c2'), /# Fixture/u)
   assert.match(toolResult('c3'), /outside the worktree/u)
@@ -113,11 +121,12 @@ try {
   assert.equal(existsSync(join(workspace, '.git/hooks/pre-commit')), false)
   assert.equal(spawnSync('git', ['-C', workspace, 'rev-parse', '--verify', '--quiet', 'HEAD']).status !== 0, true, 'no commit was made')
   assert.match(result.stdout, /"type":"context_consumed","path":"README\.md"/u)
+  assert.match(result.stdout, /"type":"skill_loaded","source":"builder_tool","name":"generate-fixture"/u)
   assert.match(result.stdout, /"type":"message","summary":"Created src\/generated\.ts\."\}/u, 'a Builder that finished on its own is not marked as stopped')
   assert.equal(result.stdout.includes(secret) || result.stderr.includes(secret), false)
   // Each tool call is reported for the running Intent, by what it did and not by what it read or wrote.
   const steps = readFileSync(progressPath, 'utf8').trim().split('\n').map((line) => (JSON.parse(line) as { summary: string }).summary)
-  assert.deepEqual(steps.slice(0, 2), ['第 1 步 · 列目录 .', '第 1 步 · 读取 README.md'])
+  assert.deepEqual(steps.slice(0, 3), ['第 1 步 · 加载 Skill generate-fixture', '第 1 步 · 列目录 .', '第 1 步 · 读取 README.md'])
   assert.equal(steps.includes('第 2 步 · 写入 src/generated.ts'), true)
   assert.equal(steps.at(-1), '第 3 步 · 写总结')
   assert.equal(steps.some((step) => step.includes('export const generated')), false)
@@ -125,7 +134,7 @@ try {
   // Without builder.allowShell the chat engine has no shell: run_command is neither offered, mentioned nor run.
   const noShell = await run([join(agents, 'chat-builder.mjs')], { ...provider, APERTURE_RUN_REQUEST: noShellRequestPath, APERTURE_AGENT_PROVIDER_BASE_URL: `http://127.0.0.1:${port}/no-shell`, APERTURE_AGENT_PROVIDER_WIRE_API: 'chat' })
   assert.equal(noShell.status, 0, noShell.stderr)
-  assert.deepEqual(noShellRequests[0].tools.map((tool) => tool.function.name), ['list_files', 'read_file', 'write_file', 'replace_in_file', 'finish'])
+  assert.deepEqual(noShellRequests[0].tools.map((tool) => tool.function.name), ['list_files', 'load_skill', 'read_file', 'write_file', 'replace_in_file', 'finish'])
   assert.doesNotMatch(String(noShellRequests[0].messages[0].content), /run_command/u)
   assert.match(String(noShellRequests[0].messages[0].content), /there is no shell/u)
   assert.match(String(noShellRequests[1].messages.find((message) => message.tool_call_id === 'n1')?.content), /not available: the project manifest does not set builder\.allowShell/u)
@@ -140,7 +149,7 @@ try {
   const budget = await run([join(agents, 'chat-builder.mjs')], { ...provider, APERTURE_AGENT_PROVIDER_BASE_URL: `http://127.0.0.1:${port}/budget`, APERTURE_AGENT_PROVIDER_WIRE_API: 'chat', APERTURE_BUILDER_MAX_STEPS: '12' })
   assert.equal(budget.status, 0, budget.stderr)
   assert.equal(budgetRequests.length, 12)
-  assert.equal(budgetRequests.slice(0, 11).every((request) => request.tools.length === 6), true)
+  assert.equal(budgetRequests.slice(0, 11).every((request) => request.tools.length === 7), true)
   assert.deepEqual(budgetRequests[11].tools.map((tool) => tool.function.name), ['finish'])
   assert.match(JSON.stringify(budgetRequests[2].messages), /You have 10 steps left/u)
   assert.equal(existsSync(join(workspace, 'ignored-command')), false, 'nothing but finish runs on the last step')

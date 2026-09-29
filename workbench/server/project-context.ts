@@ -2,6 +2,8 @@ import { execFileSync } from 'node:child_process'
 import { resolveProjectRepository } from './code-host/index.ts'
 import { CONTEXT_PROMPT_BUDGET_BYTES } from './declared-context.ts'
 import { loadProjectManifest, PROJECT_MANIFEST_PATH } from './project-manifest.ts'
+import { PROJECT_SKILL_MAX_BYTES } from './project-skills.ts'
+import { sha256 } from './security.ts'
 import { AppError, type Project } from './types.ts'
 import { GIT_NO_EXEC } from './worktree-git.ts'
 
@@ -26,6 +28,17 @@ export type ProjectContextFile = {
 
 export type ProjectContextIssue = { severity: 'error' | 'warning'; code: string; message: string; path?: string }
 
+export type ProjectSkill = {
+  name: string
+  path: string
+  description: string
+  exists: boolean
+  sizeBytes?: number
+  contentDigest?: string
+  lastCommit?: { sha: string; author: string; committedAt: string; subject: string }
+  editUrl?: string
+}
+
 export type ProjectContext = {
   projectId: string
   branch: string
@@ -34,6 +47,7 @@ export type ProjectContext = {
   manifestFound: boolean
   manifestError?: string
   files: ProjectContextFile[]
+  skills: ProjectSkill[]
   requiredBytes: number
   budgetBytes: number
   /** Whether the chat engine gets a shell (`run_command`); only an aperture.project.v2 manifest can allow one. */
@@ -68,6 +82,14 @@ function blobSize(repositoryPath: string, baseSha: string, path: string) {
   return Number(git(repositoryPath, ['cat-file', '-s', `${baseSha}:${path}`]))
 }
 
+function blobContent(repositoryPath: string, baseSha: string, path: string) {
+  try {
+    return execFileSync('git', [...GIT_NO_EXEC, '-C', repositoryPath, 'show', `${baseSha}:${path}`], { maxBuffer: 4 * 1024 * 1024 })
+  } catch {
+    return undefined
+  }
+}
+
 function editUrl(project: Project, path: string) {
   const { owner, repo, webBase } = project.codeHostConfig
   if (project.codeHost !== 'github' || !owner || !repo) return undefined
@@ -75,13 +97,21 @@ function editUrl(project: Project, path: string) {
 }
 
 /** The manifest's context lists as written, for a manifest that does not validate; nothing else in it is trusted. */
-function rawContext(repositoryPath: string, baseSha: string) {
+function rawProjectConfiguration(repositoryPath: string, baseSha: string) {
   try {
-    const context = JSON.parse(git(repositoryPath, ['show', `${baseSha}:${PROJECT_MANIFEST_PATH}`]) ?? '').context
+    const raw = JSON.parse(git(repositoryPath, ['show', `${baseSha}:${PROJECT_MANIFEST_PATH}`]) ?? '')
+    const context = raw.context
     const paths = (value: unknown) => Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []
-    return { required: paths(context?.required), allowed: paths(context?.allowed) }
+    const skills = Array.isArray(raw.skills) ? raw.skills.flatMap((entry: unknown) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
+      const skill = entry as Record<string, unknown>
+      return typeof skill.name === 'string' && typeof skill.path === 'string' && typeof skill.description === 'string'
+        ? [{ name: skill.name, path: skill.path, description: skill.description }]
+        : []
+    }) : []
+    return { required: paths(context?.required), allowed: paths(context?.allowed), skills }
   } catch {
-    return { required: [], allowed: [] }
+    return { required: [], allowed: [], skills: [] }
   }
 }
 
@@ -97,12 +127,14 @@ export function projectContext(database: Database, projectId: string): ProjectCo
   const issues: ProjectContextIssue[] = []
   let required: string[] = []
   let allowed: string[] = []
+  let declaredSkills: Array<{ name: string; path: string; description: string }> = []
   let manifestFound = true
   let manifestError: string | undefined
   let builder: ProjectContext['builder'] = { allowShell: false }
   try {
     const { manifest } = loadProjectManifest(repositoryPath, baseSha)
     ;({ required, allowed } = manifest.context)
+    declaredSkills = manifest.skills ?? []
     builder = { schemaVersion: manifest.schemaVersion, allowShell: manifest.builder?.allowShell === true }
   } catch (error) {
     if (!(error instanceof AppError)) throw error
@@ -112,7 +144,7 @@ export function projectContext(database: Database, projectId: string): ProjectCo
     } else {
       manifestError = error.message
       issues.push({ severity: 'error', code: 'manifest_invalid', message: `${PROJECT_MANIFEST_PATH} 无法通过校验，Run 会被拒绝：${error.message}` })
-      ;({ required, allowed } = rawContext(repositoryPath, baseSha))
+      ;({ required, allowed, skills: declaredSkills } = rawProjectConfiguration(repositoryPath, baseSha))
     }
   }
 
@@ -132,14 +164,30 @@ export function projectContext(database: Database, projectId: string): ProjectCo
   for (const path of AGENT_INSTRUCTION_FILES) {
     if (!allowedSet.has(path) && blobSize(repositoryPath, baseSha, path) !== undefined) issues.push({ severity: 'warning', code: 'undeclared_instructions', path, message: `${path} 可能被 Agent 引擎自动读取，但没有在 manifest 中声明，读取不会进入上下文对账` })
   }
-  return { projectId, branch: project.defaultBranch, baseSha, manifestPath: PROJECT_MANIFEST_PATH, manifestFound, manifestError, files, requiredBytes, budgetBytes: CONTEXT_PROMPT_BUDGET_BYTES, builder, issues }
+  const skills = declaredSkills.map((skill): ProjectSkill => {
+    const content = blobContent(repositoryPath, baseSha, skill.path)
+    const [sha, author, committedAt, subject] = (git(repositoryPath, ['log', '-1', '--format=%H%x1f%an%x1f%aI%x1f%s', baseSha, '--', skill.path]) ?? '').split('\x1f')
+    return {
+      ...skill,
+      exists: content !== undefined,
+      sizeBytes: content?.length,
+      contentDigest: content ? `sha256:${sha256(content)}` : undefined,
+      lastCommit: sha ? { sha, author, committedAt, subject } : undefined,
+      editUrl: editUrl(project, skill.path),
+    }
+  })
+  for (const skill of skills) {
+    if (!skill.exists) issues.push({ severity: 'error', code: 'skill_missing', path: skill.path, message: `Skill ${skill.name} 声明的文件 ${skill.path} 在 ${project.defaultBranch} 上不存在，无法被加载` })
+    if ((skill.sizeBytes ?? 0) > PROJECT_SKILL_MAX_BYTES) issues.push({ severity: 'error', code: 'skill_too_large', path: skill.path, message: `Skill ${skill.name} 为 ${skill.sizeBytes} 字节，超过 ${PROJECT_SKILL_MAX_BYTES} 字节的单文件上限` })
+  }
+  return { projectId, branch: project.defaultBranch, baseSha, manifestPath: PROJECT_MANIFEST_PATH, manifestFound, manifestError, files, skills, requiredBytes, budgetBytes: CONTEXT_PROMPT_BUDGET_BYTES, builder, issues }
 }
 
-/** One declared context file at the default branch head. Only paths the manifest lists can be read through here. */
+/** One declared context or Skill file at the default branch head. */
 export function projectContextFile(database: Database, projectId: string, path: string) {
   const context = projectContext(database, projectId)
-  const file = context?.files.find((entry) => entry.path === path)
-  if (!context || !file) throw new AppError(404, `${path} is not declared as context of this project`, 'context_file_not_declared')
+  const file = context?.files.find((entry) => entry.path === path) ?? context?.skills.find((entry) => entry.path === path)
+  if (!context || !file) throw new AppError(404, `${path} is not declared as context or a Skill of this project`, 'context_file_not_declared')
   if (!file.exists) throw new AppError(404, `${path} does not exist on ${context.branch}`, 'context_file_missing')
   const { repositoryPath } = resolveProjectRepository(database, projectId)
   const content = execFileSync('git', [...GIT_NO_EXEC, '-C', repositoryPath, 'show', `${context.baseSha}:${path}`], { maxBuffer: 64 * 1024 * 1024 })

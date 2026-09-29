@@ -12,6 +12,18 @@ function git(repositoryPath: string, args: string[]) {
   }
 }
 
+export function releaseArtifactEvidence(evidence: { id: string; sha256: string; summary: Record<string, unknown> }, approvedHeadSha: string) {
+  const artifactCount = Number(evidence.summary.artifactCount ?? 0)
+  if (artifactCount <= 0) return []
+  const buildCheckName = typeof evidence.summary.buildCheckName === 'string' ? evidence.summary.buildCheckName : undefined
+  if (!buildCheckName || evidence.summary.buildCheckConclusion !== 'success') throw new AppError(409, 'Application artifact evidence requires its declared build check to succeed', 'release_application_build_failed')
+  const artifactDigests = Array.isArray(evidence.summary.artifactDigests) ? evidence.summary.artifactDigests.filter((value): value is string => typeof value === 'string' && /^sha256:[0-9a-f]{64}$/u.test(value)) : []
+  const sourceCommitShas = Array.isArray(evidence.summary.artifactSourceCommitShas) ? evidence.summary.artifactSourceCommitShas.filter((value): value is string => typeof value === 'string') : []
+  if (artifactDigests.length !== artifactCount || sourceCommitShas.length !== artifactCount) throw new AppError(409, 'Application artifact evidence must bind every artifact digest and source commit', 'release_application_artifact_digest_missing')
+  if (sourceCommitShas.some((sourceSha) => sourceSha !== approvedHeadSha)) throw new AppError(409, 'Application artifact evidence was not built from the approved Head SHA', 'release_application_artifact_source_mismatch')
+  return [{ evidenceId: evidence.id, packageDigest: evidence.sha256, artifactCount, artifactDigests, sourceCommitSha: approvedHeadSha, buildCheckName }]
+}
+
 export class LocalReleaseAuthority {
   readonly id = 'local-release-authority@0.1'
   private readonly database: ControlPlaneDatabase
@@ -32,15 +44,15 @@ export class LocalReleaseAuthority {
       if (hostMerge.outsideGate) throw new AppError(409, `The host merged this proposal outside the gate (${hostMerge.outsideGateReasons.join('; ')}); it cannot be released`, 'release_merge_outside_gate')
     } else if (mergeEvidence.mergedSha !== proposal.headSha) throw new AppError(409, 'Merge Evidence does not match the proposal Head SHA', 'release_merge_evidence_mismatch')
     const commitSha = git(proposal.repositoryPath, ['rev-parse', '--verify', `${mergeEvidence.mergedSha}^{commit}`])
+    const mergedTreeSha = git(proposal.repositoryPath, ['rev-parse', '--verify', `${commitSha}^{tree}`])
+    const approvedTreeSha = git(proposal.repositoryPath, ['rev-parse', '--verify', `${mergeEvidence.approvedHeadSha}^{tree}`])
     const tree = git(proposal.repositoryPath, ['ls-tree', '-r', '--full-tree', commitSha])
     const sourceTreeDigest = `sha256:${sha256(tree)}`
     const sourceFileCount = tree ? tree.split('\n').length : 0
     const workItem = this.database.getWorkItem(proposal.workItemId)
-    const artifactEvidence = mergeEvidence.evidenceIds.map((evidenceId) => this.database.getEvidencePackage(evidenceId)).flatMap((evidence) => {
-      const artifactCount = Number(evidence.summary.artifactCount ?? 0)
-      return artifactCount > 0 ? [{ evidenceId: evidence.id, packageDigest: evidence.sha256, artifactCount }] : []
-    })
+    const artifactEvidence = mergeEvidence.evidenceIds.map((evidenceId) => this.database.getEvidencePackage(evidenceId)).flatMap((evidence) => releaseArtifactEvidence(evidence, mergeEvidence.approvedHeadSha))
     if (workItem.productType === 'application' && artifactEvidence.length === 0) throw new AppError(409, 'Application Release Candidate requires Build Artifact Evidence in Merge Evidence', 'release_application_artifact_missing')
+    if (artifactEvidence.length && mergedTreeSha !== approvedTreeSha) throw new AppError(409, 'Merged source tree differs from the approved Head tree that produced the build artifacts', 'release_build_source_tree_mismatch')
     const artifactClass = artifactEvidence.length ? 'source_with_build_attestation' as const : 'source_snapshot' as const
     return this.database.createReleaseCandidate({ proposalId, mergeEvidenceId: mergeEvidence.id, repositoryPath: proposal.repositoryPath, sourceRef: proposal.baseRef, commitSha, sourceTreeDigest, sourceFileCount, artifactClass, artifactEvidence }, actorId)
   }

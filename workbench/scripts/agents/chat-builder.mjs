@@ -1,8 +1,9 @@
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, relative, resolve, sep } from 'node:path'
 import { progress } from './progress.mjs'
-import { declaredContextSections, taskPrompt } from './run-request.mjs'
+import { declaredContextSections, skillCatalogSections, taskPrompt } from './run-request.mjs'
 
 // A Builder Agent with no external CLI: it drives any OpenAI-compatible Chat Completions endpoint (DeepSeek,
 // Qwen, OpenAI, vLLM, Ollama, a gateway) through tool calls, so which model writes the code is decided only by
@@ -35,6 +36,8 @@ if (!requestPath || !worktreePath || !baseUrl || !model) {
 const root = realpathSync(worktreePath)
 const request = JSON.parse(readFileSync(requestPath, 'utf8'))
 const contextSections = declaredContextSections(request)
+const skillSections = skillCatalogSections(request, 'Use load_skill with a Skill name when its method applies; do not read or copy a Skill through another tool.')
+const skillsByName = new Map((request.projectManifest?.skills ?? []).map((skill) => [skill.name, skill]))
 // A shell runs whatever the model asks for, so the chat engine only gets one when the project's reviewed manifest
 // (aperture.project.v2, builder.allowShell) says so. Without it the Control Plane's checks are the only code that runs.
 const allowShell = request.projectManifest?.builder?.allowShell === true
@@ -46,10 +49,12 @@ Start by listing and reading the files you need; call several tools in one turn 
 update relevant tests, ${allowShell ? "and run the project's tests with run_command when that is useful" : 'and leave running them to the Control Plane, which runs the project\'s checks after you finish; there is no shell'}. Do not delete,
 skip or weaken existing tests. Do not create a Git commit: the Control Plane commits your changes.
 When you are done, call finish with a concise summary of changed files and remaining risks.
-${contextSections.join('\n')}`
+${contextSections.join('\n')}
+${skillSections.join('\n')}`
 
 const tools = [
   { name: 'list_files', description: 'List files tracked or untracked (not ignored) in the worktree, optionally under a directory.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Directory relative to the worktree root; defaults to the root.' } } } },
+  ...(skillsByName.size ? [{ name: 'load_skill', description: 'Load one project-declared Skill by name from the run\'s bound base revision.', parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } }] : []),
   { name: 'read_file', description: 'Read a UTF-8 text file. Long files are returned in slices; use offset to continue.', parameters: { type: 'object', properties: { path: { type: 'string' }, offset: { type: 'integer', description: 'Character offset to start from.' } }, required: ['path'] } },
   { name: 'write_file', description: 'Create or overwrite a file with the given content.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
   { name: 'replace_in_file', description: 'Replace exactly one occurrence of old_string with new_string in a file.', parameters: { type: 'object', properties: { path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } }, required: ['path', 'old_string', 'new_string'] } },
@@ -79,6 +84,7 @@ const forbiddenGit = /\bgit\s+(commit|push|reset|rebase|merge|checkout|switch|st
 // One line for the running Intent: what the model is doing, not the content it read or wrote.
 function progressLabel(name, args) {
   if (name === 'list_files') return `列目录 ${args.path ?? '.'}`
+  if (name === 'load_skill') return `加载 Skill ${args.name}`
   if (name === 'read_file') return `读取 ${args.path}`
   if (name === 'write_file') return `写入 ${args.path}`
   if (name === 'replace_in_file') return `修改 ${args.path}`
@@ -100,6 +106,18 @@ const handlers = {
     const result = spawnSync('git', ['-C', root, 'ls-files', '--cached', '--others', '--exclude-standard', ...(relativePath === '.' ? [] : ['--', relativePath])], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 })
     const files = (result.stdout ?? '').split('\n').filter(Boolean)
     return files.length > 500 ? `${files.slice(0, 500).join('\n')}\n… ${files.length - 500} more; list a subdirectory` : files.join('\n') || '(no files)'
+  },
+  load_skill({ name }) {
+    if (typeof name !== 'string' || !name.trim()) throw new Error('Skill name is required')
+    const skill = skillsByName.get(name.trim())
+    if (!skill) throw new Error(`Skill is not declared: ${name}`)
+    const { absolute, relativePath } = worktreeFile(skill.path)
+    if (!existsSync(absolute) || !statSync(absolute).isFile()) throw new Error(`Skill file is missing: ${relativePath}`)
+    const content = readFileSync(absolute)
+    const contentDigest = `sha256:${createHash('sha256').update(content).digest('hex')}`
+    if (contentDigest !== skill.contentDigest) throw new Error(`Skill content no longer matches the bound base revision: ${relativePath}`)
+    console.log(JSON.stringify({ type: 'skill_loaded', source: 'builder_tool', name: skill.name, path: relativePath, contentDigest, fileBytes: content.length }))
+    return content.toString('utf8')
   },
   read_file({ path, offset = 0 }) {
     const { absolute, relativePath } = worktreeFile(path)

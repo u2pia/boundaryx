@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:lab": "VITE_APERTURE_LAB=true vite",
     "server:dev": "node --watch --experimental-strip-types server/main.ts",
     "server:start": "node --experimental-strip-types server/main.ts",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
@@ -49,6 +50,7 @@
     "test:autonomy": "node --experimental-strip-types scripts/autonomy-provider-smoke.ts",
     "case:real": "node --experimental-strip-types scripts/run-real-case.ts",
     "build": "npm run typecheck && vite build",
+    "build:lab": "VITE_APERTURE_LAB=true npm run build",
     "seed:demo": "node --experimental-strip-types scripts/seed-demo.ts",
     "test:evaluation-provenance": "node --experimental-strip-types scripts/evaluation-provenance-smoke.ts",
     "test:isolated-evaluation": "node --experimental-strip-types scripts/isolated-evaluation-smoke.ts",

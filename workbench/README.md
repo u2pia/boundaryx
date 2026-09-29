@@ -449,9 +449,13 @@ Dataset 必须存在于 Base Revision，且不能列入 Builder Context。Contro
 
 Change Proposal 获得独立批准后，只有 Owner 或 Maintainer 可以显式执行本地 fast-forward 合并。Control Plane 会复验 Base、Approved Head、Check、Evidence 和 Approval，要求实际目标分支 SHA 精确等于 Approved Head SHA，再生成不可更新、不可删除并带 Digest 的 Merge Evidence。合并前还会重算该 Proposal 以及产出其证据的每个 Run 的事件哈希链；有一条对不上（例如绕过平台直接 INSERT 进来的伪造批准事件）就拒绝合并（`event_chain_broken`），且在目标分支移动之前拒绝。整条链从 genesis 重算一遍也能自洽，所以还要求每个 Evidence Package 生成时记录的链头（`eventChainHeads`，写入证据摘要和 `evidence.recorded` 事件，外部附加的证据取自包文件）仍在当前链上；Merge Evidence 读取时同样核对其 `proposalEventChainHead`（`merge_evidence_chain_mismatch`）。事件 Digest 不带密钥，谁都能算，所以每个事件另有一枚封印（`event_seals`，迁移 025）：对事件 ID 与 Digest 做 HMAC-SHA256，密钥不在数据库里。只拿到数据库文件的人可以追加一个 Digest 正确的伪造事件，但造不出封印，合并、GitHub 门禁与 Merge Evidence 读取都会拒绝（`has no seal` / `seal does not verify`）。密钥依次取自 `APERTURE_EVENT_SEAL_KEY`、`APERTURE_EVENT_SEAL_KEY_FILE`，都没有时在数据目录生成 `event-seal.key`（0600）。放在数据目录里只防「单独拷走数据库文件」，不防拿到整个数据目录的人；同一操作系统用户下的本地 Builder 也读得到它，正式部署要把密钥文件放到数据目录之外、Builder 读不到的地方。启动日志与 `/api/health` 的 `eventSeal` 报告密钥来源、未封印事件数与旧密钥封印数，不输出密钥。迁移 025 执行时已存在的事件一次性补封（`backfilled = 1`），补封只是为当时的历史背书，之后没有封印的事件一律视为平台外写入。换密钥时把旧密钥文件列进 `APERTURE_EVENT_SEAL_RETIRED_KEY_FILES`（冒号分隔），旧封印仍可验证；密钥丢失或被替换而没有列出旧密钥时，所有旧事件都会报「sealed with key … which this Control Plane does not hold」，合并全部被拒，这是有意的失败方式。链头尚未外部锚定：持有密钥的人仍可重写。`host_protected` 模式下合并已经发生，链校验失败会作为绕过门禁的原因记录。契约见 `../docs/MERGE_EVIDENCE_CONTRACT.md`。该能力不是自动合并，也不代表发布授权。
 
+Reviewer 可以先打开当前 Proposal 的 Decision Brief，把 Intent、Revision、Gate、Acceptance Criteria、Context 来源、Runtime 边界、Evidence 展开状态和 Review Assignment 汇总到同一只读投影。它复用现有 Review Readiness，不产生第二套批准结论；`ready` 只表示可以开始人工审查。外部 `runId` 没有本地 Agent Run 时明确标记为未验证引用，不伪造 Isolation 或 Production Eligibility。契约见 `../docs/DECISION_BRIEF_CONTRACT.md`。
+
+Decision Brief 按 Reviewer 与 Head SHA 只记录首次打开时间，并与后续终态 Review 计算 `Brief → Decision` 中位耗时和样本数。重复刷新不增加样本；这个指标用于 10-Change 试点验证审查带宽，不代表 Reviewer Active Time。
+
 Reviewer 请求修改后，Proposal 作者或 Owner/Maintainer 可以启动 Agent Revision Run。新 Run 从被审查 Head SHA 开始，绑定当前 Reviewer Feedback，沿用原始基线 Manifest；完成后更新同一个 Proposal，并使旧 Review、Check、Evidence 失效。契约见 `../docs/AGENT_REVISION_RUN_CONTRACT.md`。
 
-Merged Proposal 可以生成本地 Release Candidate。当前候选只封存 Commit、Source Tree Digest、文件数、Merge Evidence Binding 和 Candidate Content Digest，并要求不同的 Owner/Maintainer 批准。契约见 `../docs/RELEASE_CANDIDATE_CONTRACT.md`。它不是二进制 Artifact、Deployment 或生产发布证明。
+Merged Proposal 可以生成本地 Release Candidate。Agent System 可以封存 `source_snapshot`；Application 必须引用 Merge Evidence 中真实 Build Artifact Evidence，并把 Evidence ID、Package Digest、Artifact Count 与 Artifact Binding Digest 纳入 Candidate Content Digest。候选仍要求不同的 Owner/Maintainer 批准。契约见 `../docs/RELEASE_CANDIDATE_CONTRACT.md`。它不是 Artifact Repository Receipt、Deployment 或生产发布证明。
 
 访问 `http://127.0.0.1:8787`。首次访问时创建本地 Owner；系统没有默认密码。SQLite 数据库保存在 `.aperture/control-plane.db`，本地 Git 仓库保存真实代码版本。
 
@@ -462,7 +466,9 @@ npm run server:dev
 npm run dev
 ```
 
-`npm run dev` 单独启动时只提供 Lab / Mock UI，不具备 SQLite 身份、Intent、Change Proposal Review 和 Event Log 的服务端控制边界。
+默认前端显示六个 Core 工作入口以及项目管理页。“上下文”工作面分别呈现 Run 输入治理与 Skills Catalog，避免为每种治理对象继续增加顶层导航；两者仍保持独立合同与证据语义。内置 Chat Builder 使用受控 `load_skill(name)`；Claude Code 的成功 Read 会映射为 Skill 使用事件。加载事件进入 Run 对账、Decision Brief 与 Evidence Package，但仍标为运行内报告而非独立观测；没有事件时不会把 Catalog 声明冒充为已使用。Lab 当前冻结；`npm run dev:lab` 和 `npm run build:lab` 仅保留已有实验页面，不作为当前开发方向。边界说明见 `../docs/CORE_LAB_BOUNDARY.md`。
+
+`npm run dev` 单独启动时只提供前端 Mock UI，不具备 SQLite 身份、Intent、Change Proposal Review 和 Event Log 的服务端控制边界。
 
 完整检查：
 

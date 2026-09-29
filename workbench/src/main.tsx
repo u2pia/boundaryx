@@ -72,43 +72,30 @@ import { criteriaSyntaxHint, criticalityLabels, draftChangedFields, formatAccept
 import type { WorkbenchState } from './store-model'
 import { useWorkbench } from './use-workbench'
 import { useLocalControlPlane } from './local-control-plane-context'
-import type { LocalActor, LocalActorUpdate, LocalAgentRun, LocalAgentRunDetail, LocalProjectContext, LocalAgentRuntimeDescriptor, LocalWorkItem, LocalCodeHostConnection, LocalProject, LocalProjectInput, LocalProjectRole, LocalIdentityMode, LocalChangeProposal, LocalEvidencePackageView, LocalIntentVersion, LocalReviewAssignment, LocalReviewReadiness } from './local-control-plane-client'
+import type { LocalActor, LocalActorUpdate, LocalAgentRun, LocalAgentRunDetail, LocalProjectContext, LocalAgentRuntimeDescriptor, LocalWorkItem, LocalCodeHostConnection, LocalProject, LocalProjectInput, LocalProjectRole, LocalIdentityMode, LocalChangeProposal, LocalDecisionBrief, LocalEvidencePackageView, LocalIntentVersion, LocalReviewAssignment, LocalReviewReadiness } from './local-control-plane-client'
 import { DEMO_PROJECT_ID, localControlPlaneClient, type LocalAgentProviderTestResult, type LocalIntentDraft } from './local-control-plane-client'
+import { administrationPageLabels, availablePageLabels, corePageLabels, labPageLabels, type Page } from './product-surfaces'
 import './styles.css'
 
-type Page = '总览' | 'Intents' | '上下文' | 'Agent Runs' | '评审队列' | '发布' | '评估' | '证据中心' | '追溯' | '策略' | '反馈闭环' | '集成' | '项目' | '团队' | '度量'
 type RunItem = (typeof runs)[number]
 type EvalTaskItem = { id: string; title: string; kind: string; detail: string; tone: string; derived?: boolean; liveRunId?: string; regressionId?: string; remediationType?: 'intent' | 'regression' }
 
 // Nav counts must come from the local Control Plane. The hardcoded demo numbers that used to live here showed on
 // every page without a demo label, which is exactly the kind of unsourced claim this platform exists to prevent.
+const labEnabled = import.meta.env.VITE_APERTURE_LAB === 'true'
+const pageIcons: Record<Page, typeof Home> = { '总览': LayoutDashboard, 'Intents': CircleDot, '上下文': FolderTree, 'Agent Runs': Bot, '评审队列': Inbox, '发布': Rocket, '评估': FlaskConical, '证据中心': FileCheck2, '追溯': Route, '策略': ShieldCheck, '反馈闭环': RefreshCw, '集成': Plug, '项目': FolderGit2, '团队': Users, '度量': BarChart3 }
 const navigation: Array<{ group: string; items: Array<{ label: Page; icon: typeof Home; count?: number }> }> = [
   {
     group: '工作区',
-    items: [
-      { label: '总览', icon: LayoutDashboard },
-      { label: 'Intents', icon: CircleDot },
-      { label: '上下文', icon: FolderTree },
-      { label: 'Agent Runs', icon: Bot },
-      { label: '评审队列', icon: Inbox },
-      { label: '发布', icon: Rocket },
-    ],
+    items: corePageLabels.map((label) => ({ label, icon: pageIcons[label] })),
   },
   {
-    group: '控制面',
-    items: [
-      { label: '评估', icon: FlaskConical },
-      { label: '证据中心', icon: FileCheck2 },
-      { label: '追溯', icon: Route },
-      { label: '策略', icon: ShieldCheck },
-      { label: '反馈闭环', icon: RefreshCw },
-      { label: '集成', icon: Plug },
-      { label: '项目', icon: FolderGit2 },
-      { label: '团队', icon: Users },
-      { label: '度量', icon: BarChart3 },
-    ],
+    group: '管理',
+    items: administrationPageLabels.map((label) => ({ label, icon: pageIcons[label] })),
   },
+  ...(labEnabled ? [{ group: 'Lab · Reference', items: labPageLabels.map((label) => ({ label, icon: pageIcons[label] })) }] : []),
 ]
+const availablePages = new Set<Page>(availablePageLabels(labEnabled))
 
 const pageToHash: Record<Page, string> = {
   '总览': 'overview',
@@ -249,8 +236,11 @@ function App() {
   const { notifications: demoNotifications, dismissNotification } = useWorkbench()
   const localControlPlane = useLocalControlPlane()
   // The prototype store's notifications are sample data too, so they stay with the rest of it.
-  const notifications = useDemoScope() ? demoNotifications : []
-  const [page, setPage] = useState<Page>(() => hashToPage[window.location.hash.replace('#/', '')] ?? '总览')
+  const notifications = useDemoScope() ? demoNotifications.filter((notice) => availablePages.has(notice.page as Page)) : []
+  const [page, setPage] = useState<Page>(() => {
+    const requested = hashToPage[window.location.hash.replace('#/', '')]
+    return requested && availablePages.has(requested) ? requested : '总览'
+  })
   const routeMounted = useRef(false)
   const [selectedReview, setSelectedReview] = useState<ReviewItem | null>(null)
   const [selectedRun, setSelectedRun] = useState<RunItem | null>(null)
@@ -297,7 +287,7 @@ function App() {
   useEffect(() => {
     const onHashChange = () => {
       const nextPage = hashToPage[window.location.hash.replace('#/', '')]
-      if (nextPage) setPage(nextPage)
+      if (nextPage && availablePages.has(nextPage)) setPage(nextPage)
     }
     window.addEventListener('hashchange', onHashChange)
     return () => window.removeEventListener('hashchange', onHashChange)
@@ -343,15 +333,15 @@ function App() {
           {page === 'Agent Runs' && <RunsPage onOpenRun={setSelectedRun} />}
           {page === '评审队列' && <ReviewPage onOpenReview={setSelectedReview} />}
           {page === '发布' && <ReleasePage />}
-          {page === '评估' && <EvaluationPage />}
-          {page === '证据中心' && <EvidencePage />}
-          {page === '追溯' && <TraceabilityPage />}
-          {page === '策略' && <PolicyPage />}
-          {page === '反馈闭环' && <FeedbackPage />}
+          {labEnabled && page === '评估' && <EvaluationPage />}
+          {labEnabled && page === '证据中心' && <EvidencePage />}
+          {labEnabled && page === '追溯' && <TraceabilityPage />}
+          {labEnabled && page === '策略' && <PolicyPage />}
+          {labEnabled && page === '反馈闭环' && <FeedbackPage />}
           {page === '集成' && <IntegrationsPage />}
           {page === '项目' && <ProjectsPage />}
           {page === '团队' && <TeamPage />}
-          {page === '度量' && <MetricsPage />}
+          {labEnabled && page === '度量' && <MetricsPage />}
           </Fragment>
         </div>
       </main>
@@ -512,9 +502,7 @@ function Sidebar({ page, onNavigate, open, collapsed, onToggle }: { page: Page; 
           </div>
         ))}
       </nav>
-      <div className="sidebar-bottom">
-        <button className="nav-item" onClick={() => onNavigate('集成')} title={collapsed ? '设置与集成' : undefined}><Settings size={16} /><span>设置与集成</span></button>
-      </div>
+      {!labEnabled && <div className="sidebar-bottom"><span className="prototype-pill"><i />Core distribution</span></div>}
     </aside>
   )
 }
@@ -1027,6 +1015,72 @@ function ProjectContextPanel() {
   )
 }
 
+function ProjectSkillsPanel() {
+  const local = useLocalControlPlane()
+  const projectId = local.currentProjectId
+  const [state, setState] = useState<{ context?: LocalProjectContext | null; error?: string; loading?: boolean }>({})
+  const [preview, setPreview] = useState<{ path: string; content?: string; truncated?: boolean; error?: string }>()
+  const load = (id: string) => {
+    setState((current) => ({ ...current, loading: true, error: undefined }))
+    return localControlPlaneClient.getProjectContext(id)
+      .then(({ context }) => setState({ context }))
+      .catch((caught: unknown) => setState({ error: caught instanceof Error ? caught.message : String(caught) }))
+  }
+  useEffect(() => {
+    if (local.status !== 'ready' || !projectId) return
+    setState({})
+    void load(projectId)
+  }, [local.status, projectId])
+  const openPreview = (path: string) => {
+    if (!projectId) return
+    setPreview({ path })
+    localControlPlaneClient.getProjectContextFile(projectId, path)
+      .then(({ file }) => setPreview({ path, content: file.content, truncated: file.truncated }))
+      .catch((caught: unknown) => setPreview({ path, error: caught instanceof Error ? caught.message : String(caught) }))
+  }
+  if (local.status !== 'ready' || !projectId) return null
+  const context = state.context
+  const skillIssues = context?.issues.filter((issue) => issue.code.startsWith('skill_')) ?? []
+  const healthySkills = context?.skills.filter((skill) => skill.exists && (skill.sizeBytes ?? 0) <= 32 * 1024).length ?? 0
+  return (
+    <section className="panel local-core-section project-context project-skills">
+      <div className="local-core-heading">
+        <div><span className="eyebrow">真实数据 · {context ? `${context.branch} @ ${context.baseSha.slice(0, 7)}` : '项目仓库'}</span><h2>项目 Skills Catalog</h2><p>Skill 是仓库拥有、经评审变更的可复用执行方法。目录来自 {context?.manifestPath ?? '.aperture/project.json'}，内容固定到当前 Revision。</p></div>
+        <div className="local-core-heading-actions"><button className="secondary-button" disabled={state.loading} onClick={() => void load(projectId)}><RefreshCw size={13} className={state.loading ? 'spin' : undefined} />刷新</button></div>
+      </div>
+      {state.error && <p className="local-form-error" role="alert">{state.error}</p>}
+      {context === null && <div className="local-empty"><FolderGit2 size={18} /><p>项目还没有配置仓库。</p></div>}
+      {context && <>
+        <div className="project-context-summary">
+          <span className={skillIssues.length ? 'context-no' : 'context-yes'}>{skillIssues.length ? <ShieldAlert size={13} /> : <ShieldCheck size={13} />}{skillIssues.length ? `${skillIssues.length} 个目录问题` : '目录检查通过'}</span>
+          <span>{context.skills.length} 个已声明 · {healthySkills} 个可读取</span>
+          <span><Fingerprint size={13} />Revision {context.baseSha.slice(0, 12)}</span>
+        </div>
+        {skillIssues.length > 0 && <ul className="project-context-issues">{skillIssues.map((issue) => <li key={`${issue.code}-${issue.path ?? ''}`} className={issue.severity}><ShieldAlert size={12} />{issue.message}</li>)}</ul>}
+        {context.skills.length === 0 ? <div className="local-empty"><Sparkles size={18} /><p>尚未声明 Skill。在 manifest 的 <code>skills</code> 中登记名称、路径与用途。</p></div> : <div className="project-context-files project-skill-files">
+          <div className="project-skill-row head"><span>Skill</span><span>文件</span><span>大小</span><span>内容摘要</span><span>最后修改</span><span /></div>
+          {context.skills.map((skill) => <div className={`project-skill-row${skill.exists ? '' : ' missing'}`} key={skill.name}>
+            <span className="project-skill-name"><strong>{skill.name}</strong><small>{skill.description}</small></span>
+            <code>{skill.path}</code>
+            <span>{skill.exists ? `${((skill.sizeBytes ?? 0) / 1024).toFixed(1)} KB` : '不存在'}</span>
+            <code title={skill.contentDigest}>{skill.contentDigest?.slice(0, 19) ?? '—'}</code>
+            <small title={skill.lastCommit ? `${skill.lastCommit.sha} · ${skill.lastCommit.subject}` : undefined}>{skill.lastCommit ? `${skill.lastCommit.author} · ${skill.lastCommit.committedAt.slice(0, 10)}` : '—'}</small>
+            <span className="project-context-actions"><button className="secondary-button" disabled={!skill.exists} onClick={() => openPreview(skill.path)}><Eye size={12} />查看</button>{skill.editUrl && <a className="secondary-button" href={skill.editUrl} target="_blank" rel="noreferrer"><ExternalLink size={12} />编辑</a>}</span>
+          </div>)}
+        </div>}
+        <small className="project-context-note">内置 Chat Builder 通过受控 <code>load_skill(name)</code> 加载；Claude Code 对声明路径的成功 Read 会映射为 Skill 使用事件。两者都会进入 Run 与 Evidence，但仍来自运行内工具事件、尚非 OS 级独立观测。Codex 当前只能看到 Catalog，不能据此声称已加载。</small>
+      </>}
+      {preview && <>
+        <button className="local-evidence-overlay" aria-label="关闭预览" onClick={() => setPreview(undefined)} />
+        <aside className="local-evidence-drawer">
+          <header><div><span className="eyebrow">Skill · {context?.branch} @ {context?.baseSha.slice(0, 7)}</span><h3>{preview.path}</h3><p>这是 Catalog 当前 Revision 绑定的只读内容。</p></div><button className="icon-button" onClick={() => setPreview(undefined)} aria-label="关闭"><X size={15} /></button></header>
+          {preview.error ? <p className="local-form-error" role="alert">{preview.error}</p> : preview.content === undefined ? <p className="local-evidence-empty"><RefreshCw size={13} className="spin" />读取中</p> : <section>{preview.truncated && <small>文件较大，只显示开头部分。</small>}<pre className="project-context-preview">{preview.content}</pre></section>}
+        </aside>
+      </>}
+    </section>
+  )
+}
+
 function ContextPage() {
   const { liveRun } = useWorkbench()
   const liveContextReads = liveRun?.events.filter((event): event is Extract<AgentRunEvent, { type: 'context_consumed' }> => event.type === 'context_consumed') ?? []
@@ -1084,10 +1138,11 @@ function ContextPage() {
   return (
     <>
       <PageHeader
-        title="上下文中心"
-        description="管理 Agent 被允许知道什么，并对账它实际读取了什么。"
+        title="上下文与 Skills"
+        description="治理 Agent 被允许知道什么、可以采用哪些复用方法，并对账 Run 实际读取与加载了什么。"
       />
       <ProjectContextPanel />
+      <ProjectSkillsPanel />
       <DemoRegion title="上下文面板" note="本页的上下文来源、检索质量与预算面板仍为演示数据；真实的“声明 vs 实际读取”对账在「Agent Runs」页每个 Run 的「上下文对账」里。">
 
         <div className="context-status-grid">
@@ -1256,6 +1311,8 @@ function LocalRunContextDrawer({ detail, onClose }: { detail: LocalAgentRunDetai
   const compiled = detail.events.find((event) => event.eventType === 'agent_run.context_compiled')?.payload as { omitted?: Array<{ path: string; reason: string }> } | undefined
   const leftOut = compiled?.omitted ?? []
   const rejected = detail.events.filter((event) => event.eventType === 'agent_run.context_rejected')
+  const skillsLoaded = detail.events.filter((event) => event.eventType === 'agent_run.skill_loaded')
+  const skillsRejected = detail.events.filter((event) => event.eventType === 'agent_run.skill_rejected')
   const consumedPaths = new Set(consumed.map((item) => item.path))
   const undeclared = reported.filter((item) => !item.declared)
   const unread = detail.declaredContextPaths.filter((path) => !consumedPaths.has(path))
@@ -1270,7 +1327,7 @@ function LocalRunContextDrawer({ detail, onClose }: { detail: LocalAgentRunDetai
     <>
       <button className="local-evidence-overlay" aria-label="关闭运行详情" onClick={onClose} />
       <aside className="local-evidence-drawer">
-        <header><div><span className="eyebrow">上下文对账</span><h3>{detail.agentRun.id}</h3><p>Manifest 是声明，实际读取是事实，两者不一致本身就是审查信息。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭"><X size={15} /></button></header>
+        <header><div><span className="eyebrow">上下文与 Skills 对账</span><h3>{detail.agentRun.id}</h3><p>Manifest 是声明，实际读取或加载是事实，两者不一致本身就是审查信息。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭"><X size={15} /></button></header>
         <div className={`local-evidence-digest ${undeclared.length || unread.length || truncated.length ? 'drift' : ''}`}>
           {undeclared.length || unread.length || truncated.length ? <ShieldAlert size={15} /> : <ShieldCheck size={15} />}
           <div>
@@ -1282,6 +1339,8 @@ function LocalRunContextDrawer({ detail, onClose }: { detail: LocalAgentRunDetai
         <section><span>Builder 上报的读取</span>{reported.length ? <div className="local-context-rows">{reported.map(row)}</div> : <small>Builder 没有上报额外读取。</small>}</section>
         <section><span>声明但未进入提示词</span>{unread.length ? <div className="local-context-rows">{unread.map((path) => { const reason = leftOut.find((item) => item.path === path)?.reason; return <div className="local-context-row unread" key={path}><strong>{path}</strong><span className="local-check-provenance all_tests">{reason === 'budget' ? '超出预算' : reason === 'missing' ? 'base 中不存在' : '未读取'}</span></div> })}</div> : <small>声明的路径都进入了提示词。</small>}</section>
         {rejected.length > 0 && <section><span>被拒绝的读取</span><div className="local-context-rows">{rejected.map((event) => <div className="local-context-row rejected" key={event.id}><strong>{String(event.payload.reportedPath ?? '')}</strong><span className="local-check-provenance unverified">{String(event.payload.reason ?? 'rejected')}</span></div>)}</div></section>}
+        <section><span>实际加载的 Skills</span>{skillsLoaded.length ? <div className="local-context-rows">{skillsLoaded.map((event) => <div className="local-context-row declared" key={event.id}><strong>{String(event.payload.name ?? '')}</strong><span className="local-check-provenance pre_existing">已加载</span><code>{String(event.payload.contentDigest ?? '')}</code><em>{String(event.payload.reportSource ?? 'unknown')} · base {String(event.payload.revision ?? '').slice(0, 12)} · 未独立观测</em></div>)}</div> : <small>本次 Run 没有可验证的 Skill 加载记录；Catalog 声明不等于实际使用。</small>}</section>
+        {skillsRejected.length > 0 && <section><span>被拒绝的 Skill 上报</span><div className="local-context-rows">{skillsRejected.map((event) => <div className="local-context-row rejected" key={event.id}><strong>{String(event.payload.name ?? event.payload.path ?? '')}</strong><span className="local-check-provenance unverified">{String(event.payload.reason ?? 'rejected')}</span></div>)}</div></section>}
         <section><span>Run</span><div className="local-evidence-runtime"><code>{detail.agentRun.adapterId} · {detail.agentRun.status}</code><small>{detail.agentRun.isolation} · {detail.agentRun.networkEgress} egress · base {detail.agentRun.baseSha.slice(0, 12)} · {detail.events.length} 条事件</small></div></section>
       </aside>
     </>
@@ -1430,6 +1489,8 @@ function LocalReviewQueue() {
   const [busyId, setBusyId] = useState<string>()
   const [evidenceBusyId, setEvidenceBusyId] = useState<string>()
   const [evidencePreview, setEvidencePreview] = useState<LocalEvidencePackageView>()
+  const [decisionBriefBusyId, setDecisionBriefBusyId] = useState<string>()
+  const [decisionBrief, setDecisionBrief] = useState<LocalDecisionBrief>()
   const [error, setError] = useState<string>()
   const [assigneeChoice, setAssigneeChoice] = useState<Record<string, string>>({})
   if (local.status !== 'ready') return null
@@ -1510,6 +1571,14 @@ function LocalReviewQueue() {
       setEvidenceBusyId(undefined)
     }
   }
+  const openDecisionBrief = async (proposalId: string) => {
+    setDecisionBriefBusyId(proposalId)
+    setError(undefined)
+    try {
+      const brief = await local.getDecisionBrief(proposalId)
+      setDecisionBrief(brief.viewer.canRecordTerminalDecision ? await local.recordDecisionBriefView(proposalId) : brief)
+    } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) } finally { setDecisionBriefBusyId(undefined) }
+  }
   return (
     <section className="panel local-review-queue">
       <div className="local-core-heading">
@@ -1519,6 +1588,7 @@ function LocalReviewQueue() {
       <div className="local-review-metrics">
         <div><span>待评审</span><strong>{local.reviewMetrics.pendingCount}</strong><small>oldest {formatReviewDuration(local.reviewMetrics.oldestPendingSeconds)}</small></div>
         <div><span>首个决策中位数</span><strong>{formatReviewDuration(local.reviewMetrics.medianDecisionLatencySeconds)}</strong><small>按 Revision 计算</small></div>
+        <div><span>摘要 → 决定</span><strong>{local.reviewMetrics.decisionBriefOpenedDecisionCount ? formatReviewDuration(local.reviewMetrics.medianBriefToDecisionSeconds) : '无样本'}</strong><small>{local.reviewMetrics.decisionBriefOpenedDecisionCount} 个决定使用摘要 · {local.reviewMetrics.decisionBriefViewCount} 次首次打开</small></div>
         <div><span>请求修改</span><strong>{local.reviewMetrics.changesRequestedCount}</strong><small>阻断批准状态</small></div>
         <div><span>有效 / 失效决策</span><strong>{local.reviewMetrics.currentDecisionCount} / {local.reviewMetrics.invalidatedDecisionCount}</strong><small>{local.reviewMetrics.activeReviewerCount} active reviewers</small></div>
       </div>
@@ -1567,6 +1637,7 @@ function LocalReviewQueue() {
           return <article key={proposal.id}>
             <div className="local-proposal-main"><span className={`local-status ${proposal.status}`}>{proposal.status}</span><div><strong>{workItemLabel(workItems.get(proposal.workItemId)) ?? proposal.workItemId}</strong><small>{proposal.id} · {proposal.baseRef} → {proposal.headRef}</small></div><code title={proposal.headSha}>{proposal.headSha.slice(0, 12)}</code></div>
             <div className="local-proposal-stats"><span>{proposal.changedFiles} files</span><span className="additions">+{proposal.additions}</span><span className="deletions">−{proposal.deletions}</span><span>{proposal.authorActorId === local.actor?.id ? '你是作者' : `author ${proposal.authorActorId.slice(-8)}`}</span><span><Clock3 size={11} /> cycle {formatReviewDuration(Math.max(0, Math.floor((Date.now() - Date.parse(proposal.reviewCycleStartedAt)) / 1000)))}</span></div>
+            <div className="local-decision-brief-trigger"><button className="secondary-button" disabled={decisionBriefBusyId === proposal.id} onClick={() => void openDecisionBrief(proposal.id)}><FileText size={13} />{decisionBriefBusyId === proposal.id ? '汇总中' : '打开决策摘要'}</button><small>先看需要决定什么，再按需展开 Evidence。</small></div>
             {builderStop && <div className="local-policy-change local-builder-stop" role="note"><ShieldAlert size={14} /><div><strong>部分变更 · {builderStop.reason === 'time_budget' ? 'Builder 用完了时间预算' : 'Builder 用完了步数预算'}</strong><small>{builderStop.summary}</small><small>{builderStop.runId} · 按每条验收标准核对；批准需在审查意见里写明为什么接受。</small></div></div>}
             {policyFiles.length > 0 && <div className="local-policy-change" role="note"><ShieldAlert size={14} /><div><strong>改动策略文件 · {policyFiles.length}</strong><small>本次变更修改了治理它自己的规则；Run 仍按 Base 上的 Manifest 执行。批准需 Owner 并写明理由。</small></div><ul>{policyFiles.map((file) => <li key={file}><code>{file}</code></li>)}</ul></div>}
             <div className={`local-review-assignment ${assignment?.overdue ? 'overdue' : assignment ? assignment.status : 'unassigned'}`}>
@@ -1590,6 +1661,7 @@ function LocalReviewQueue() {
         })}</div>
       )}
       {error && <p className="local-form-error" role="alert">{error}</p>}
+      {decisionBrief && <DecisionBriefDrawer brief={decisionBrief} onClose={() => setDecisionBrief(undefined)} onViewEvidence={(evidenceId) => void viewEvidence(evidenceId)} />}
       {evidencePreview && <>
         <button className="local-evidence-overlay" aria-label="关闭证据详情" onClick={() => setEvidencePreview(undefined)} />
         <aside className="local-evidence-drawer">
@@ -1605,7 +1677,9 @@ function LocalReviewQueue() {
               <strong>{evidencePreview.evidencePackage.projectManifest.evaluation.profile}</strong>
               <small>{evidencePreview.evidencePackage.projectManifest.evaluation.datasetPath ?? 'repository checks'} · {evidencePreview.evidencePackage.projectManifest.evaluation.datasetDigest ?? 'no dataset digest'}</small>
             </div>}
+            {evidencePreview.evidencePackage.projectManifest.skills?.length ? <div className="local-evidence-evaluation-binding"><strong>{evidencePreview.evidencePackage.projectManifest.skills.length} Skills bound</strong><small>{evidencePreview.evidencePackage.projectManifest.skills.map((skill) => `${skill.name} · ${skill.contentDigest.slice(0, 19)}`).join(' · ')}</small></div> : null}
           </section>}
+          <section><span>Skill 使用证据</span>{evidencePreview.evidencePackage.skillUsage?.loaded.length ? evidencePreview.evidencePackage.skillUsage.loaded.map((skill) => <div className="local-decision-evidence" key={`${skill.name}-${skill.contentDigest}`}><div><strong>{skill.name}</strong><small>{skill.path} · {skill.contentDigest} · {skill.reportSource} · {skill.independentlyObserved ? '已独立观测' : '未独立观测'}</small></div></div>) : <p className="local-evidence-empty">没有可验证的 Skill 加载记录；Catalog 声明不代表本次 Run 使用。</p>}{evidencePreview.evidencePackage.skillUsage?.rejected.map((skill) => <div className="local-decision-evidence" key={`rejected-${skill.name}-${skill.path}`}><div><strong>{skill.name || skill.path} · rejected</strong><small>{skill.reason}</small></div></div>)}</section>
           <section><span>Acceptance Criteria · 起草时声明的验证方式</span><small className="local-evidence-criteria-note">这里是起草时的声明。逐条的证据状态、推翻记录与人工签署要求见审查队列中的「验收标准证据」。</small>{evidencePreview.evidencePackage.intent.acceptanceCriteria.map((criterion) => <div className="local-evidence-criterion" key={criterion.id}><CircleDot size={12} /><p>{criterion.statement}</p><em>声明 · {criterion.criticality} · {criterion.verificationType}</em></div>)}</section>
           {testProvenance && <section className={`local-evidence-provenance ${independentPassingConclusion ? 'independent' : 'self-authored'}`}>
             <span>测试独立性</span>
@@ -1638,6 +1712,28 @@ function LocalReviewQueue() {
   )
 }
 
+const decisionActionLabels: Record<LocalDecisionBrief['gate']['nextAction'], string> = { resolve_blockers: '当前 Revision 仍有门禁阻断', review_human_judgement: '当前 Revision 需要人工判断', review_and_decide: '当前 Revision 已进入人工决策阶段', already_decided: '当前 Revision 已有终态决定', await_revision: '已请求修改，等待新 Revision', completed: '该提案已经结束' }
+const decisionExecutionLabels: Record<LocalDecisionBrief['execution']['source'], string> = { local_agent_run: '本地受管 Run', external_run_reference: '外部 Run 引用', manual: '人工提案' }
+const decisionRestrictionLabels: Record<NonNullable<LocalDecisionBrief['viewer']['restriction']>, string> = { self_review_forbidden: '你是该变更作者，不能提交终态审查决定。', review_not_assigned: '该审查已分配给其他 Reviewer；需要先完成显式转派。', proposal_completed: '该提案已经结束，不能再提交审查决定。' }
+
+function DecisionBriefDrawer({ brief, onClose, onViewEvidence }: { brief: LocalDecisionBrief; onClose: () => void; onViewEvidence: (evidenceId: string) => void }) {
+  return <>
+    <button className="local-evidence-overlay" aria-label="关闭决策摘要" onClick={onClose} />
+    <aside className="local-evidence-drawer local-decision-brief-drawer">
+      <header><div><span className="eyebrow">DECISION BRIEF · CONTROL PLANE PROJECTION</span><h3>#{brief.workItem.sequence} · {brief.workItem.title}</h3><p>{brief.intent.goal}</p></div><button className="icon-button" onClick={onClose} aria-label="关闭"><X size={15} /></button></header>
+      <div className={`local-decision-brief-state ${brief.gate.state}`}><span>{brief.gate.state === 'ready' ? <ShieldCheck size={16} /> : <ShieldAlert size={16} />}</span><div><strong>{decisionActionLabels[brief.gate.nextAction]}</strong><small>{brief.gate.state} · risk {brief.intent.riskLevel} · head {brief.proposal.headSha.slice(0, 12)}</small></div></div>
+      <section><span>你的审查权限</span><p className="local-decision-brief-copy">{brief.viewer.restriction ? decisionRestrictionLabels[brief.viewer.restriction] : `你以 ${brief.viewer.role} / ${brief.viewer.relationship} 身份查看，可提交终态决定；批准仍须满足全部适用门禁。`}{brief.viewer.approvalRestrictedToOwner ? ' 此变更修改策略文件，只有 Owner 可以批准；你仍可评论或请求修改。' : ''}</p></section>
+      <section><span>为什么存在</span><p className="local-decision-brief-copy">{brief.workItem.description || brief.intent.goal}</p>{brief.intent.nonGoals?.length ? <><small>明确不做</small><ul>{brief.intent.nonGoals.map((item) => <li key={item}>{item}</li>)}</ul></> : null}{brief.intent.draft ? <div className="local-decision-brief-copy"><small>模型起草来源</small><p>{brief.intent.draft.providerId} / {brief.intent.draft.model} · draft {brief.intent.draft.draftId}</p><p>作者修改：{brief.intent.draft.changedFields.length ? brief.intent.draft.changedFields.join('、') : '无字段变更'}</p>{brief.intent.draft.questions?.length ? <><small>起草时待确认问题</small><ul>{brief.intent.draft.questions.map((question) => <li key={question}>{question}</li>)}</ul></> : null}</div> : <small>该 Intent 未记录模型起草来源。</small>}</section>
+      <section><span>变更范围</span><code>{brief.proposal.baseRef} {brief.proposal.baseSha.slice(0, 8)} → {brief.proposal.headRef} {brief.proposal.headSha.slice(0, 8)}</code><small>{brief.proposal.changedFiles} files · +{brief.proposal.additions} −{brief.proposal.deletions} · {decisionExecutionLabels[brief.execution.source]}{brief.execution.runId ? ` ${brief.execution.runId}` : ''} · {brief.execution.adapterId ?? 'adapter unknown'} · {brief.execution.isolation ?? 'runtime unverified'}</small></section>
+      <section><span>门禁结论</span><div className="local-decision-brief-grid"><div><strong>{brief.gate.checks.successful}</strong><small>Checks passed</small></div><div><strong>{brief.gate.checks.failed}</strong><small>Failed</small></div><div><strong>{brief.gate.checks.waived}</strong><small>Waived</small></div><div><strong>{brief.gate.checks.pending}</strong><small>Pending</small></div></div>{brief.attention.length ? <ul className="local-decision-attention">{brief.attention.map((item) => <li key={item}>{item}</li>)}</ul> : <p className="local-decision-brief-copy">没有未解释的阻断；仍需 Reviewer 对变更本身负责。</p>}</section>
+      <section><span>验收标准</span>{brief.gate.criteria.map((criterion) => <div className={`local-decision-criterion ${criterion.status}`} key={criterion.criterionId}><div><strong>{criterion.label} · {criterion.statement}</strong><small>{criterionStatusLabels[criterion.status]} · {criticalityLabels[criterion.criticality]} · {verificationLabels[criterion.verificationType]}</small></div></div>)}</section>
+      <section><span>Context、Skills 与执行边界</span><div className="local-decision-brief-grid"><div><strong>{brief.context.controlPlaneInjected}</strong><small>平台注入</small></div><div><strong>{brief.context.builderReported}</strong><small>Builder 上报</small></div><div><strong>{brief.context.rejected}</strong><small>读取拒绝</small></div><div><strong>{brief.context.undeclared}</strong><small>未声明读取</small></div><div><strong>{brief.context.skillsLoaded}</strong><small>Skills loaded</small></div><div><strong>{brief.context.skillsRejected}</strong><small>Skill rejected</small></div></div><small>{brief.context.observation === 'unavailable' ? '本地没有该 Run 的 Context / Skill 事件来源；以上 0 不是已验证的零次访问。 · ' : ''}production eligible {brief.execution.productionEligible === undefined ? 'unknown' : String(brief.execution.productionEligible)}{brief.execution.builderStop ? ` · Builder ${brief.execution.builderStop.reason}` : ''}</small></section>
+      <section><span>Evidence</span>{brief.evidence.map((evidence) => <div className="local-decision-evidence" key={evidence.id}><div><strong>{evidence.id} · {evidence.status ?? 'recorded'}</strong><small>{evidence.artifactCount} artifact(s) · independent test {evidence.independentTestSignal === undefined ? 'unknown' : String(evidence.independentTestSignal)} · {evidence.viewedByReviewer ? '你已展开' : '尚未展开'}</small></div><button className="secondary-button" onClick={() => onViewEvidence(evidence.id)}><Eye size={12} />校验证据</button></div>)}</section>
+      <section><span>审查责任</span>{brief.review.assignment ? <div className="local-decision-brief-copy"><strong>{brief.review.assignment.assigneeDisplayName}</strong><p>{assignmentStatusLabels[brief.review.assignment.status]} · due {brief.review.assignment.dueAt.slice(0, 16).replace('T', ' ')}{brief.review.briefOpenedAt ? ` · Brief opened ${brief.review.briefOpenedAt.slice(0, 16).replace('T', ' ')}` : ''}{brief.review.evidenceOpenedAt ? ` · Evidence opened ${brief.review.evidenceOpenedAt.slice(0, 16).replace('T', ' ')}` : ''}{brief.review.assignmentCycleElapsedSeconds !== undefined ? ` · assignment cycle ${formatReviewDuration(brief.review.assignmentCycleElapsedSeconds)}` : ''}</p></div> : <p className="local-decision-brief-copy">尚未分配唯一审查人。{brief.review.briefOpenedAt ? ` 当前查看者首次打开于 ${brief.review.briefOpenedAt.slice(0, 16).replace('T', ' ')}。` : ''}</p>}{brief.review.currentDecisions.length ? <ul>{brief.review.currentDecisions.map((decision) => <li key={decision.id}><strong>{decision.reviewerDisplayName} · {decision.decision}</strong>：{decision.comment || '未填写说明'}</li>)}</ul> : null}</section>
+    </aside>
+  </>
+}
+
 function LocalReleaseCandidates() {
   const local = useLocalControlPlane()
   const [busyId, setBusyId] = useState<string>()
@@ -1654,9 +1750,9 @@ function LocalReleaseCandidates() {
   const approveCandidate = async (candidateId: string) => {
     setBusyId(candidateId)
     setError(undefined)
-    try { await local.approveReleaseCandidate(candidateId, 'Merge Evidence 与 Source Snapshot Digest 已复验，批准该发布候选。') } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) } finally { setBusyId(undefined) }
+    try { await local.approveReleaseCandidate(candidateId, 'Merge Evidence、Source Tree Digest 与 Artifact Binding 已复验，批准该发布候选。') } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) } finally { setBusyId(undefined) }
   }
-  return <section className="panel local-release-candidates"><div className="local-core-heading"><div><span className="eyebrow">真实数据 · 本地发布</span><h2>Merged Revision → Source Snapshot</h2><p>当前只封存 Source Tree Digest 与独立发布批准；不执行部署，也不冒充二进制制品证明。</p></div><span>{local.releaseCandidates.filter((candidate) => candidate.status === 'approved').length} approved</span></div>{mergedProposals.length === 0 ? <div className="local-empty"><PackageCheck size={18} /><p>尚无已合并 Change Proposal；Release Candidate 必须从 Merge Evidence 创建。</p></div> : <div className="local-release-list">{mergedProposals.map((proposal) => { const candidate = candidatesByProposal.get(proposal.id); const selfApproval = candidate?.createdByActorId === local.actor?.id; return <article key={proposal.id}><div><span className={`local-status ${candidate?.status ?? 'review_ready'}`}>{candidate?.status ?? 'not_created'}</span><strong>{workItemLabel(local.workItems.find((item) => item.id === proposal.workItemId)) ?? proposal.workItemId}</strong><small>{proposal.id} · commit {(candidate?.commitSha ?? proposal.headSha).slice(0, 12)}</small></div>{candidate ? <><div className="local-release-digests"><code title={candidate.sourceTreeDigest}>{candidate.sourceTreeDigest}</code><small>{candidate.sourceFileCount} source files · {candidate.contentDigest}</small></div><div className="local-release-actions">{candidate.approval ? <span><ShieldCheck size={13} />{candidate.approval.approverActorId.slice(-8)} · approved</span> : <button className="approve-button" disabled={!canManage || selfApproval || busyId === candidate.id} onClick={() => void approveCandidate(candidate.id)}><Check size={13} />{selfApproval ? '需要独立 Maintainer' : '批准候选'}</button>}</div></> : <button className="secondary-button" disabled={!canManage || busyId === proposal.id} onClick={() => void createCandidate(proposal.id)}><Plus size={13} />{busyId === proposal.id ? '封存中' : '创建候选'}</button>}</article> })}</div>}{error && <p className="local-form-error" role="alert">{error}</p>}</section>
+  return <section className="panel local-release-candidates"><div className="local-core-heading"><div><span className="eyebrow">真实数据 · 本地发布</span><h2>Merged Revision → Governed Candidate</h2><p>Agent System 可封存源码快照；Application 必须绑定 Merge Evidence 中的 Build Artifact Evidence。这里不执行部署，也不冒充 Artifact Repository 证明。</p></div><span>{local.releaseCandidates.filter((candidate) => candidate.status === 'approved').length} approved</span></div>{mergedProposals.length === 0 ? <div className="local-empty"><PackageCheck size={18} /><p>尚无已合并 Change Proposal；Release Candidate 必须从 Merge Evidence 创建。</p></div> : <div className="local-release-list">{mergedProposals.map((proposal) => { const candidate = candidatesByProposal.get(proposal.id); const selfApproval = candidate?.createdByActorId === local.actor?.id; return <article key={proposal.id}><div><span className={`local-status ${candidate?.status ?? 'review_ready'}`}>{candidate?.status ?? 'not_created'}</span><strong>{workItemLabel(local.workItems.find((item) => item.id === proposal.workItemId)) ?? proposal.workItemId}</strong><small>{proposal.id} · commit {(candidate?.commitSha ?? proposal.headSha).slice(0, 12)}</small></div>{candidate ? <><div className="local-release-digests"><code title={candidate.sourceTreeDigest}>{candidate.sourceTreeDigest}</code><small>{candidate.artifactClass} · {candidate.artifactEvidence.reduce((count, evidence) => count + evidence.artifactCount, 0)} artifact(s) · {candidate.sourceFileCount} source files</small><small>{candidate.artifactBindingDigest ?? 'legacy candidate without artifact binding'} · {candidate.contentDigest}</small></div><div className="local-release-actions">{candidate.approval ? <span><ShieldCheck size={13} />{candidate.approval.approverActorId.slice(-8)} · approved</span> : <button className="approve-button" disabled={!canManage || selfApproval || busyId === candidate.id} onClick={() => void approveCandidate(candidate.id)}><Check size={13} />{selfApproval ? '需要独立 Maintainer' : '批准候选'}</button>}</div></> : <button className="secondary-button" disabled={!canManage || busyId === proposal.id} onClick={() => void createCandidate(proposal.id)}><Plus size={13} />{busyId === proposal.id ? '封存中' : '创建候选'}</button>}</article> })}</div>}{error && <p className="local-form-error" role="alert">{error}</p>}</section>
 }
 
 function ReleasePage() {

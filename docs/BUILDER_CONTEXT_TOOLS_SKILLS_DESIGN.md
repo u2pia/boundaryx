@@ -1,6 +1,6 @@
 # Builder 上下文、工具与 Skills 设计方案（草案 v0.1）
 
-日期：2026-09-26 · 状态：已审查，**不按原样实施**，见 `ADVERSARIAL_REVIEW_2026-09-26_BUILDER_CONTEXT_TOOLS.md`；修订后的 P1（3.7、3.8、`builder.allowShell` 随 `aperture.project.v2` 引入）已实施，3.2、3.3 砍掉，实施记录和残余风险见审查文档末尾 · 适用分支：builder-time-budget
+日期：2026-09-26 · 状态：已审查，**不按原样实施**，见 `ADVERSARIAL_REVIEW_2026-09-26_BUILDER_CONTEXT_TOOLS.md`；修订后的 P1（3.7、3.8、`builder.allowShell` 随 `aperture.project.v2` 引入）已实施，3.2、3.3 砍掉。2026-09-29 已把 Skills Catalog 作为 Core 治理面实施：manifest 声明、Revision、文件健康、32 KB 大小检查、内容摘要和只读预览已接入；内置 Chat Builder 支持受控 `load_skill(name)`，Claude Code 的成功 Read 会映射为 Skill 使用事件，事件进入 Run、Decision Brief 与 Evidence Package。当前事件仍来自运行内工具流、不是 OS 级独立观测；Codex 尚无可靠读取事件，不得把目录声明当作 Run 使用证明。 · 适用分支：builder-time-budget
 
 ## 1. 背景与目标
 

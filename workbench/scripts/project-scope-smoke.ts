@@ -199,18 +199,23 @@ try {
   const noManifest = (await call<{ context: { manifestFound: boolean; issues: Array<{ code: string }> } }>(`/api/projects/${beta.id}/context`, { cookie: aliceCookie })).body.context
   assert.deepEqual([noManifest.manifestFound, noManifest.issues.map((issue) => issue.code)], [false, ['manifest_missing']])
   mkdirSync(join(betaRepository, '.aperture'))
+  mkdirSync(join(betaRepository, '.aperture/skills'))
   writeFileSync(join(betaRepository, 'CLAUDE.md'), 'See docs.\n')
-  writeFileSync(join(betaRepository, '.aperture/project.json'), JSON.stringify({ schemaVersion: 'aperture.project.v1', productType: 'application', context: { required: ['README.md'], allowed: ['README.md', 'docs/rules.md'] }, checks: [{ name: 'beta', kind: 'test', command: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 10_000 }], policy: { maximumRisk: 'high', allowUnisolatedRuntime: true } }))
+  writeFileSync(join(betaRepository, '.aperture/skills/review-change.md'), '# Review change\nUse the Intent and Evidence.\n')
+  writeFileSync(join(betaRepository, '.aperture/project.json'), JSON.stringify({ schemaVersion: 'aperture.project.v1', productType: 'application', context: { required: ['README.md'], allowed: ['README.md', 'docs/rules.md'] }, skills: [{ name: 'review-change', path: '.aperture/skills/review-change.md', description: 'Review a change against its governed inputs.' }], checks: [{ name: 'beta', kind: 'test', command: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 10_000 }], policy: { maximumRisk: 'high', allowUnisolatedRuntime: true } }))
   execFileSync('git', ['-C', betaRepository, 'add', '.aperture', 'CLAUDE.md'])
   execFileSync('git', ['-C', betaRepository, 'commit', '--quiet', '-m', 'manifest'])
   // The context a Run would bind is readable by members, flags what a Run would miss, and serves only declared files.
-  const context = (await call<{ context: { files: Array<{ path: string; required: boolean; exists: boolean; sizeBytes?: number; lastCommit?: { subject: string } }>; requiredBytes: number; issues: Array<{ code: string; path?: string }> } }>(`/api/projects/${beta.id}/context`, { cookie: aliceCookie })).body.context
+  const context = (await call<{ context: { files: Array<{ path: string; required: boolean; exists: boolean; sizeBytes?: number; lastCommit?: { subject: string } }>; skills: Array<{ name: string; path: string; exists: boolean; contentDigest?: string }>; requiredBytes: number; issues: Array<{ code: string; path?: string }> } }>(`/api/projects/${beta.id}/context`, { cookie: aliceCookie })).body.context
   assert.deepEqual(context.files.map((file) => [file.path, file.required, file.exists]), [['README.md', true, true], ['docs/rules.md', false, false]])
+  assert.deepEqual(context.skills.map((skill) => [skill.name, skill.path, skill.exists]), [['review-change', '.aperture/skills/review-change.md', true]])
+  assert.match(context.skills[0].contentDigest ?? '', /^sha256:[0-9a-f]{64}$/u)
   assert.equal(context.requiredBytes, '# beta\n'.length)
   assert.equal(context.files[0].lastCommit?.subject, 'initial')
   assert.deepEqual(context.issues.map((issue) => [issue.code, issue.path]), [['file_missing', 'docs/rules.md'], ['undeclared_instructions', 'CLAUDE.md']])
   assert.equal((await call(`/api/projects/${beta.id}/context`, { cookie: bobCookie })).status, 404, 'a non-member cannot read the context')
   assert.deepEqual((await call<{ file: { content: string } }>(`/api/projects/${beta.id}/context/file?path=README.md`, { cookie: aliceCookie })).body.file.content, '# beta\n')
+  assert.match((await call<{ file: { content: string } }>(`/api/projects/${beta.id}/context/file?path=${encodeURIComponent('.aperture/skills/review-change.md')}`, { cookie: aliceCookie })).body.file.content, /Use the Intent and Evidence/u)
   for (const path of ['CLAUDE.md', '.aperture/project.json', '../etc/passwd']) assert.equal((await call(`/api/projects/${beta.id}/context/file?path=${encodeURIComponent(path)}`, { cookie: aliceCookie })).status, 404, `${path} is not declared context`)
   assert.deepEqual((await call(`/api/projects/${beta.id}/product-type`, { cookie: aliceCookie })).body, { productType: 'application' })
   assert.equal((await call(`/api/projects/${beta.id}/product-type`, { cookie: bobCookie })).status, 404, 'a non-member cannot read it')

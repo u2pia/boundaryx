@@ -230,7 +230,8 @@ try {
   function makeReady(proposalId: string, summary: Record<string, unknown> = {}) {
     const proposal = database.getChangeProposal(proposalId)
     database.recordCheck({ proposalId, headSha: proposal.headSha, name: 'unit', status: 'completed', conclusion: 'success' }, owner.id)
-    const evidence = database.recordEvidence({ proposalId, runId: proposal.runId!, headSha: proposal.headSha, uri: `local://evidence/${proposalId}.json`, sha256: `sha256:${proposalId}`, summary }, owner.id)
+    const artifactSummary = Number(summary.artifactCount ?? 0) > 0 ? { buildCheckName: 'build', buildCheckConclusion: 'success', artifactDigests: [`sha256:${'a'.repeat(64)}`], artifactSourceCommitShas: [proposal.headSha] } : {}
+    const evidence = database.recordEvidence({ proposalId, runId: proposal.runId!, headSha: proposal.headSha, uri: `local://evidence/${proposalId}.json`, sha256: `sha256:${proposalId}`, summary: { ...summary, ...artifactSummary } }, owner.id)
     database.recordEvidenceView(evidence.id, bob.id, evidence.sha256)
   }
   const approve = (proposalId: string) => database.recordReview({ proposalId, headSha: database.getChangeProposal(proposalId).headSha, reviewerActorId: bob.id, decision: 'approved', comment: 'checked' })
@@ -335,7 +336,7 @@ try {
   // Branch protection refusing the push is its own error, and is rolled back too.
   const second = runProposal('agent/run-b')
   await syncer.syncProject(project.id)
-  makeReady(second.id)
+  makeReady(second.id, { artifactCount: 1 })
   approve(second.id)
   await syncer.syncProject(project.id)
   assert.equal(gateOf(second.headSha)?.state, 'success')
@@ -361,6 +362,8 @@ try {
   assert.equal(git(clone, 'rev-parse', 'refs/heads/main'), remoteSha('main'), 'the managed clone follows the merge')
   assert.deepEqual([database.getChangeProposal(second.id).status, linkOf(second.id).state], ['merged', 'merged'])
   assert.equal(database.listAggregateEvents('change_proposal', second.id).some((event) => event.eventType === 'change_proposal.merged_outside_gate'), false)
+  const releases = new LocalReleaseAuthority(database)
+  assert.throws(() => releases.createReleaseCandidate(second.id, owner.id), failsWith('release_build_source_tree_mismatch'), 'a squash tree that includes unrelated source cannot inherit the approved head build attestation')
 
   // A merge the gate did not allow — unreviewed, a failing check, and an extra commit pushed to the pull request.
   const third = runProposal('agent/run-c')
@@ -412,7 +415,6 @@ try {
   assert.equal((await call(hostMergePath, { cookie: ownerCookie, body: {} })).status, 200, 'asking again is a no-op')
   allowedMergeMethods = ['merge', 'squash', 'rebase']
   // A host merge is released from the commit the host made, not the approved head; one outside the gate is not.
-  const releases = new LocalReleaseAuthority(database)
   const candidate = releases.createReleaseCandidate(fourth.id, owner.id)
   assert.deepEqual([candidate.commitSha, candidate.artifactClass], [viaApi.body.evidence.mergedSha, 'source_with_build_attestation'])
   assert.notEqual(candidate.commitSha, fourth.headSha)

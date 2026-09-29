@@ -8,7 +8,7 @@ import { requestContext } from './request-context.ts'
 import { loadEventSealKeyring, type EventSealKeyring } from './event-seal.ts'
 import { normalizeProjectHost, type ProjectHostInput } from './code-host/index.ts'
 import type { GeneratedIntentDraft, IntentDraftContent } from './intent-drafter.ts'
-import type { IntentDraftField, IntentVersionDraft, AcceptanceCriterionInput, BuilderStopReason, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentExample, IntentVersion, MergeEvidence, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
+import type { IntentDraftField, IntentVersionDraft, AcceptanceCriterionInput, BuilderStopReason, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionBrief, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentExample, IntentVersion, MergeEvidence, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
 import { AppError } from './types.ts'
 
 type SqlValue = string | number | null
@@ -1496,6 +1496,15 @@ export class ControlPlaneDatabase {
       WHERE evidence_packages.change_proposal_id = ? AND evidence_packages.head_sha = ?
         AND evidence_views.reviewer_actor_id = ? AND evidence_views.viewed_at <= ?
     `).get(review.changeProposalId, review.headSha, review.reviewerActorId, review.createdAt) as { count: number }).count) > 0).length
+    const proposalIds = new Set(proposals.map((proposal) => proposal.id))
+    const briefViews = (this.db.prepare('SELECT change_proposal_id, head_sha, reviewer_actor_id, viewed_at FROM decision_brief_views').all() as Array<{ change_proposal_id: string; head_sha: string; reviewer_actor_id: string; viewed_at: string }>).filter((view) => proposalIds.has(view.change_proposal_id))
+    const briefViewByDecision = new Map(briefViews.map((view) => [`${view.change_proposal_id}:${view.head_sha}:${view.reviewer_actor_id}`, view.viewed_at]))
+    const briefToDecisionSeconds = [...firstTerminalDecisionByRevision.values()].flatMap((review) => {
+      const viewedAt = briefViewByDecision.get(`${review.changeProposalId}:${review.headSha}:${review.reviewerActorId}`)
+      if (!viewedAt || viewedAt > review.createdAt) return []
+      return [Math.max(0, Math.floor((Date.parse(review.createdAt) - Date.parse(viewedAt)) / 1000))]
+    }).sort((left, right) => left - right)
+    const medianBriefToDecisionSeconds = briefToDecisionSeconds.length === 0 ? 0 : briefToDecisionSeconds.length % 2 === 1 ? briefToDecisionSeconds[Math.floor(briefToDecisionSeconds.length / 2)] : Math.round((briefToDecisionSeconds[briefToDecisionSeconds.length / 2 - 1] + briefToDecisionSeconds[briefToDecisionSeconds.length / 2]) / 2)
     return {
       pendingCount: pending.length,
       changesRequestedCount: proposals.filter((proposal) => proposal.status === 'changes_requested').length,
@@ -1507,6 +1516,9 @@ export class ControlPlaneDatabase {
       activeReviewerCount: new Set(reviews.filter((review) => !review.invalidatedAt).map((review) => review.reviewerActorId)).size,
       approvalDecisionCount: approvals.length,
       evidenceExpandedApprovalCount,
+      decisionBriefViewCount: briefViews.length,
+      decisionBriefOpenedDecisionCount: briefToDecisionSeconds.length,
+      medianBriefToDecisionSeconds,
       decidedProposalCount: firstDecisionByProposal.size,
       firstPassApprovalCount: [...firstDecisionByProposal.values()].filter((review) => review.decision === 'approved').length,
       reworkedProposalCount: new Set(reviews.filter((review) => review.decision === 'changes_requested').map((review) => review.changeProposalId)).size,
@@ -1603,6 +1615,97 @@ export class ControlPlaneDatabase {
       policyFiles: proposal.policyFiles ?? null,
       builderStop: proposal.runId ? this.builderStop(proposal.runId) : null,
     }
+  }
+
+  getDecisionBrief(proposalId: string, reviewerActorId: string): DecisionBrief {
+    const proposal = this.getChangeProposal(proposalId)
+    const reviewerRole = this.requireProjectRole(reviewerActorId, proposal.projectId, ['owner', 'maintainer', 'reviewer'], 'review_forbidden')
+    const workItem = this.getWorkItem(proposal.workItemId)
+    const intent = this.getIntentVersion(proposal.intentVersionId)
+    const readiness = this.getReviewReadiness(proposalId)
+    const localRun = proposal.runId
+      ? this.db.prepare('SELECT id FROM agent_runs WHERE id = ?').get(proposal.runId) as { id: string } | undefined
+      : undefined
+    const run = localRun ? this.getAgentRun(localRun.id) : undefined
+    const executionSource: DecisionBrief['execution']['source'] = run ? 'local_agent_run' : proposal.runId ? 'external_run_reference' : 'manual'
+    const runEvents = run ? this.listAggregateEvents('agent_run', run.id) : []
+    const consumed = runEvents.filter((event) => event.eventType === 'agent_run.context_consumed')
+    const context = {
+      observation: run ? 'available' as const : 'unavailable' as const,
+      controlPlaneInjected: consumed.filter((event) => event.payload.reportSource === 'control_plane_injection').length,
+      builderReported: consumed.filter((event) => event.payload.reportSource !== 'control_plane_injection').length,
+      rejected: runEvents.filter((event) => event.eventType === 'agent_run.context_rejected').length,
+      undeclared: consumed.filter((event) => event.payload.declared === false).length,
+      skillsLoaded: runEvents.filter((event) => event.eventType === 'agent_run.skill_loaded').length,
+      skillsRejected: runEvents.filter((event) => event.eventType === 'agent_run.skill_rejected').length,
+    }
+    const assignment = this.activeAssignment(proposalId)
+    const briefOpenedAt = (this.db.prepare('SELECT viewed_at FROM decision_brief_views WHERE change_proposal_id = ? AND head_sha = ? AND reviewer_actor_id = ?').get(proposal.id, proposal.headSha, reviewerActorId) as { viewed_at: string } | undefined)?.viewed_at
+    const currentDecisions = this.listReviews([proposal.projectId]).filter((review) => review.changeProposalId === proposalId && review.headSha === proposal.headSha && !review.invalidatedAt).map((review) => ({ id: review.id, decision: review.decision, comment: review.comment, reviewerDisplayName: review.reviewerDisplayName, decisionLatencySeconds: review.decisionLatencySeconds, createdAt: review.createdAt }))
+    const evidence = readiness.evidence.map((item) => ({
+      id: item.id,
+      runId: item.runId,
+      sha256: item.sha256,
+      status: typeof item.summary.status === 'string' ? item.summary.status : undefined,
+      artifactCount: Number(item.summary.artifactCount ?? 0),
+      independentTestSignal: typeof item.summary.independentTestSignal === 'boolean' ? item.summary.independentTestSignal : undefined,
+      viewedByReviewer: Number((this.db.prepare('SELECT COUNT(*) AS count FROM evidence_views WHERE evidence_id = ? AND reviewer_actor_id = ? AND viewed_sha256 = ?').get(item.id, reviewerActorId, item.sha256) as { count: number }).count) > 0,
+      createdAt: item.createdAt,
+    }))
+    const humanJudgement = readiness.criteria.filter((criterion) => criterion.status === 'awaiting_review' || criterion.status === 'needs_test_review')
+    const attention = [
+      ...readiness.blockers,
+      ...(proposal.policyFiles?.length ? [`Policy files changed: ${proposal.policyFiles.join(', ')}`] : []),
+      ...(readiness.builderStop ? [`Builder stopped early: ${readiness.builderStop.reason}`] : []),
+      ...(context.rejected ? [`${context.rejected} context access report(s) were rejected.`] : []),
+      ...(context.skillsRejected ? [`${context.skillsRejected} Skill load report(s) were rejected.`] : []),
+      ...(intent.draft?.questions?.length ? [`模型起草时有 ${intent.draft.questions.length} 个待确认问题。`] : []),
+      ...(evidence.some((item) => item.independentTestSignal === false) ? ['No independent passing test signal is recorded for at least one evidence package.'] : []),
+      ...(evidence.some((item) => item.independentTestSignal === undefined) ? ['Independent test provenance is unknown for at least one evidence package.'] : []),
+      ...humanJudgement.map((criterion) => `${criterion.label} requires reviewer judgement.`),
+    ]
+    const nextAction: DecisionBrief['gate']['nextAction'] = ['merged', 'closed'].includes(proposal.status)
+      ? 'completed'
+      : proposal.status === 'approved'
+        ? 'already_decided'
+        : proposal.status === 'changes_requested'
+          ? 'await_revision'
+          : readiness.status !== 'ready'
+            ? 'resolve_blockers'
+            : humanJudgement.length
+              ? 'review_human_judgement'
+              : 'review_and_decide'
+    const proposalCompleted = ['merged', 'closed'].includes(proposal.status)
+    const isAuthor = proposal.authorActorId === reviewerActorId
+    const assignmentMismatch = Boolean(assignment && assignment.assigneeActorId !== reviewerActorId)
+    const restriction: DecisionBrief['viewer']['restriction'] = proposalCompleted ? 'proposal_completed' : isAuthor ? 'self_review_forbidden' : assignmentMismatch ? 'review_not_assigned' : undefined
+    return {
+      generatedAt: nowIso(),
+      proposal: { id: proposal.id, status: proposal.status, baseRef: proposal.baseRef, baseSha: proposal.baseSha, headRef: proposal.headRef, headSha: proposal.headSha, changedFiles: proposal.changedFiles, additions: proposal.additions, deletions: proposal.deletions, policyFiles: proposal.policyFiles, reviewCycleStartedAt: proposal.reviewCycleStartedAt },
+      workItem: { id: workItem.id, sequence: workItem.sequence, title: workItem.title, description: workItem.description, productType: workItem.productType },
+      intent: { id: intent.id, version: intent.version, goal: intent.goal, constraints: intent.constraints, nonGoals: intent.nonGoals, examples: intent.examples, riskLevel: intent.riskLevel, contentDigest: intent.contentDigest, draft: intent.draft },
+      gate: { state: readiness.status, nextAction, blockers: readiness.blockers, criteria: readiness.criteria, checks: { successful: readiness.successfulCheckCount, failed: readiness.failedCheckCount, waived: readiness.waivedCheckCount, pending: readiness.pendingCheckCount } },
+      context,
+      execution: { source: executionSource, runId: proposal.runId, status: run?.status, adapterId: run?.adapterId, isolation: run?.isolation, productionEligible: run?.productionEligible, builderStop: readiness.builderStop },
+      evidence,
+      review: { assignment, currentDecisions, briefOpenedAt, evidenceOpenedAt: assignment?.evidenceOpenedAt, assignmentCycleElapsedSeconds: assignment?.timeSpentSeconds },
+      viewer: { role: reviewerRole, relationship: isAuthor ? 'author' : assignment?.assigneeActorId === reviewerActorId ? 'assignee' : 'reviewer', canComment: !proposalCompleted, canRecordTerminalDecision: !restriction, approvalRestrictedToOwner: Boolean(proposal.policyFiles?.length && reviewerRole !== 'owner'), ...(restriction ? { restriction } : {}) },
+      attention: [...new Set(attention)],
+    }
+  }
+
+  recordDecisionBriefView(proposalId: string, reviewerActorId: string) {
+    const brief = this.getDecisionBrief(proposalId, reviewerActorId)
+    if (!brief.viewer.canRecordTerminalDecision) throw new AppError(403, 'Only the actor currently eligible to make a terminal decision can record a Decision Brief view', 'decision_brief_view_forbidden')
+    const proposal = this.getChangeProposal(proposalId)
+    const timestamp = nowIso()
+    const viewId = id('DBV')
+    return this.inTransaction(() => {
+      const result = this.db.prepare('INSERT OR IGNORE INTO decision_brief_views(id, change_proposal_id, head_sha, reviewer_actor_id, viewed_at) VALUES (?, ?, ?, ?, ?)').run(viewId, proposal.id, proposal.headSha, reviewerActorId, timestamp)
+      const view = this.db.prepare('SELECT id, viewed_at FROM decision_brief_views WHERE change_proposal_id = ? AND head_sha = ? AND reviewer_actor_id = ?').get(proposal.id, proposal.headSha, reviewerActorId) as { id: string; viewed_at: string }
+      if (result.changes) this.appendEvent({ aggregateType: 'change_proposal', aggregateId: proposal.id, eventType: 'review.decision_brief_opened', actorId: reviewerActorId, payload: { viewId: view.id, headSha: proposal.headSha } })
+      return { reviewerActorId, viewedAt: view.viewed_at }
+    })
   }
 
   /** The Builder's own report that it was stopped at a budget, from the run that produced the head under review. */

@@ -67,6 +67,7 @@ Agent 可在标准输出中逐行写入 JSON：
 
 ```json
 {"type":"context_consumed","path":"src/auth/session.ts"}
+{"type":"skill_loaded","source":"builder_tool","name":"add-validation-rule","path":".aperture/skills/add-validation-rule.md","contentDigest":"sha256:..."}
 {"type":"message","summary":"Implemented session expiry validation."}
 ```
 
@@ -78,6 +79,8 @@ independentlyObserved = false
 ```
 
 在接入独立文件访问审计前，该信息不能作为高保证审计证据。
+
+`skill_loaded` 只有在名称、路径和内容摘要都匹配 Run admission 时绑定的 Skills Catalog 时才会记为 `agent_run.skill_loaded`；否则记为 `agent_run.skill_rejected`。内置 Chat Builder 的 `load_skill(name)` 会生成该事件，Claude Code 对声明 Skill 路径的成功 Read 也会映射为同一事件。两者都明确标为 `independentlyObserved = false`。Codex 当前没有可靠的读取事件，因此只接收 Catalog 提示，不生成虚假的加载证据。
 
 ## 5. App 与 Agent System 的评估分流
 

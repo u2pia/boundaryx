@@ -8,6 +8,8 @@ import { ControlPlaneDatabase } from '../server/database.ts'
 import { useProjectRepository } from './fixtures.ts'
 import { LocalCommandAgentRunner } from '../server/local-command-agent-runner.ts'
 import { LocalEvidenceStore } from '../server/local-evidence-store.ts'
+import { LocalGitAuthority } from '../server/local-git-authority.ts'
+import { LocalReleaseAuthority, releaseArtifactEvidence } from '../server/local-release-authority.ts'
 import { LocalRunPostprocessor } from '../server/local-run-postprocessor.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'aperture-application-build-'))
@@ -37,6 +39,7 @@ try {
   const owner = database.createActor({ username: 'owner', displayName: 'Build Owner', role: 'owner', password: 'owner-password-2026' })
   useProjectRepository(database, repositoryPath, owner.id)
   const approver = database.createActor({ username: 'approver', displayName: 'Intent Approver', role: 'reviewer', password: 'approver-password-2026' }, owner.id)
+  const releaseApprover = database.createActor({ username: 'release-approver', displayName: 'Release Approver', role: 'maintainer', password: 'release-password-2026' }, owner.id)
   const evidenceStore = new LocalEvidenceStore(join(root, 'evidence'))
   const runner = new LocalCommandAgentRunner({ database, executable: process.execPath, args: [agentScript], worktreeRoot: join(root, 'runs'), timeoutMs: 10_000, postprocessor: new LocalRunPostprocessor({ database, evidenceStore }) })
 
@@ -70,7 +73,28 @@ try {
   assert.equal(missing.evidence.checks.some((check) => check.name === 'artifact-output:dist/app.js' && check.conclusion === 'failure'), true)
   assert.equal(database.listAggregateEvents('agent_run', missing.run.id).some((event) => event.eventType === 'agent_run.artifact_attestation_failed'), true)
 
-  console.log(`application build provenance smoke passed · ${ready.run.id} · artifact digest attested · missing output blocked`)
+  const proposalId = ready.run.changeProposalId!
+  const evidenceRecord = ready.readiness.evidence[0]
+  database.recordEvidenceView(evidenceRecord.id, approver.id, evidenceRecord.sha256)
+  database.recordReview({ proposalId, headSha: ready.readiness.headSha, reviewerActorId: approver.id, decision: 'approved', comment: 'Build Artifact evidence and source binding reviewed.' })
+  const merge = new LocalGitAuthority(database).mergeChangeProposal(proposalId, owner.id)
+  assert.equal(merge.proposal.status, 'merged')
+  assert.deepEqual(merge.evidence.evidenceIds, [evidenceRecord.id])
+
+  const releaseAuthority = new LocalReleaseAuthority(database)
+  assert.throws(() => releaseArtifactEvidence({ ...evidenceRecord, summary: { ...evidenceRecord.summary, buildCheckConclusion: 'failure' } }, ready.evidence.git.headSha), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'release_application_build_failed')
+  const candidate = releaseAuthority.createReleaseCandidate(proposalId, owner.id)
+  assert.equal(candidate.artifactClass, 'source_with_build_attestation')
+  assert.deepEqual(candidate.artifactEvidence, [{ evidenceId: evidenceRecord.id, packageDigest: evidenceRecord.sha256, artifactCount: 1, artifactDigests: [ready.evidence.artifacts![0].sha256], sourceCommitSha: ready.evidence.git.headSha, buildCheckName: 'application-build' }])
+  assert.match(candidate.artifactBindingDigest ?? '', /^sha256:[0-9a-f]{64}$/u)
+  assert.match(candidate.contentDigest, /^sha256:[0-9a-f]{64}$/u)
+  assert.equal(releaseAuthority.verifyReleaseCandidate(candidate.id).contentDigest, candidate.contentDigest)
+  assert.throws(() => database.approveReleaseCandidate(candidate.id, owner.id, 'self approval'))
+  const approvedCandidate = database.approveReleaseCandidate(candidate.id, releaseApprover.id, 'Artifact binding and merged source verified.')
+  assert.equal(approvedCandidate.status, 'approved')
+  assert.equal(approvedCandidate.approval?.candidateContentDigest, candidate.contentDigest)
+
+  console.log(`application build provenance smoke passed · ${ready.run.id} · artifact bound through approved release candidate · missing output blocked`)
 } finally {
   database.close()
   rmSync(root, { recursive: true, force: true })
