@@ -169,10 +169,12 @@ Intent 页的表单按 `PRODUCT_CHARTER.md` 的定义补三样东西：验收标
 
 「用模型起草」按钮把 Work Item 标题和一段需求描述交给设置里配置的 LLM Provider（与 Builder 同一个，`POST /api/projects/:id/intent-drafts`），生成目标、约束、不做什么、示例、风险等级和带标注的验收标准，填进同一张表单，开发人员改完再提交。草稿本身不创建任何东西，提交时和手写的 Intent 走同样的校验。几条约定：
 
-- 模型的输出先由服务端规范化：无法识别的标注按「关键 · 确定性」处理，manifest 里没有的 Check 名去掉，高风险缺人工标准这类问题只提示、不代补，所有调整都列在草稿下方；模型拿不准的地方以「待确认问题」列出；
-- 模型建议的风险等级比表单当前值低时不会自动下调，因为风险等级决定谁来批准，要由人自己改；
-- 草稿原样存进只允许追加的 `intent_drafts` 表，并在项目事件链上记一条 `intent.draft_generated`（需求描述只记摘要）。Intent 版本记下来源草稿和作者改过的字段（`draft.changedFields`），不计入 `contentDigest`。Intent 详情会显示「由某模型起草，作者修改了哪些字段」；验收标准没改过时会提醒批准人逐条核对；
-- 草稿只能由生成它的作者、在同一项目里使用（`intent_draft_foreign`）。
+- 模型的输出先由服务端规范化：无法识别的标注按「关键 · 确定性」处理，manifest 里没有的 Check 名去掉（读不到 manifest 时照常起草、不点名任何 Check，并在调整里写明原因），高风险缺人工标准这类问题只提示、不代补，所有调整都列在草稿下方；模型拿不准的地方以「待确认问题」列出，这些问题随 Intent 版本的起草来源一起保存，批准人在 Intent 详情和 Evidence Package 里都能看到（作者可能已经在 Intent 里回答，也可能没有）；
+- 模型建议的风险等级比表单当前值低时不会自动下调，因为风险等级决定谁来批准，要由人自己改；保留表单的值会记为 `riskLevel` 与草稿不同，表单提示里标成「保留表单的，未按模型下调」；
+- 草稿原样存进只允许追加的 `intent_drafts` 表，并在项目事件链上记一条 `intent.draft_generated`（需求描述只记摘要）。Intent 版本记下来源草稿和作者改过的字段（`draft.changedFields`），不计入 `contentDigest`。Intent 详情和 Evidence Package（`intent.draft`）都带着这份来源；验收标准没改过时会提醒批准人逐条核对。表单提示「你已修改」与服务端的 `changedFields` 用同一个比较（`intentFormContent` / `draftChangedFields`）；
+- 草稿只能由生成它的作者、在同一项目里使用（`intent_draft_foreign`）；
+- 每人同时只能有一份草稿在生成（`429 intent_draft_in_progress`）。「取消起草」或离开页面会关闭请求，服务端随之中止模型调用，不留记录；切换项目前如果表单里有没提交的内容会先确认；
+- 没有 API key 的 Anthropic Provider 走本机 Claude Code：只跑一轮，关掉工具、hooks、MCP 和斜杠命令，只读用户级设置，需求描述里的指令没有可执行的东西。
 
 验收标准一行一条，行首可带任意数量、任意顺序的方括号标注：
 
@@ -198,7 +200,7 @@ Intent 页的表单按 `PRODUCT_CHARTER.md` 的定义补三样东西：验收标
 
 **验收标准证据门禁**：审查与批准路径逐条读取 `criticality` / `verificationType`（实现在 `server/criteria-coverage.ts`，由 `getReviewReadiness` 与 `recordReview` 调用）。`DOMAIN_MODEL.md` 要求 AC → 检查的映射来自人或确定性规则、不能来自模型；写了 `[验证: …]` 的标准用人声明的映射（`mapping: 'declared'`），其余用规则映射（`mapping: 'rule'`）：
 
-- `[确定性]` 映射到 manifest 的 test / build / evaluation 检查（evaluation 的判定是阈值比较，本身是确定性的）。只靠 Run 自己可能写出来的测试通过的标准，状态是 `self_graded`（"仅自带测试"）：对关键标准它和"证据失败"一样阻塞批准。能解除它的是独立证据：`@baseline` 检查（把测试文件重置回 Base 后重跑）、manifest 声明了 `testPaths` 且 Agent 未改动这些文件，或外部上报的检查。本地 Evaluation 永远不算独立（见下文 Agent System 一节）。`@baseline` 只重置 `testPaths`，测试依赖的 helper / fixture 若不在其中，重跑时仍是 Head 版本：Evidence Package 的 `testProvenance.filesAtHeadDuringBaseline` 列出这些文件，`testPaths` 应覆盖测试运行所需的全部输入；
+- `[确定性]` 映射到 manifest 的 test / build / evaluation 检查（evaluation 的判定是阈值比较，本身是确定性的）。只靠 Run 自己可能写出来的测试通过的标准，状态是 `self_graded`（"仅自带测试"）：对关键标准它和"证据失败"一样阻塞批准。能解除它的是独立证据：`@baseline` 检查（把测试文件重置回 Base 后重跑）、manifest 声明了 `testPaths` 且 Agent 未改动这些文件，或外部上报的检查。build 检查不算：它只说明代码能构建，不说明行为；只有明确写了 `[验证: build]` 的标准才由它证明。本地 Evaluation 永远不算独立（见下文 Agent System 一节）。Agent 改了测试、而独立证据只有 `@baseline` 时，Base 测试通过只说明没有回归，不说明新行为被 Agent 以外的测试覆盖：状态是 `needs_test_review`（"需核对 Agent 测试"），不阻塞，但批准人必须读过 Agent 写的测试，并在审查意见里写出每条关键标准的编号（与人工标准签署同一机制，否则 `review_agent_tests_unconfirmed`）。`@baseline` 只重置 `testPaths`，测试依赖的 helper / fixture 若不在其中，重跑时仍是 Head 版本：Evidence Package 的 `testProvenance.filesAtHeadDuringBaseline` 列出这些文件，`testPaths` 应覆盖测试运行所需的全部输入；
 - `[模型]` 只映射到 evaluation 检查，manifest 没有声明 evaluation 时标为"无可映射检查"并给出原因；
 - 声明映射只采信所列检查（及其 `@baseline`）；任一所列检查没有运行，标准为"无可映射检查"并写明是哪个，不会退回规则映射去找别的检查凑数；
 - `[人工]` 由批准本身证明：存在人工标准时，批准意见必须**逐条点名**每条人工标准的编号（`AC-2：已与安全负责人核对威胁模型`），缺哪条就拒绝哪条（`review_human_criteria_unsigned`），事件里记录 `humanCriteriaSignedOff`。一句「ok」不再能签署任何人工标准，界面也不自动填充默认意见；
@@ -483,7 +485,7 @@ npm run check
 - `npm run test:github-e2e`（手动，不在 `check` 里）对真实 GitHub 仓库跑同样的流程，需要 `APERTURE_GITHUB_TOKEN` 与 `GITHUB_E2E_REPO=owner/repo`。仓库须是可丢弃的测试仓库，并在 `pull_request` 上用 Actions 跑测试。覆盖 GitHub Actions 检查导入、GitHub 上显示的 `aperture/gate`、平台合并推送、远程前进时拒绝并回滚、PR 关闭、`host_protected` 下的 squash 合并和绕过门禁的合并。结果留在 `.aperture-github-e2e/` 供界面查看；
 - `npm run test:governance-decisions` 验证 Override 的角色、作者、理由与 Head 绑定，共享检查需要每条依赖标准都推翻，完整性检查不可推翻，以及 Reject 的终局性；
 - `npm run test:intent-template` 验证验收标准标注的解析与默认值、模版本身带显式标注且套用后仍被标为待补充、模糊度提示只告警不拦截，以及服务端的枚举校验、高风险人工审批不变量和 `criticality` / `verificationType` 按输入落库并参与 `contentDigest`；
-- `npm run test:intent-draft` 用一个假的 OpenAI 兼容服务验证模型起草：输出规范化与调整提示、文本框格式往返一致、未配置 Provider 与无法解析的回复被拒、草稿不创建任何东西、原样提交记录 `changedFields: []`、改动被逐字段记录、提交仍受高风险人工标准门禁、他人不能冒用草稿、草稿表只允许追加；
+- `npm run test:intent-draft` 用一个假的 OpenAI 兼容服务验证模型起草：输出规范化与调整提示、文本框格式往返一致、未配置 Provider 与无法解析的回复被拒、草稿不创建任何东西、原样提交记录 `changedFields: []`、改动被逐字段记录、提交仍受高风险人工标准门禁、他人不能冒用草稿、读不到 manifest 时有提示、并发起草返回 429、客户端断开会中止并释放锁、表单与服务端对改动字段的判定一致、草稿表只允许追加；
 - `npm run test:local-control-plane` 验证 SQLite、Local Authority、真实 Git Revision、Review 失效和追加式 Domain Event Log；
 - `npm run test:local-control-plane-http` 验证初始化、登录、成员、Intent、Change Proposal、Check、Evidence、Review 和 Event API 的 HTTP 契约；
 - `npm run test:agent-provider` 验证 LLM Provider 设置的 Owner 边界、API Key 只写不读、保留与清除语义，以及模型进入 Agent 进程环境、Runtime Attestation 与 codex `-c` 覆盖；

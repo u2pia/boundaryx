@@ -42,7 +42,7 @@ try {
 
   const runCase = (goal: string) => {
     const workItem = database.createWorkItem({ title: goal, description: '验证 Application Build Provenance。', productType: 'application', ownerActorId: owner.id }, owner.id)
-    const intent = database.createIntentVersion({ workItemId: workItem.id, goal, constraints: ['构建输出不提交到源码 Revision'], riskLevel: 'medium', acceptanceCriteria: [{ statement: '构建输出拥有 SHA-256 Provenance', criticality: 'critical', verificationType: 'deterministic' }] }, owner.id)
+    const intent = database.createIntentVersion({ workItemId: workItem.id, goal, constraints: ['构建输出不提交到源码 Revision'], riskLevel: 'medium', acceptanceCriteria: [{ statement: '构建输出拥有 SHA-256 Provenance', criticality: 'critical', verificationType: 'deterministic', verifiedBy: ['application-build'] }] }, owner.id)
     database.approveIntentVersion(intent.id, approver.id)
     const run = runner.run({ workItemId: workItem.id, intentVersionId: intent.id, repositoryPath, baseRef: 'main', declaredContextPaths: ['README.md'] }, owner.id)
     const readiness = database.getReviewReadiness(run.changeProposalId!)

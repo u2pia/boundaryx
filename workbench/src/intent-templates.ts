@@ -207,6 +207,34 @@ export function splitLines(text: string) {
   return text.split('\n').map((line) => line.trim()).filter(Boolean)
 }
 
+export type IntentFormContent = {
+  goal: string
+  constraints: string[]
+  nonGoals: string[]
+  examples: Array<{ input: string; expected: string }>
+  riskLevel: RiskLevel
+  acceptanceCriteria: Array<{ statement: string; criticality: Criticality; verificationType: VerificationType; verifiedBy?: string[] }>
+}
+export type IntentFormField = keyof IntentFormContent
+const intentFormFields: IntentFormField[] = ['goal', 'constraints', 'nonGoals', 'examples', 'riskLevel', 'acceptanceCriteria']
+
+/** 表单提交的内容，与服务端记录起草改动时比较的规范形式一致（去空行、去重）。 */
+export function intentFormContent(form: { goal: string; constraints: string; nonGoals: string; examples: string; riskLevel: RiskLevel; criteria: string }): IntentFormContent {
+  return {
+    goal: form.goal.trim(),
+    constraints: splitLines(form.constraints),
+    nonGoals: [...new Set(splitLines(form.nonGoals))],
+    examples: parseIntentExamples(form.examples).examples,
+    riskLevel: form.riskLevel,
+    acceptanceCriteria: parseAcceptanceCriteria(form.criteria).map(({ statement, criticality, verificationType, verifiedBy }) => ({ statement, criticality, verificationType, ...(verifiedBy?.length ? { verifiedBy: [...new Set(verifiedBy)] } : {}) })),
+  }
+}
+
+/** 与模型草稿相比改了哪些字段；服务端提交时用同样的比较记录 `changedFields`，两边必须一致。 */
+export function draftChangedFields(draft: IntentFormContent, content: IntentFormContent): IntentFormField[] {
+  return intentFormFields.filter((field) => JSON.stringify(content[field]) !== JSON.stringify(draft[field]))
+}
+
 export type ParsedIntentExamples = { examples: Array<{ input: string; expected: string }>; errors: string[] }
 
 /**

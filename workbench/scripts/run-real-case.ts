@@ -99,7 +99,7 @@ if (testProvenance.agentModifiedTestFiles.length) {
   assert.equal(baseline.conclusion, 'success')
 }
 
-await request(`/api/change-proposals/${agentRun.changeProposalId}/reviews`, { cookie: reviewerCookie, body: { headSha: (await request<{ changeProposal: { headSha: string } }>(`/api/change-proposals/${agentRun.changeProposalId}`, { cookie: reviewerCookie })).body.changeProposal.headSha, decision: 'approved', comment: '已查看 Evidence Package；既定测试全部通过，批准该 Revision。' } })
+await request(`/api/change-proposals/${agentRun.changeProposalId}/reviews`, { cookie: reviewerCookie, body: { headSha: (await request<{ changeProposal: { headSha: string } }>(`/api/change-proposals/${agentRun.changeProposalId}`, { cookie: reviewerCookie })).body.changeProposal.headSha, decision: 'approved', comment: '已查看 Evidence Package，读过 Agent 新增的测试，逐条核对 AC-1、AC-2、AC-3、AC-4，批准该 Revision。' } })
 const final = await request<{ changeProposal: { id: string; status: string; headSha: string; headRef: string }; events: Array<{ eventType: string; eventDigest: string }> }>(`/api/change-proposals/${agentRun.changeProposalId}`, { cookie: reviewerCookie })
 assert.equal(final.body.changeProposal.status, 'approved')
 

@@ -12,7 +12,7 @@ import { normalizeIntentDraft } from '../server/intent-drafter.ts'
 import { LocalCommandAgentRunner } from '../server/local-command-agent-runner.ts'
 import { LocalEvidenceStore } from '../server/local-evidence-store.ts'
 import { AppError } from '../server/types.ts'
-import { formatAcceptanceCriteria, formatIntentExamples, parseAcceptanceCriteria, parseIntentExamples } from '../src/intent-templates.ts'
+import { draftChangedFields, formatAcceptanceCriteria, formatIntentExamples, intentFormContent, parseAcceptanceCriteria, parseIntentExamples, type IntentFormContent } from '../src/intent-templates.ts'
 
 /**
  * An Intent drafted by the model is a suggestion the developer edits: nothing exists until they submit, what they
@@ -23,16 +23,20 @@ const root = mkdtempSync(join(tmpdir(), 'aperture-intent-draft-'))
 const migrationDirectory = resolve(dirname(fileURLToPath(import.meta.url)), '../server/migrations')
 const apiKey = 'sk-intent-draft-secret-2026'
 
-// A stand-in for an OpenAI-compatible provider: it answers with whatever reply the test queues next.
-const replies: string[] = []
+// A stand-in for an OpenAI-compatible provider: it answers with whatever reply the test queues next, after a delay
+// when the test needs a draft to still be in progress.
+const replies: Array<string | { text: string; delayMs: number }> = []
 const received: Array<{ authorization?: string; prompt: string }> = []
 const provider = createServer(async (request, response) => {
   const chunks: Buffer[] = []
   for await (const chunk of request) chunks.push(Buffer.from(chunk))
   const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { messages: Array<{ content: string }> }
   received.push({ authorization: request.headers.authorization, prompt: body.messages[0].content })
+  const reply = replies.shift() ?? 'no reply queued'
+  if (typeof reply !== 'string') await new Promise((done) => setTimeout(done, reply.delayMs))
+  if (response.destroyed) return
   response.writeHead(200, { 'content-type': 'application/json' })
-  response.end(JSON.stringify({ choices: [{ message: { content: replies.shift() ?? 'no reply queued' } }] }))
+  response.end(JSON.stringify({ choices: [{ message: { content: typeof reply === 'string' ? reply : reply.text } }] }))
 })
 provider.listen(0, '127.0.0.1')
 await once(provider, 'listening')
@@ -80,7 +84,8 @@ try {
     agentRunner: new LocalCommandAgentRunner({ database, executable: process.execPath, args: ['-e', ''], worktreeRoot: join(root, 'agent-runs'), timeoutMs: 10_000 }),
     evidenceStore: new LocalEvidenceStore(join(root, 'evidence')),
   })
-  async function call<T>(path: string, input: { cookie?: string; body?: Record<string, unknown> } = {}) {
+  // closeAfterMs: the client goes away (a cancel or a closed tab) before the response is written.
+  async function call<T>(path: string, input: { cookie?: string; body?: Record<string, unknown>; closeAfterMs?: number } = {}) {
     const payload = input.body ? JSON.stringify(input.body) : ''
     const headers: IncomingHttpHeaders = { ...(input.cookie ? { cookie: input.cookie } : {}), ...(payload ? { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(payload)) } : {}) }
     const requestStream = Readable.from(payload ? [Buffer.from(payload)] : []) as IncomingMessage
@@ -91,8 +96,9 @@ try {
     const responseStream = new Writable({ write(chunk, _encoding, callback) { chunks.push(Buffer.from(chunk)); callback() } }) as ServerResponse
     responseStream.writeHead = ((statusCode: number, nextHeaders?: Record<string, string | number | string[]>) => { status = statusCode; responseHeaders = nextHeaders ?? {}; return responseStream }) as ServerResponse['writeHead']
     const finished = once(responseStream, 'finish')
+    if (input.closeAfterMs !== undefined) setTimeout(() => responseStream.destroy(), input.closeAfterMs)
     await handler(requestStream, responseStream)
-    await finished
+    if (input.closeAfterMs === undefined) await finished
     const setCookie = responseHeaders['set-cookie']
     const cookieValue = Array.isArray(setCookie) ? setCookie[0] : typeof setCookie === 'string' ? setCookie : undefined
     const text = Buffer.concat(chunks).toString('utf8')
@@ -127,6 +133,27 @@ try {
   assert.ok(received.at(-1)?.prompt.includes(brief.brief), 'the brief reaches the model')
   assert.ok(!drafted.text.includes(apiKey), 'the key never comes back')
   assert.equal(database.listWorkItems().length, 0, 'drafting creates nothing')
+  assert.ok(draft.adjustments[0]?.includes('项目还没接入仓库'), `a manifest that cannot be read is reported in the draft, not swallowed (${draft.adjustments[0]})`)
+
+  // One draft in progress per person: a second request while the first holds the provider is refused, not queued.
+  replies.push({ text: JSON.stringify(modelDraft), delayMs: 300 })
+  const slow = call<{ intentDraft: Draft }>(draftPath, { cookie: developer, body: brief })
+  await new Promise((done) => setTimeout(done, 50))
+  const concurrent = await call<{ error: { code: string } }>(draftPath, { cookie: developer, body: brief })
+  assert.equal(concurrent.status, 429)
+  assert.equal(concurrent.body?.error.code, 'intent_draft_in_progress')
+  assert.equal((await slow).status, 201, 'the first draft still completes')
+
+  // A client that goes away cancels the model call and releases the lock; nothing is recorded for it.
+  const draftsBefore = (database as unknown as { db: { prepare(sql: string): { get(): { count: number } } } }).db.prepare('SELECT COUNT(*) AS count FROM intent_drafts').get().count
+  replies.push({ text: JSON.stringify(modelDraft), delayMs: 5_000 })
+  const cancelStarted = Date.now()
+  await call(draftPath, { cookie: developer, body: brief, closeAfterMs: 50 })
+  assert.ok(Date.now() - cancelStarted < 2_000, 'the handler returns as soon as the client is gone, without waiting for the model')
+  assert.equal((database as unknown as { db: { prepare(sql: string): { get(): { count: number } } } }).db.prepare('SELECT COUNT(*) AS count FROM intent_drafts').get().count, draftsBefore, 'a cancelled draft is not recorded')
+  replies.length = 0
+  replies.push(JSON.stringify(modelDraft))
+  assert.equal((await call(draftPath, { cookie: developer, body: brief })).status, 201, 'the lock is released after a cancel')
 
   replies.push('抱歉，我不能完成')
   assert.equal((await call<{ error: { code: string } }>(draftPath, { cookie: developer, body: brief })).body?.error.code, 'intent_draft_unparseable', 'a reply without a draft is refused')
@@ -138,7 +165,8 @@ try {
   }
   const unchanged = await submit(developer, { riskLevel: draft.riskLevel, acceptanceCriteria: draft.acceptanceCriteria }, draft.id)
   assert.equal(unchanged.status, 201, unchanged.text)
-  assert.deepEqual(unchanged.body!.intentVersion.draft, { draftId: draft.id, providerId: 'fake', model: 'fake-drafter-1', changedFields: [] })
+  assert.deepEqual(unchanged.body!.intentVersion.draft, { draftId: draft.id, providerId: 'fake', model: 'fake-drafter-1', changedFields: [], questions: modelDraft.questions }, 'the model\'s open questions travel with the version to the approver')
+  assert.deepEqual(database.getIntentVersion(unchanged.body!.intentVersion.id).draft?.questions, modelDraft.questions, 'and are read back from the draft, not only returned once')
   const withoutDraft = await submit(developer, { riskLevel: draft.riskLevel, acceptanceCriteria: draft.acceptanceCriteria })
   assert.equal(withoutDraft.body!.intentVersion.draft, undefined)
   assert.equal(withoutDraft.body!.intentVersion.contentDigest.length, unchanged.body!.intentVersion.contentDigest.length)
@@ -158,10 +186,29 @@ try {
   assert.equal(foreign.body?.error?.code, 'intent_draft_foreign')
   assert.equal((await submit(developer, { riskLevel: 'low', acceptanceCriteria: draft.acceptanceCriteria }, 'intent-draft-missing')).body?.error?.code, 'intent_draft_not_found')
 
+  // The form's "you changed …" note and the server's changedFields come from the same comparison.
+  const draftForm = { goal: draft.goal, constraints: draft.constraints.join('\n'), nonGoals: draft.nonGoals.join('\n'), examples: formatIntentExamples(draft.examples), riskLevel: draft.riskLevel as IntentFormContent['riskLevel'], criteria: formatAcceptanceCriteria(draft.acceptanceCriteria as IntentFormContent['acceptanceCriteria']) }
+  const draftContent = draft as unknown as IntentFormContent
+  const formCases: Array<[string, Partial<typeof draftForm>]> = [
+    ['as drafted', {}],
+    ['whitespace and blank lines only', { goal: `  ${draft.goal}  `, constraints: `\n${draft.constraints.join('\n\n')}  \n` }],
+    ['a repeated non-goal', { nonGoals: [...draft.nonGoals, ...draft.nonGoals].join('\n') }],
+    ['the goal', { goal: `${draft.goal}，并记录校验失败次数` }],
+    ['an example and the risk', { examples: `${draftForm.examples}\n输入：123\n期望：提示「身份证号应为 18 位」`, riskLevel: 'medium' }],
+    ['a criterion made non-blocking', { criteria: formatAcceptanceCriteria(draft.acceptanceCriteria.map((criterion, index) => index === 0 ? { ...criterion, criticality: 'normal' } : criterion) as IntentFormContent['acceptanceCriteria']) }],
+  ]
+  for (const [label, edit] of formCases) {
+    const content = intentFormContent({ ...draftForm, ...edit })
+    const workItem = await call<{ workItem: { id: string } }>('/api/work-items', { cookie: developer, body: { projectId: 'PRJ-DEFAULT', title: brief.title, description: content.goal, productType: 'application' } })
+    const submitted = await call<{ intentVersion: Version }>(`/api/work-items/${workItem.body!.workItem.id}/intent-versions`, { cookie: developer, body: { draftId: draft.id, ...content } })
+    assert.equal(submitted.status, 201, `${label}: ${submitted.text}`)
+    assert.deepEqual(draftChangedFields(draftContent, content), submitted.body!.intentVersion.draft?.changedFields, `${label}: the form and the server agree on what changed`)
+  }
+
   // The draft row is append-only and its generation is on the project's event chain.
   assert.throws(() => (database as unknown as { db: { exec(sql: string): void } }).db.exec(`UPDATE intent_drafts SET model = 'other' WHERE id = '${draft.id}'`), /append-only/u)
   const events = await call<{ events: Array<{ eventType: string; payload: Record<string, unknown> }> }>('/api/events', { cookie: owner })
-  const generated = events.body?.events?.find((event) => event.eventType === 'intent.draft_generated')
+  const generated = events.body?.events?.find((event) => event.eventType === 'intent.draft_generated' && event.payload.draftId === draft.id)
   assert.ok(generated, `intent.draft_generated is recorded (${events.status})`)
   assert.equal(generated.payload.draftId, draft.id)
   assert.ok(!JSON.stringify(generated.payload).includes(brief.brief), 'the event carries the brief by digest only')

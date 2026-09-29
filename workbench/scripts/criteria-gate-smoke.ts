@@ -28,7 +28,7 @@ git('config', 'user.email', 'aperture@example.test')
 writeFileSync(join(repositoryPath, 'README.md'), '# Criteria gate\n')
 git('add', 'README.md')
 git('commit', '--quiet', '-m', 'initial')
-for (const branch of ['model-unmapped', 'low-risk', 'high-risk', 'self-graded']) {
+for (const branch of ['model-unmapped', 'low-risk', 'high-risk', 'self-graded', 'build-criterion', 'regression-only']) {
   git('checkout', '--quiet', '-b', `agent/${branch}`, 'main')
   writeFileSync(join(repositoryPath, `${branch}.txt`), `${branch}\n`)
   git('add', `${branch}.txt`)
@@ -119,6 +119,15 @@ try {
     assert.deepEqual(unverified.map((item) => item.independent), [false, false], 'no testPaths and no verified dataset: nothing is independent')
     const withBaseline = mapCriteriaToChecks(intent, [{ name: 'unit', kind: 'test', provenance: 'all_tests' }, { name: 'unit@baseline', kind: 'test', provenance: 'pre_existing' }])
     assert.equal(withBaseline[0].independent, true, 'a re-run on the base test files is independent')
+    assert.equal(withBaseline[0].regressionOnly, true, 'but when the run also edited the tests, the base run only shows nothing regressed')
+    assert.equal(criterionStatus(withBaseline[0], [{ name: 'unit', status: 'completed', conclusion: 'success' }, { name: 'unit@baseline', status: 'completed', conclusion: 'success' }]), 'needs_test_review')
+    assert.equal(mapCriteriaToChecks(intent, [{ name: 'unit', kind: 'test', provenance: 'pre_existing' }])[0].regressionOnly, undefined, 'tests the run did not touch are not regression-only')
+    // A build shows the code builds, not how it behaves: matched by rule it is no independent proof. A criterion
+    // that names the build explicitly (a build criterion) is evidenced by it.
+    const buildOnly = mapCriteriaToChecks(intent, [{ name: 'unit', kind: 'test', provenance: 'unverified' }, { name: 'build', kind: 'build' }])
+    assert.equal(buildOnly[0].independent, false, 'a build does not make agent-written tests independent')
+    const { intent: buildIntent } = proposalFor('build-criterion', 'low', [{ statement: 'the application builds into dist/', criticality: 'critical', verificationType: 'deterministic', verifiedBy: ['build'] }])
+    assert.equal(mapCriteriaToChecks(buildIntent, [{ name: 'build', kind: 'build' }])[0].independent, true, 'a criterion that names the build is evidenced by it')
     // No local evaluation is independent: the code under evaluation shares the grader's process and can read the
     // holdout. The dataset guards join the evaluation's checks, so a touched or copied dataset fails the criterion.
     const integrity = { name: 'evaluation-dataset-integrity', kind: 'integrity' as const, conclusion: 'success' }
@@ -141,6 +150,24 @@ try {
     assert.equal(readiness.blockers.filter((blocker) => blocker.includes('only passed tests the run could have authored')).length, 1, 'only the critical criterion blocks')
     database.recordEvidenceView(evidence.id, reviewer.id, evidence.sha256)
     assert.throws(() => database.recordReview({ proposalId: proposal.id, headSha: proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'tests pass' }), blockedBy('review_blocked_by_criteria'))
+  }
+
+  // The run edited the tests and the only independent result is the base tests still passing. That is not a
+  // blocker, but the approver must read the run's tests and confirm each critical criterion by name.
+  {
+    const { intent, proposal } = proposalFor('regression-only', 'medium', [
+      { statement: 'negative sizes report invalid_file_size', criticality: 'critical', verificationType: 'deterministic' },
+      { statement: 'errors keep their order', criticality: 'normal', verificationType: 'deterministic' },
+    ])
+    for (const name of ['unit', 'unit@baseline']) database.recordCheck({ proposalId: proposal.id, headSha: proposal.headSha, name, status: 'completed', conclusion: 'success', source: 'run', runId: 'RUN-regression-only' }, owner.id)
+    const criteriaCoverage = mapCriteriaToChecks(intent, [{ name: 'unit', kind: 'test', provenance: 'all_tests' }, { name: 'unit@baseline', kind: 'test', provenance: 'pre_existing' }])
+    const evidence = database.recordEvidence({ proposalId: proposal.id, runId: 'RUN-regression-only', headSha: proposal.headSha, uri: 'local://evidence/r.json', sha256: 'sha256:r', summary: { criteriaCoverage } }, author.id)
+    const readiness = database.getReviewReadiness(proposal.id)
+    assert.deepEqual(readiness.criteria.map((item) => item.status), ['needs_test_review', 'needs_test_review'])
+    assert.equal(readiness.status, 'ready', 'confirming the tests is the approver\'s job, not a blocker')
+    database.recordEvidenceView(evidence.id, reviewer.id, evidence.sha256)
+    assert.throws(() => database.recordReview({ proposalId: proposal.id, headSha: proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'tests pass' }), blockedBy('review_agent_tests_unconfirmed'))
+    database.recordReview({ proposalId: proposal.id, headSha: proposal.headSha, reviewerActorId: reviewer.id, decision: 'approved', comment: 'AC-1: read the run\'s negative-size tests' })
   }
 
   // F2.2: the human criterion a high risk Intent rests on has to say what the approver judges.

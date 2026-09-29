@@ -68,7 +68,7 @@ import type { AgentRunEvent, AutonomyDecisionInput } from './adapters/contracts'
 import { LocalAutonomyDecisionProvider } from './adapters/local-autonomy-provider'
 import { LocalOtlpFileExportProvider } from './adapters/local-otlp-file-export-provider'
 import { providerCatalog, summarizeProviderCatalog, type ProviderStage } from './provider-catalog'
-import { criteriaSyntaxHint, criticalityLabels, formatAcceptanceCriteria, formatIntentExamples, inspectStatement, intentTemplates, lintIntentDraft, mentionsCriterion, parseAcceptanceCriteria, parseIntentExamples, splitLines, verificationLabels, type ProductType, type RiskLevel } from './intent-templates'
+import { criteriaSyntaxHint, criticalityLabels, draftChangedFields, formatAcceptanceCriteria, formatIntentExamples, inspectStatement, intentFormContent, intentTemplates, lintIntentDraft, mentionsCriterion, parseAcceptanceCriteria, parseIntentExamples, splitLines, verificationLabels, type ProductType, type RiskLevel } from './intent-templates'
 import type { WorkbenchState } from './store-model'
 import { useWorkbench } from './use-workbench'
 import { useLocalControlPlane } from './local-control-plane-context'
@@ -469,6 +469,7 @@ function ProjectSwitcher({ onManage }: { onManage: () => void }) {
   const pick = async (projectId: string) => {
     setOpen(false)
     if (projectId === local.currentProjectId) return
+    if (intentFormDirty && !window.confirm('切换项目会丢弃正在写的 Intent（以及正在生成的模型草稿），继续？')) return
     setSwitching(true)
     try { await local.selectProject(projectId) } finally { setSwitching(false) }
   }
@@ -724,6 +725,9 @@ function RunRow({ run, onClick }: { run: RunItem; onClick: () => void }) {
 }
 
 const riskLabels: Record<LocalIntentVersion['riskLevel'], string> = { low: '低风险', medium: '中风险', high: '高风险' }
+/** Set while the Intent form holds unsubmitted text or a draft in progress; both belong to the current project. */
+let intentFormDirty = false
+
 const intentDraftFieldLabels: Record<NonNullable<LocalIntentVersion['draft']>['changedFields'][number], string> = { goal: '业务目标', constraints: '约束', nonGoals: '不做什么', examples: '示例', riskLevel: '风险等级', acceptanceCriteria: '验收标准' }
 
 function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => void }) {
@@ -739,7 +743,9 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
   const [productType, setProductType] = useState<ProductType>('application')
   const [riskLevel, setRiskLevel] = useState<RiskLevel>('medium')
   const [brief, setBrief] = useState('')
-  const [draft, setDraft] = useState<LocalIntentDraft & { riskLowered?: RiskLevel }>()
+  // riskLowered: the model suggested a lower risk than the form had, and the form kept its own (riskKept).
+  const [draft, setDraft] = useState<LocalIntentDraft & { riskLowered?: RiskLevel; riskKept?: RiskLevel }>()
+  const draftAbort = useRef<AbortController | undefined>(undefined)
   const [drafting, setDrafting] = useState(false)
   const [draftError, setDraftError] = useState<string>()
   const [creating, setCreating] = useState(false)
@@ -778,10 +784,12 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
     if (!projectId) return
     const hasDraft = [goal, constraints, nonGoals, examples, criteria].some((value) => value.trim())
     if (hasDraft && !window.confirm('模型起草会覆盖当前的业务目标、约束、不做什么、示例和验收标准，继续？')) return
+    const controller = new AbortController()
+    draftAbort.current = controller
     setDrafting(true)
     setDraftError(undefined)
     try {
-      const { intentDraft } = await localControlPlaneClient.draftIntent(projectId, { title: title.trim(), brief: brief.trim(), productType })
+      const { intentDraft } = await localControlPlaneClient.draftIntent(projectId, { title: title.trim(), brief: brief.trim(), productType }, controller.signal)
       const order: RiskLevel[] = ['low', 'medium', 'high']
       const lowered = order.indexOf(intentDraft.riskLevel) < order.indexOf(riskLevel)
       setGoal(intentDraft.goal)
@@ -790,25 +798,23 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
       setExamples(formatIntentExamples(intentDraft.examples))
       setCriteria(formatAcceptanceCriteria(intentDraft.acceptanceCriteria))
       if (!lowered) setRiskLevel(intentDraft.riskLevel)
-      setDraft({ ...intentDraft, ...(lowered ? { riskLowered: intentDraft.riskLevel } : {}) })
+      setDraft({ ...intentDraft, ...(lowered ? { riskLowered: intentDraft.riskLevel, riskKept: riskLevel } : {}) })
     } catch (error) {
-      setDraftError(error instanceof Error ? error.message : String(error))
+      if (!controller.signal.aborted) setDraftError(error instanceof Error ? error.message : String(error))
     } finally {
+      if (draftAbort.current === controller) draftAbort.current = undefined
       setDrafting(false)
     }
   }
+  // Closing the request is what stops the model call on the server, so leaving the page cancels too.
+  useEffect(() => () => draftAbort.current?.abort(), [])
   // What the developer has changed so far, by the same comparison the server records on submission.
-  const draftEdits = useMemo(() => {
-    if (!draft) return []
-    const edits: string[] = []
-    if (goal.trim() !== draft.goal) edits.push('业务目标')
-    if (JSON.stringify(splitLines(constraints)) !== JSON.stringify(draft.constraints)) edits.push('约束')
-    if (JSON.stringify([...new Set(splitLines(nonGoals))]) !== JSON.stringify(draft.nonGoals)) edits.push('不做什么')
-    if (JSON.stringify(parsedExamples.examples) !== JSON.stringify(draft.examples)) edits.push('示例')
-    if (riskLevel !== draft.riskLevel) edits.push('风险等级')
-    if (JSON.stringify(parsedCriteria.map(({ statement, criticality, verificationType, verifiedBy }) => ({ statement, criticality, verificationType, ...(verifiedBy?.length ? { verifiedBy: [...new Set(verifiedBy)] } : {}) }))) !== JSON.stringify(draft.acceptanceCriteria)) edits.push('验收标准')
-    return edits
-  }, [draft, goal, constraints, nonGoals, parsedExamples, riskLevel, parsedCriteria])
+  const formContent = useMemo(() => intentFormContent({ goal, constraints, nonGoals, examples, riskLevel, criteria }), [goal, constraints, nonGoals, examples, riskLevel, criteria])
+  // Keeping the form's risk over a lower one the model suggested differs from the draft (and is recorded as such), but it isn't an edit the developer made.
+  const draftEdits = useMemo(() => draft ? draftChangedFields(draft, formContent).map((field) => field === 'riskLevel' && draft.riskKept === riskLevel ? '风险等级（保留表单的，未按模型下调）' : intentDraftFieldLabels[field]) : [], [draft, formContent, riskLevel])
+  // Anything a project switch would throw away: the switcher asks first.
+  intentFormDirty = drafting || [title, brief, goal, constraints, nonGoals, examples, criteria].some((value) => value.trim())
+  useEffect(() => () => { intentFormDirty = false }, [])
   const submitBlocked = creating || drafting || Boolean(projectType.error) || !title.trim() || !goal.trim() || parsedCriteria.length === 0 || parsedExamples.errors.length > 0 || draftLint.blockers.length > 0
   const latestIntentFor = (workItemId: string) => local.intentVersions.filter((intent) => intent.workItemId === workItemId).sort((left, right) => right.version - left.version)[0]
   const actorName = (actorId?: string) => local.actors.find((candidate) => candidate.id === actorId)?.displayName ?? actorId ?? '—'
@@ -846,6 +852,7 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
           <label className="local-intent-brief"><span>需求描述 · 可选 · 交给模型起草下面各项，本身不会提交</span><textarea value={brief} onChange={(event) => setBrief(event.target.value)} maxLength={4000} placeholder={'用自己的话说要做什么、为什么、给谁用、有哪些限制；越具体，草稿越少要改\n例：开户页要校验身份证号，18 位、末位可以是 X，校验失败给出具体原因，不能改动已有的手机号校验'} /></label>
           <div className="local-intent-draft-actions">
             <button className="secondary-button" disabled={drafting || !title.trim() || !brief.trim() || !projectId} title={!title.trim() || !brief.trim() ? '先填写 Work Item 标题和需求描述' : '用设置里配置的 LLM Provider 起草；结果填进下面的表单，由你修改后提交'} onClick={() => void draftWithModel()}><Bot size={15} />{drafting ? '模型起草中…' : draft ? '重新起草' : '用模型起草'}</button>
+            {drafting && <button className="secondary-button" onClick={() => draftAbort.current?.abort()}><X size={15} />取消起草</button>}
             {draftError && <small className="local-form-error" role="alert">{draftError}</small>}
           </div>
           {draft && <div className="local-intent-draft-note">
@@ -877,7 +884,7 @@ function IntentsPage({ onOpenIntent }: { onOpenIntent: (intent: IntentItem) => v
             {draftLint.warnings.map((warning) => <p key={warning}><CircleDot size={13} />{warning}</p>)}
           </div>}
           <div className="local-intent-actions">
-            <button className="primary-button" disabled={submitBlocked} onClick={() => void (async () => { setCreating(true); setCreateError(undefined); try { await local.createIntentBundle({ ...(draft ? { draftId: draft.id } : {}), title: title.trim(), description: goal.trim(), productType, goal: goal.trim(), constraints: splitLines(constraints), nonGoals: splitLines(nonGoals), examples: parsedExamples.examples, riskLevel, acceptanceCriteria: parsedCriteria.map(({ statement, criticality, verificationType, verifiedBy }) => ({ statement, criticality, verificationType, ...(verifiedBy?.length ? { verifiedBy } : {}) })) }); setTitle(''); setGoal(''); setConstraints(''); setNonGoals(''); setExamples(''); setCriteria(''); setBrief(''); setDraft(undefined) } catch (error) { setCreateError(error instanceof Error ? error.message : String(error)) } finally { setCreating(false) } })()}><Plus size={15} />{creating ? '创建中…' : '创建本地 Intent'}</button>
+            <button className="primary-button" disabled={submitBlocked} onClick={() => void (async () => { setCreating(true); setCreateError(undefined); try { await local.createIntentBundle({ ...(draft ? { draftId: draft.id } : {}), title: title.trim(), description: goal.trim(), productType, ...formContent }); setTitle(''); setGoal(''); setConstraints(''); setNonGoals(''); setExamples(''); setCriteria(''); setBrief(''); setDraft(undefined) } catch (error) { setCreateError(error instanceof Error ? error.message : String(error)) } finally { setCreating(false) } })()}><Plus size={15} />{creating ? '创建中…' : '创建本地 Intent'}</button>
             <small>提示只是建议，不阻塞提交；红色项会被服务端拒绝，必须改。{riskLevel === 'low' ? '低风险 Intent 创建即按规则批准。' : '中、高风险 Intent 创建后需由另一位成员批准，才能启动 Run。'}</small>
             {projectType.type && <small>被开发对象由项目 .aperture/project.json 决定（{projectType.type === 'agent_system' ? 'agent_system' : 'application'}）。</small>}
             {projectType.type === null && <small>这个项目还没接入仓库，类型暂按你的选择；接入后以仓库的 .aperture/project.json 为准。</small>}
@@ -1411,7 +1418,7 @@ function formatReviewDuration(seconds: number) {
   return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`
 }
 
-const criterionStatusLabels: Record<LocalReviewReadiness['criteria'][number]['status'], string> = { passed: '已证明', self_graded: '仅自带测试', failed: '证据失败', pending: '待证据', unmapped: '无可映射检查', awaiting_review: '待人工签署', overridden: '已推翻' }
+const criterionStatusLabels: Record<LocalReviewReadiness['criteria'][number]['status'], string> = { passed: '已证明', self_graded: '仅自带测试', needs_test_review: '需核对 Agent 测试', failed: '证据失败', pending: '待证据', unmapped: '无可映射检查', awaiting_review: '待人工签署', overridden: '已推翻' }
 
 const assignmentStatusLabels: Record<LocalReviewAssignment['status'], string> = { pending: '待开始', in_review: '审查中', changes_requested: '已请求修改', approved: '已批准', reassigned: '已转交' }
 const assignmentBasisLabels: Record<LocalReviewAssignment['basis'], string> = { manual: '指定分配', self_claim: '自行认领', load_balanced: '按负载分配' }
@@ -1467,7 +1474,9 @@ function LocalReviewQueue() {
       setBusyId(undefined)
     }
   }
-  const humanCriteriaFor = (proposalId: string) => (local.reviewReadiness.find((item) => item.changeProposalId === proposalId)?.criteria ?? []).filter((item) => item.verificationType === 'human' && item.criticality === 'critical')
+  // Critical criteria the approval must name: human ones are signed by it, and ones resting only on tests the run
+  // wrote are confirmed by it (the reviewer read those tests).
+  const humanCriteriaFor = (proposalId: string) => (local.reviewReadiness.find((item) => item.changeProposalId === proposalId)?.criteria ?? []).filter((item) => item.criticality === 'critical' && (item.verificationType === 'human' || item.status === 'needs_test_review'))
   const act = async (proposal: LocalChangeProposal, action: 'refresh' | 'approved' | 'changes_requested' | 'merge' | 'host_merge' | 'revise' | 'reject' | { overrideCriterionId: string }) => {
     setBusyId(proposal.id)
     setError(undefined)
@@ -1574,7 +1583,7 @@ function LocalReviewQueue() {
             {mergeEvent && <div className="local-merge-evidence"><PackageCheck size={13} /><div><strong>Merge Evidence 已封存</strong><small>{mergeEvent.payload.strategy === 'host_merge' ? `GitHub 合并 · ${String((mergeEvent.payload.hostMerge as { contentCheck?: string } | undefined)?.contentCheck ?? '')}` : String(mergeEvent.payload.strategy)} · {String(mergeEvent.payload.mergedSha).slice(0, 12)} · {String(mergeEvent.payload.evidenceDigest)}</small></div></div>}
             {outsideGateEvent && <div className="local-reject-decision local-outside-gate" role="alert"><ShieldAlert size={13} /><div><strong>绕过门禁的合并 · {String(outsideGateEvent.payload.mergedBy ?? '未知')} 在 GitHub 上合并</strong><small>{(outsideGateEvent.payload.reasons as string[] | undefined ?? []).join('；')}。检查分支保护是否把 aperture/gate 设为必需检查。</small></div></div>}
             {hostLink && <div className={`local-host-link ${hostLink.state} gate-${hostLink.gateShaPublished === proposal.headSha ? hostLink.gateStatePublished ?? 'none' : 'none'}`}><GitPullRequest size={13} /><div><strong><a href={hostLink.url} target="_blank" rel="noreferrer">PR #{hostLink.externalId}</a> · {hostLink.state === 'open' ? '打开' : hostLink.state === 'merged' ? '已合并' : '已关闭'} · aperture/gate {hostLink.gateShaPublished === proposal.headSha ? hostLink.gateStatePublished ?? '未发布' : '未发布到当前 Head'}</strong><small>{hostLink.publishedRef} · {hostLink.headShaPublished.slice(0, 12)} · 同步于 {hostLink.syncedAt.slice(0, 16).replace('T', ' ')}{hostLink.gateDescriptionPublished ? ` · ${hostLink.gateDescriptionPublished}` : ''}</small>{hostLink.lastError && <small className="local-form-error">同步失败：{hostLink.lastError}</small>}</div></div>}
-            <textarea value={notes[proposal.id] ?? ''} onChange={(event) => setNotes((current) => ({ ...current, [proposal.id]: event.target.value }))} placeholder={humanCriteria.length ? `批准即签署 ${humanCriteria.map((item) => item.label).join('、')}（人工验收）：逐条写明编号与判断，如「${humanCriteria[0].label}：已与安全负责人核对威胁模型」（必填）` : '审查意见；拒绝与推翻门禁时作为理由（必填）'} aria-label="审查意见" />
+            <textarea value={notes[proposal.id] ?? ''} onChange={(event) => setNotes((current) => ({ ...current, [proposal.id]: event.target.value }))} placeholder={humanCriteria.length ? `批准即签署 ${humanCriteria.map((item) => `${item.label}（${item.status === 'needs_test_review' ? '核对 Agent 写的测试' : '人工验收'}）`).join('、')}：逐条写明编号与判断，如「${humanCriteria[0].label}：${humanCriteria[0].status === 'needs_test_review' ? '已读 Agent 新增的测试，确实断言了该标准' : '已与安全负责人核对威胁模型'}」（必填）` : '审查意见；拒绝与推翻门禁时作为理由（必填）'} aria-label="审查意见" />
             <div className="local-proposal-actions"><button className="secondary-button" disabled={busyId === proposal.id || closed} onClick={() => void act(proposal, 'refresh')}><RefreshCw size={13} />刷新 Revision</button><button className="secondary-button" title={assignedTitle || undefined} disabled={!canReview || selfReview || busyId === proposal.id || closed || assignedElsewhere} onClick={() => void act(proposal, 'changes_requested')}>请求修改</button><button className="secondary-button danger" title={!note ? '在意见框写下拒绝理由；拒绝后提案关闭，不能再修订' : '关闭提案：不提供修订路径'} disabled={!canReview || selfReview || busyId === proposal.id || closed || !note} onClick={() => void act(proposal, 'reject')}><X size={13} />拒绝</button><button className="secondary-button" title={!local.agentRunnerId ? 'Agent Runner 未配置' : undefined} disabled={!local.agentRunnerId || busyId === proposal.id || proposal.status !== 'changes_requested' || !(proposal.authorActorId === local.actor?.id || canMerge)} onClick={() => void act(proposal, 'revise')}><Bot size={13} />Agent 修订</button><button className="primary-button" title={assignedTitle || (readiness?.status === 'blocked' ? readiness.blockers.join(' ') : unsignedHumanCriteria.length ? `审查意见须逐条写出对 ${unsignedHumanCriteria.map((item) => item.label).join('、')} 的判断（写明编号）` : policyApprovalBlock || partialApprovalBlock || undefined)} disabled={!canReview || selfReview || busyId === proposal.id || proposal.status === 'approved' || closed || readiness?.status === 'blocked' || unsignedHumanCriteria.length > 0 || Boolean(policyApprovalBlock) || Boolean(partialApprovalBlock) || assignedElsewhere} onClick={() => void act(proposal, 'approved')}><Check size={13} />批准</button>{mergesOnHost && proposal.status !== 'merged' ? (hostLink ? <><button className="secondary-button" title={!canMerge ? '仅 Owner / Maintainer 可合并' : readiness?.status !== 'ready' ? 'Evidence 尚未就绪' : '服务端用 GitHub token 合并这个 PR，不用打开 GitHub；分支保护照常生效，被拒时显示 GitHub 的理由'} disabled={!canMerge || busyId === proposal.id || proposal.status !== 'approved' || readiness?.status !== 'ready'} onClick={() => void act(proposal, 'host_merge')}><GitPullRequest size={13} />{busyId === proposal.id ? '合并中…' : '通过 GitHub 合并'}</button><a className="secondary-button" href={hostLink.url} target="_blank" rel="noreferrer" title="在 GitHub 上查看这个 PR"><ExternalLink size={13} />PR</a></> : <button className="secondary-button" disabled title="尚未发布到 GitHub；等待同步或在项目页点「立即同步」"><GitPullRequest size={13} />等待发布 PR</button>) : <button className="secondary-button" title={!canMerge ? '仅 Owner / Maintainer 可合并' : readiness?.status !== 'ready' ? 'Evidence 尚未就绪' : hostLink ? '合并后推送到 GitHub；远程已前进或被分支保护拒绝时不会封存' : undefined} disabled={!canMerge || busyId === proposal.id || proposal.status !== 'approved' || readiness?.status !== 'ready'} onClick={() => void act(proposal, 'merge')}><GitBranch size={13} />{proposal.status === 'merged' ? '已合并' : hostLink ? '合并并推送' : '合并并封存'}</button>}</div>
             {selfReview && <small className="local-rule-note"><ShieldAlert size={12} />作者自批已由服务端禁止</small>}
           </article>
@@ -1587,6 +1596,7 @@ function LocalReviewQueue() {
           <header><div><span className="eyebrow">证据包</span><h3>{evidencePreview.evidencePackage.workItem.title}</h3><p>{evidencePreview.evidencePackage.intent.goal}</p></div><button className="icon-button" onClick={() => setEvidencePreview(undefined)} aria-label="关闭"><X size={15} /></button></header>
           <div className="local-evidence-digest"><ShieldCheck size={15} /><div><strong>{evidencePreview.evidencePackage.packageDigest}</strong><small>已校验并记录查看 · {evidencePreview.view.viewedAt}</small></div></div>
           <section><span>Revision</span><code>{evidencePreview.evidencePackage.git.baseSha.slice(0, 12)} → {evidencePreview.evidencePackage.git.headSha.slice(0, 12)}</code><small>{evidencePreview.evidencePackage.git.changedFiles} files · +{evidencePreview.evidencePackage.git.additions} −{evidencePreview.evidencePackage.git.deletions}</small></section>
+          {evidencePreview.evidencePackage.intent.draft && <section><span>Intent 起草来源</span><code>{evidencePreview.evidencePackage.intent.draft.providerId} · {evidencePreview.evidencePackage.intent.draft.model} · {evidencePreview.evidencePackage.intent.draft.draftId}</code><small>{evidencePreview.evidencePackage.intent.draft.changedFields.length ? `作者修改了${evidencePreview.evidencePackage.intent.draft.changedFields.map((field) => intentDraftFieldLabels[field]).join('、')}` : '作者未作修改'}{evidencePreview.evidencePackage.intent.draft.questions?.length ? ` · 模型留下 ${evidencePreview.evidencePackage.intent.draft.questions.length} 个待确认问题：${evidencePreview.evidencePackage.intent.draft.questions.join('；')}` : ''}</small></section>}
           {evidencePreview.evidencePackage.projectManifest && <section>
             <span>Project Manifest</span>
             <code>{evidencePreview.evidencePackage.projectManifest.path} · {evidencePreview.evidencePackage.projectManifest.digest}</code>
@@ -2940,7 +2950,7 @@ function LocalIntentDrawer({ workItemId, projectType, onClose, approval }: { wor
         <div className="intent-drawer-body">
           {tab === '意图' && <>
             <section className="intent-section"><span className="intent-label">业务目标</span><p className="intent-goal">{intent?.goal ?? workItem.description}</p></section>
-            {intent?.draft && <section className="intent-section"><span className="intent-label">起草来源</span><p className={`local-intent-draft-origin${intent.draft.changedFields.includes('acceptanceCriteria') ? '' : ' unchanged'}`}><Bot size={13} />由 {intent.draft.model} 起草，{intent.draft.changedFields.length ? `作者修改了${intent.draft.changedFields.map((field) => intentDraftFieldLabels[field]).join('、')}` : '作者未作修改'}。{intent.draft.changedFields.includes('acceptanceCriteria') ? '' : '验收标准及其关键性、验证方式都是模型原样给出的，批准前请逐条核对。'}</p></section>}
+            {intent?.draft && <section className="intent-section"><span className="intent-label">起草来源</span><p className={`local-intent-draft-origin${intent.draft.changedFields.includes('acceptanceCriteria') ? '' : ' unchanged'}`}><Bot size={13} />由 {intent.draft.model} 起草，{intent.draft.changedFields.length ? `作者修改了${intent.draft.changedFields.map((field) => intentDraftFieldLabels[field]).join('、')}` : '作者未作修改'}。{intent.draft.changedFields.includes('acceptanceCriteria') ? '' : '验收标准及其关键性、验证方式都是模型原样给出的，批准前请逐条核对。'}</p>{intent.draft.questions?.length ? <div className="local-intent-draft-questions"><span>模型起草时无法从需求描述判断、只能假设的问题（作者可能已在 Intent 中回答，也可能没有）：</span><ul>{intent.draft.questions.map((question) => <li key={question}>{question}</li>)}</ul></div> : null}</section>}
             <section className="intent-section"><span className="intent-label">成功结果 · 关键验收标准</span>{criteria.some((criterion) => criterion.criticality === 'critical') ? <div className="outcome-list">{criteria.filter((criterion) => criterion.criticality === 'critical').map((criterion) => <div key={criterion.id}><Check size={13} /><span>{criterion.statement}</span></div>)}</div> : <p className="local-intent-empty">没有关键验收标准，这个 Intent 不会阻塞任何审批。</p>}</section>
             <section className="intent-section"><span className="intent-label">约束</span>{intent?.constraints.length ? <div className="constraint-tags">{intent.constraints.map((constraint) => <span key={constraint}>{constraint}</span>)}</div> : <p className="local-intent-empty">未声明约束</p>}</section>
             {intent?.nonGoals?.length ? <section className="intent-section"><span className="intent-label">不做什么</span><div className="constraint-tags">{intent.nonGoals.map((item) => <span key={item}>{item}</span>)}</div></section> : null}

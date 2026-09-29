@@ -153,26 +153,37 @@ export function normalizeIntentDraft(raw: unknown, checkNames: string[]): Genera
   }
 }
 
+export type DraftingContext = {
+  productType?: WorkItem['productType']
+  checks: Array<{ name: string; kind: string }>
+  /** Why the manifest could not be read; the draft is still made, without checks, and says so. */
+  unavailable?: string
+}
+
 /**
  * What the drafter is told about the project: its product type and the checks a criterion may name. Read from the
- * manifest on the default branch, like a Run; a project without one yet is drafted without checks.
+ * manifest on the default branch, like a Run. A project whose manifest cannot be read is still drafted, without
+ * checks, and the reason goes into the draft's adjustments rather than being lost.
  */
-export function projectDraftingContext(database: { getProject(projectId: string): Project; dataDirectory: string }, projectId: string): { productType?: WorkItem['productType']; checks: Array<{ name: string; kind: string }> } {
+export function projectDraftingContext(database: { getProject(projectId: string): Project; dataDirectory: string }, projectId: string): DraftingContext {
   try {
     const head = projectDefaultBranchHead(database, projectId)
-    if (!head) return { checks: [] }
+    if (!head) return { checks: [], unavailable: '项目还没接入仓库' }
     const { manifest } = loadProjectManifest(head.repositoryPath, head.baseSha)
     return { productType: manifest.productType, checks: manifest.checks.map((check) => ({ name: check.name, kind: check.kind })) }
-  } catch {
-    return { checks: [] }
+  } catch (error) {
+    return { checks: [], unavailable: error instanceof Error ? error.message : String(error) }
   }
 }
 
-export async function generateIntentDraft(input: { provider: ProviderProbeInput; title: string; brief: string; productType: WorkItem['productType']; checks: Array<{ name: string; kind: string }> }, options: { timeoutMs?: number } = {}) {
-  const completion = await completeWithProvider(input.provider, promptFor(input), { timeoutMs: options.timeoutMs ?? 180_000, maxTokens: 4096 })
+export async function generateIntentDraft(input: { provider: ProviderProbeInput; title: string; brief: string; productType: WorkItem['productType']; context: DraftingContext }, options: { timeoutMs?: number; signal?: AbortSignal } = {}) {
+  const completion = await completeWithProvider(input.provider, promptFor({ ...input, checks: input.context.checks }), { timeoutMs: options.timeoutMs ?? 180_000, maxTokens: 4096, signal: options.signal })
+  if (options.signal?.aborted) throw new AppError(499, '起草已取消', 'intent_draft_cancelled')
   if (!completion.ok || completion.text === undefined) {
     const detail = completion.detail ? `（${completion.detail}）` : ''
     throw new AppError(502, `模型起草失败：${completion.error ?? '没有回复'}${detail}`, 'intent_draft_provider_failed')
   }
-  return { draft: normalizeIntentDraft(extractJson(completion.text), input.checks.map((check) => check.name)), reply: completion.text }
+  const draft = normalizeIntentDraft(extractJson(completion.text), input.context.checks.map((check) => check.name))
+  if (input.context.unavailable) draft.adjustments.unshift(`读不到项目的 .aperture/project.json（${input.context.unavailable}），模型不知道有哪些 Check，所以验收标准都没有 [验证: …]；能读到之后再补`)
+  return { draft, reply: completion.text }
 }

@@ -133,6 +133,8 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
   const agentRuntimeDescriptor = input.agentRuntimeDescriptor ?? agentRunner?.descriptor
   const authority = new LocalGitAuthority(database)
   const releaseAuthority = new LocalReleaseAuthority(database)
+  // Who has a model draft in progress. One at a time per person: each call can hold the provider for minutes.
+  const draftingActors = new Set<string>()
 
   /**
    * Admits a run and hands execution to the queue, so the request returns in milliseconds instead of
@@ -450,12 +452,23 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         if (brief.length > maximumBriefLength) throw new AppError(400, `brief must be at most ${maximumBriefLength} characters`, 'invalid_intent_brief')
         const provider = database.getAgentProviderSettings()
         if (!provider) throw new AppError(409, '还没有配置模型：请 Owner 先在设置里配置 LLM Provider', 'agent_provider_not_configured')
-        const context = projectDraftingContext(database, projectId)
-        const requested = optionalString(body, 'productType')
-        const productType = context.productType ?? (requested === 'agent_system' ? 'agent_system' : 'application')
-        const { draft, reply } = await generateIntentDraft({ provider: { providerId: provider.providerId, model: provider.model, baseUrl: provider.baseUrl, wireApi: provider.wireApi, apiKey: provider.apiKey ?? (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined) }, title, brief, productType, checks: context.checks })
-        const record = database.recordIntentDraft({ projectId, title, brief, productType, providerId: provider.providerId, model: provider.model, draft, reply }, actor.id)
-        return sendJson(response, 201, { intentDraft: { id: record.id, providerId: record.providerId, model: record.model, createdAt: record.createdAt, ...record.draft } })
+        if (draftingActors.has(actor.id)) throw new AppError(429, '你已经有一份草稿正在生成，等它完成或取消后再试', 'intent_draft_in_progress')
+        draftingActors.add(actor.id)
+        // Leaving the page or pressing cancel closes the request; the model call stops with it instead of running on.
+        const abandoned = new AbortController()
+        const onClose = () => { if (!response.writableFinished) abandoned.abort() }
+        response.on('close', onClose)
+        try {
+          const context = projectDraftingContext(database, projectId)
+          const requested = optionalString(body, 'productType')
+          const productType = context.productType ?? (requested === 'agent_system' ? 'agent_system' : 'application')
+          const { draft, reply } = await generateIntentDraft({ provider: { providerId: provider.providerId, model: provider.model, baseUrl: provider.baseUrl, wireApi: provider.wireApi, apiKey: provider.apiKey ?? (provider.apiKeyEnv ? process.env[provider.apiKeyEnv] : undefined) }, title, brief, productType, context }, { signal: abandoned.signal })
+          const record = database.recordIntentDraft({ projectId, title, brief, productType, providerId: provider.providerId, model: provider.model, draft, reply }, actor.id)
+          return sendJson(response, 201, { intentDraft: { id: record.id, providerId: record.providerId, model: record.model, createdAt: record.createdAt, ...record.draft } })
+        } finally {
+          draftingActors.delete(actor.id)
+          response.off('close', onClose)
+        }
       }
 
       // The context a Run started now would bind, read from the manifest on the default branch. Read-only: the files

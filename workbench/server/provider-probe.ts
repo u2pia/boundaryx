@@ -65,16 +65,24 @@ function reasonFor(status: number) {
 // The variables Claude Code needs to find its login and the network, and no more: the server's own secrets stay out.
 const CLAUDE_ENVIRONMENT = ['HOME', 'PATH', 'USER', 'LANG', 'TMPDIR', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy']
 
+// One answer and nothing else: no tool at all, so text in the prompt (a developer's brief, say) cannot make the
+// model read or change files; only the operator's own settings, without hooks, MCP servers or slash commands, as
+// in claude-builder.
+const CLAUDE_HARDENING = ['--setting-sources', 'user', '--settings', JSON.stringify({ disableAllHooks: true }), '--strict-mcp-config', '--tools', '', '--disable-slash-commands']
+
 /** One print-mode turn of the local Claude Code, configured the way claude-builder runs it. */
-async function completeWithLocalClaude(input: ProviderProbeInput, prompt: string, timeoutMs: number): Promise<ProviderCompletion> {
+async function completeWithLocalClaude(input: ProviderProbeInput, prompt: string, timeoutMs: number, signal?: AbortSignal): Promise<ProviderCompletion> {
   const executable = localClaude() as string | undefined
   const started = Date.now()
   const result = (fields: Partial<ProviderCompletion>): ProviderCompletion => ({ ok: false, engine: 'claude-code', endpoint: executable ?? 'claude', latencyMs: Date.now() - started, ...fields })
   if (!executable) return result({ error: '本机没有找到 Claude Code：安装后再试，或填写 API Key 直连 Anthropic' })
   const environment: Record<string, string> = Object.fromEntries(CLAUDE_ENVIRONMENT.flatMap((key) => process.env[key] ? [[key, process.env[key]!]] : []))
   if (input.baseUrl.trim()) environment.ANTHROPIC_BASE_URL = input.baseUrl.trim()
+  if (signal?.aborted) return result({ error: '已取消' })
   const output = await new Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean; error?: Error }>((done) => {
-    const child = spawn(executable, ['--print', '--output-format', 'json', '--max-turns', '1', ...(input.model.trim() ? ['--model', input.model.trim()] : [])], { cwd: tmpdir(), env: environment })
+    const child = spawn(executable, ['--print', '--output-format', 'json', '--max-turns', '1', ...CLAUDE_HARDENING, ...(input.model.trim() ? ['--model', input.model.trim()] : [])], { cwd: tmpdir(), env: environment })
+    const abort = () => child.kill('SIGTERM')
+    signal?.addEventListener('abort', abort, { once: true })
     let stdout = ''
     let stderr = ''
     let timedOut = false
@@ -83,9 +91,10 @@ async function completeWithLocalClaude(input: ProviderProbeInput, prompt: string
     child.stderr.on('data', (chunk) => { stderr += chunk })
     child.stdin.on('error', () => {})
     child.stdin.end(prompt)
-    child.on('error', (error) => { clearTimeout(timer); done({ code: null, stdout, stderr, timedOut, error }) })
-    child.on('close', (code) => { clearTimeout(timer); done({ code, stdout, stderr, timedOut }) })
+    child.on('error', (error) => { clearTimeout(timer); signal?.removeEventListener('abort', abort); done({ code: null, stdout, stderr, timedOut, error }) })
+    child.on('close', (code) => { clearTimeout(timer); signal?.removeEventListener('abort', abort); done({ code, stdout, stderr, timedOut }) })
   })
+  if (signal?.aborted) return result({ error: '已取消' })
   if (output.error) return result({ error: 'Claude Code 启动失败', detail: scrub(output.error.message) })
   if (output.timedOut) return result({ error: `等待超时：Claude Code 没有在 ${Math.round(timeoutMs / 1000)} 秒内应答` })
   let payload: { result?: unknown; is_error?: boolean; subtype?: string } | undefined
@@ -101,9 +110,9 @@ async function completeWithLocalClaude(input: ProviderProbeInput, prompt: string
  * same plain-language reasons as the probe; `text` is returned as the provider sent it, so a caller that shows any
  * of it must scrub it itself.
  */
-export async function completeWithProvider(input: ProviderProbeInput, prompt: string, options: { timeoutMs?: number; maxTokens?: number } = {}): Promise<ProviderCompletion> {
+export async function completeWithProvider(input: ProviderProbeInput, prompt: string, options: { timeoutMs?: number; maxTokens?: number; signal?: AbortSignal } = {}): Promise<ProviderCompletion> {
   const base = input.baseUrl.trim().replace(/\/+$/u, '')
-  if (isAnthropic(input) && !input.apiKey) return completeWithLocalClaude(input, prompt, options.timeoutMs ?? 60_000)
+  if (isAnthropic(input) && !input.apiKey) return completeWithLocalClaude(input, prompt, options.timeoutMs ?? 60_000, options.signal)
   const engine: ProviderProbeResult['engine'] = isAnthropic(input) ? 'anthropic' : input.wireApi
   const bearer = input.apiKey ? { Authorization: `Bearer ${input.apiKey}` } : {}
   const request = engine === 'anthropic'
@@ -116,13 +125,15 @@ export async function completeWithProvider(input: ProviderProbeInput, prompt: st
   const timeoutMs = options.timeoutMs ?? 30_000
   let response: Response
   try {
-    response = await fetch(request.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', ...request.headers }, body: JSON.stringify(request.body), signal: AbortSignal.timeout(timeoutMs) })
+    response = await fetch(request.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', ...request.headers }, body: JSON.stringify(request.body), signal: options.signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), options.signal]) : AbortSignal.timeout(timeoutMs) })
   } catch (error) {
+    if (options.signal?.aborted) return result({ error: '已取消' })
     const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')
     const cause = error instanceof Error ? ((error.cause as Error | undefined)?.message ?? error.message) : String(error)
     return result({ error: timedOut ? `等待超时：服务商没有在 ${Math.round(timeoutMs / 1000)} 秒内应答` : '连不上 Base URL：检查地址、网络或代理', detail: scrub(cause, input.apiKey) })
   }
   const text = await response.text().catch(() => '')
+  if (options.signal?.aborted) return result({ error: '已取消' })
   if (!response.ok) return result({ status: response.status, error: reasonFor(response.status), detail: scrub(text, input.apiKey) })
   let body: unknown
   try { body = JSON.parse(text) } catch { return result({ status: response.status, error: '返回的不是 JSON：Base URL 可能指向了网页而不是 API', detail: scrub(text, input.apiKey) }) }

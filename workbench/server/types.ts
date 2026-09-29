@@ -142,7 +142,8 @@ export type IntentVersion = {
 export type IntentDraftField = 'goal' | 'constraints' | 'nonGoals' | 'examples' | 'riskLevel' | 'acceptanceCriteria'
 
 /** Which model drafted an Intent version, and which fields the author changed before submitting it ([] = none). */
-export type IntentVersionDraft = { draftId: string; providerId: string; model: string; changedFields: IntentDraftField[] }
+/** questions: what the model could not tell from the brief and assumed, carried to the approver; the author may have answered them in the Intent, or not. */
+export type IntentVersionDraft = { draftId: string; providerId: string; model: string; changedFields: IntentDraftField[]; questions?: string[] }
 
 export type ChangeProposal = {
   id: string

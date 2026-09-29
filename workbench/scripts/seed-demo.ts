@@ -136,7 +136,7 @@ try {
 
   // 1. The whole way through: approved intent, run, passing checks, evidence viewed, approved, merged.
   const rounding = build(plan('发票金额按分四舍五入', '0.1 + 0.2 这类浮点误差会让发票合计多出或少掉一分钱。', '发票合计按分四舍五入，消除浮点误差', ['合计按分四舍五入', '已有合计用例保持通过']))
-  approve(rounding.proposal.id, '看过证据包：node-tests 通过，边界用例覆盖 0.005。')
+  approve(rounding.proposal.id, '看过证据包和 Builder 新增的测试：AC-1 有 0.005 的边界用例，AC-2 由 Base 测试重跑证明。')
   authority.mergeChangeProposal(rounding.proposal.id, maintainer.id)
 
   // 2. Ready and waiting: a real member reviews it.

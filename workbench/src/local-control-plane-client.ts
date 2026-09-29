@@ -106,7 +106,7 @@ export type LocalIntentVersion = {
   approval?: { basis: 'low_risk_rule' | 'named_approval'; actorId?: string; approvedAt: string; comment?: string }
   acceptanceCriteria: Array<{ id: string; ordinal: number; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; verifiedBy?: string[] }>
   /** Present when the version started as a model draft: which model, and which fields the author changed ([] = none). */
-  draft?: { draftId: string; providerId: string; model: string; changedFields: Array<'goal' | 'constraints' | 'nonGoals' | 'examples' | 'riskLevel' | 'acceptanceCriteria'> }
+  draft?: { draftId: string; providerId: string; model: string; changedFields: Array<'goal' | 'constraints' | 'nonGoals' | 'examples' | 'riskLevel' | 'acceptanceCriteria'>; questions?: string[] }
 }
 
 /** A model draft of an Intent, already normalised by the server; nothing exists until the developer submits the form. */
@@ -239,7 +239,7 @@ export type LocalReviewReadiness = {
   pendingCheckCount: number
   invalidatedCheckCount: number
   invalidatedEvidenceCount: number
-  criteria: Array<{ criterionId: string; label: string; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; mapping: 'rule' | 'declared'; checkNames: string[]; independent?: boolean; unmappedReason?: string; status: 'passed' | 'self_graded' | 'failed' | 'pending' | 'unmapped' | 'awaiting_review' | 'overridden'; override?: LocalCriterionOverride }>
+  criteria: Array<{ criterionId: string; label: string; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; mapping: 'rule' | 'declared'; checkNames: string[]; independent?: boolean; unmappedReason?: string; status: 'passed' | 'self_graded' | 'needs_test_review' | 'failed' | 'pending' | 'unmapped' | 'awaiting_review' | 'overridden'; override?: LocalCriterionOverride }>
   blockers: string[]
   policyFiles: string[] | null
   builderStop: { runId: string; reason: 'time_budget' | 'step_budget'; summary: string } | null
@@ -252,7 +252,7 @@ export type LocalEvidencePackageView = {
     generatedAt: string
     projectManifest?: { path: string; baseSha: string; digest: string; schemaVersion: string; policy: { maximumRisk: 'low' | 'medium' | 'high'; allowUnisolatedRuntime: boolean }; evaluation?: { profile: 'application_checks' | 'agent_dataset'; datasetPath?: string; datasetDigest?: string; thresholds: Array<{ metric: string; operator: 'gte' | 'lte'; threshold: number }> }; artifact?: { profile: 'application_build'; buildCheck: string; outputs: string[] } }
     workItem: { id: string; title: string; productType: 'application' | 'agent_system' }
-    intent: { id: string; version: number; goal: string; riskLevel: 'low' | 'medium' | 'high'; contentDigest: string; constraints: string[]; nonGoals?: string[]; examples?: Array<{ input: string; expected: string }>; acceptanceCriteria: Array<{ id: string; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; ordinal: number }> }
+    intent: { id: string; version: number; goal: string; riskLevel: 'low' | 'medium' | 'high'; contentDigest: string; constraints: string[]; nonGoals?: string[]; examples?: Array<{ input: string; expected: string }>; acceptanceCriteria: Array<{ id: string; statement: string; criticality: 'normal' | 'critical'; verificationType: 'deterministic' | 'model' | 'human'; ordinal: number }>; draft?: LocalIntentVersion['draft'] }
     git: { repositoryPath: string; baseRef: string; baseSha: string; headRef: string; headSha: string; changedFiles: number; additions: number; deletions: number }
     run: { id: string; adapterId: string; startSha?: string; revisionOfProposalId?: string; isolation: 'unisolated_process' | 'container'; networkEgress: 'denied' | 'allowlist' | 'unrestricted'; productionEligible: boolean; runtimeAttestationDigest?: string; stdoutDigest?: string; stderrDigest?: string }
     checks: Array<{ id: string; name: string; kind?: 'test' | 'evaluation' | 'build' | 'integrity'; conclusion: 'success' | 'failure' | 'neutral' | 'cancelled'; exitCode?: number; durationMs: number; stdoutDigest: string; stderrDigest: string; stdoutExcerpt: string; stderrExcerpt: string; metrics?: Record<string, number>; thresholdResults?: Array<{ metric: string; operator: 'gte' | 'lte'; threshold: number; actual?: number; passed: boolean }>; provenance?: 'all_tests' | 'pre_existing' | 'unverified' | 'isolated' | 'isolated_partial'; testTreeSha?: string; agentModifiedTestFiles?: string[] }>
@@ -392,8 +392,8 @@ function scoped(path: string, projectId?: string) {
   return `${path}${path.includes('?') ? '&' : '?'}projectId=${encodeURIComponent(projectId)}`
 }
 
-function post<T>(path: string, body?: Record<string, unknown>) {
-  return request<T>(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined })
+function post<T>(path: string, body?: Record<string, unknown>, signal?: AbortSignal) {
+  return request<T>(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined, signal })
 }
 
 export const localControlPlaneClient = {
@@ -411,7 +411,7 @@ export const localControlPlaneClient = {
   updateActor: (actorId: string, input: LocalActorUpdate) => post<{ actor: LocalActor }>(`/api/actors/${encodeURIComponent(actorId)}`, input),
   listProjects: () => request<{ projects: LocalProject[]; roles: Record<string, LocalActor['role'] | undefined> }>('/api/projects'),
   /** What the project builds, from .aperture/project.json on its default branch; null while it has no repository. */
-  draftIntent: (projectId: string, input: { title: string; brief: string; productType: LocalWorkItem['productType'] }) => post<{ intentDraft: LocalIntentDraft }>(`/api/projects/${encodeURIComponent(projectId)}/intent-drafts`, input),
+  draftIntent: (projectId: string, input: { title: string; brief: string; productType: LocalWorkItem['productType'] }, signal?: AbortSignal) => post<{ intentDraft: LocalIntentDraft }>(`/api/projects/${encodeURIComponent(projectId)}/intent-drafts`, input, signal),
   getProjectProductType: (projectId: string) => request<{ productType: LocalWorkItem['productType'] | null }>(`/api/projects/${encodeURIComponent(projectId)}/product-type`),
   getProjectContext: (projectId: string) => request<{ context: LocalProjectContext | null }>(`/api/projects/${encodeURIComponent(projectId)}/context`),
   getProjectContextFile: (projectId: string, path: string) => request<{ file: { path: string; baseSha: string; sizeBytes: number; truncated: boolean; content: string } }>(`/api/projects/${encodeURIComponent(projectId)}/context/file?path=${encodeURIComponent(path)}`),
