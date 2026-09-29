@@ -10,6 +10,7 @@ import { createControlPlaneServer } from './http-server.ts'
 
 const serverDirectory = dirname(fileURLToPath(import.meta.url))
 const workbenchDirectory = resolve(serverDirectory, '..')
+const migrationDirectory = resolve(serverDirectory, 'migrations')
 const dataDirectory = resolve(process.env.CONTROL_PLANE_DATA_DIR ?? joinDefault(workbenchDirectory, '.aperture'))
 const databasePath = resolve(process.env.CONTROL_PLANE_DB ?? joinDefault(dataDirectory, 'control-plane.db'))
 const port = Number(process.env.CONTROL_PLANE_PORT ?? 8787)
@@ -26,7 +27,7 @@ function joinDefault(...parts: string[]) {
 }
 
 mkdirSync(dataDirectory, { recursive: true })
-const database = new ControlPlaneDatabase(databasePath, resolve(serverDirectory, 'migrations'))
+const database = new ControlPlaneDatabase(databasePath, migrationDirectory)
 if (!loopback && !database.hasActors()) {
   database.close()
   throw new Error('Refusing to expose an uninitialized Control Plane on a network interface. Start on 127.0.0.1, create the Owner, stop it, then bind CONTROL_PLANE_HOST to the LAN address.')
@@ -38,7 +39,7 @@ const githubOAuth = githubOAuthConfigFromEnv(process.env, `http://127.0.0.1:${po
 const codeHostSyncer = new CodeHostSyncer({ database, publicUrl })
 const codeHostSyncSeconds = Number(process.env.CONTROL_PLANE_CODE_HOST_SYNC_SECONDS ?? 30)
 codeHostSyncer.start(codeHostSyncSeconds)
-const server = createControlPlaneServer({ database, staticDirectory: resolve(workbenchDirectory, 'dist'), agentRunner: configuredAgent.runner, agentRunQueue, agentRuntimeDescriptor: configuredAgent.descriptor, evidenceStore: configuredAgent.evidenceStore, githubOAuth, codeHostSyncer, secureCookies, host })
+const server = createControlPlaneServer({ database, migrationDirectory, staticDirectory: resolve(workbenchDirectory, 'dist'), agentRunner: configuredAgent.runner, agentRunQueue, agentRuntimeDescriptor: configuredAgent.descriptor, evidenceStore: configuredAgent.evidenceStore, githubOAuth, codeHostSyncer, secureCookies, host })
 
 server.listen(port, host, () => {
   console.log(`${new Date().toISOString()} Local Control Plane listening on http://${host}:${port}`)

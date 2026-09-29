@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import { once } from 'node:events'
 import { fileURLToPath } from 'node:url'
+import { createControlPlaneBackup } from '../server/control-plane-backup.ts'
 import { ControlPlaneDatabase } from '../server/database.ts'
 import { createControlPlaneRequestHandler } from '../server/http-server.ts'
 import { LocalCommandAgentRunner } from '../server/local-command-agent-runner.ts'
@@ -20,7 +21,7 @@ const database = new ControlPlaneDatabase(join(root, 'control-plane.db'), migrat
 const agentScript = join(root, 'http-agent.mjs')
 const agentRunner = new LocalCommandAgentRunner({ database, executable: process.execPath, args: [agentScript], worktreeRoot: join(root, 'agent-runs'), timeoutMs: 10_000 })
 const evidenceStore = new LocalEvidenceStore(join(root, 'evidence'))
-const handler = createControlPlaneRequestHandler({ database, agentRunner, evidenceStore, secureCookies: true, loginProtection: { maxAccountFailures: 2, maxSourceFailures: 20 } })
+const handler = createControlPlaneRequestHandler({ database, migrationDirectory, agentRunner, evidenceStore, secureCookies: true, loginProtection: { maxAccountFailures: 2, maxSourceFailures: 20 } })
 
 function git(...args: string[]) {
   return execFileSync('git', ['-C', repositoryPath, ...args], { encoding: 'utf8' }).trim()
@@ -317,6 +318,23 @@ try {
   assert.ok((integrity.body?.integrity.eventCount ?? 0) > 0)
   assert.match(integrity.body!.integrity.chainHead, /^sha256:[0-9a-f]{64}$/u)
   assert.deepEqual(integrity.body?.integrity.faults, [])
+  assert.equal((await request('/api/operational-attestations')).status, 401)
+  assert.equal((await request('/api/operational-attestations', { cookie: reviewerLogin.cookie! })).status, 403)
+  const emptyOperationalAttestations = await request<{ operationalAttestations: unknown[] }>('/api/operational-attestations', { cookie: ownerCookie })
+  assert.equal(emptyOperationalAttestations.status, 200)
+  assert.equal(emptyOperationalAttestations.body?.operationalAttestations.length, 0)
+  const recoveryBackupDirectory = join(root, 'http-recovery-backup')
+  createControlPlaneBackup({ databasePath: database.databasePath, dataDirectory: root, migrationDirectory, destinationDirectory: recoveryBackupDirectory })
+  assert.equal((await request('/api/operational-attestations/recovery-drill', { cookie: reviewerLogin.cookie!, body: { backupDirectory: recoveryBackupDirectory, validDays: 30 } })).status, 403)
+  const recoveryDrill = await request<{ operationalAttestation: { id: string; active: boolean; identity: { assurance: string } } }>('/api/operational-attestations/recovery-drill', { cookie: ownerCookie, body: { backupDirectory: recoveryBackupDirectory, validDays: 30 } })
+  assert.equal(recoveryDrill.status, 201)
+  assert.equal(recoveryDrill.body?.operationalAttestation.active, true)
+  assert.equal(recoveryDrill.body?.operationalAttestation.identity.assurance, 'self_asserted')
+  assert.equal((await request(`/api/operational-attestations/${recoveryDrill.body!.operationalAttestation.id}/revoke`, { cookie: reviewerLogin.cookie!, body: { reason: 'not allowed' } })).status, 403)
+  const revokedRecoveryDrill = await request<{ operationalAttestation: { active: boolean; revocationReason: string } }>(`/api/operational-attestations/${recoveryDrill.body!.operationalAttestation.id}/revoke`, { cookie: ownerCookie, body: { reason: 'HTTP revocation verified' } })
+  assert.equal(revokedRecoveryDrill.status, 200)
+  assert.equal(revokedRecoveryDrill.body?.operationalAttestation.active, false)
+  assert.equal(revokedRecoveryDrill.body?.operationalAttestation.revocationReason, 'HTTP revocation verified')
   assert.equal((await request('/api/trust-profile')).status, 401)
   const trustProfile = await request<{ trustProfile: { level: string; capabilities: { governedHumanDecisions: boolean; productionEligibleAgentExecution: boolean }; controls: Array<{ id: string; status: string }> } }>('/api/trust-profile', { cookie: ownerCookie })
   assert.equal(trustProfile.status, 200)

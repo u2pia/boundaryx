@@ -29,6 +29,7 @@ CONTROL_PLANE_DATA_DIR=.aperture-live npm run backup:create -- ../output/backups
 - `control-plane.db`；
 - `evidence/`；
 - `holdouts/`；
+- `operational-evidence/`；
 - 使用默认同目录 Event Seal Key 时的 `event-seal.key`；
 - `backup.json` 文件清单和创建时验证摘要。
 
@@ -70,3 +71,9 @@ CONTROL_PLANE_DATA_DIR=../recovery/control-plane-data npm run server:start
 - 每月至少做一次恢复演练，并记录验证结果；
 - 将备份、活动 Seal Key、retired keys 放在不同的访问控制域；
 - 恢复演练后检查 Event Log、Evidence、Holdout 和至少一个已发布 Change 的可追溯链。
+
+## 登记恢复演练
+
+Owner 可以通过 `POST /api/operational-attestations/recovery-drill` 触发平台管理的真实演练。它会将备份恢复到临时隔离目录，重新打开数据库并运行 Core Integrity，然后生成有 Digest、签发身份、有效期、撤销和密封事件绑定的 Operational Attestation。
+
+演练成功不等于 Trust Profile 自动显示 `verifiedRecovery=true`：签发身份还必须是 Team Mode 下的外部认证身份。完整规则见 `OPERATIONAL_ATTESTATION.md`。

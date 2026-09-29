@@ -10,6 +10,7 @@ import type { LocalEvidenceStore, StoredEvidencePackage } from './local-evidence
 import { LocalGitAuthority } from './local-git-authority.ts'
 import { LocalReleaseAuthority } from './local-release-authority.ts'
 import { LoginThrottle, type LoginProtectionOptions } from './login-protection.ts'
+import { performRecoveryDrill } from './operational-attestation.ts'
 import { requestContext, type RequestContext } from './request-context.ts'
 import { projectContext, projectContextFile } from './project-context.ts'
 import { projectProductType } from './project-product-type.ts'
@@ -160,7 +161,7 @@ function serveStatic(response: ServerResponse, staticDirectory: string, pathname
   return true
 }
 
-export function createControlPlaneRequestHandler(input: { database: ControlPlaneDatabase; staticDirectory?: string; agentRunner?: AgentRunner; agentRunQueue?: AgentRunQueue; agentRuntimeDescriptor?: AgentRunnerDescriptor; evidenceStore?: LocalEvidenceStore; githubOAuth?: GithubOAuthConfig; codeHostSyncer?: CodeHostSyncer; secureCookies?: boolean; host?: string; loginProtection?: LoginProtectionOptions }) {
+export function createControlPlaneRequestHandler(input: { database: ControlPlaneDatabase; migrationDirectory?: string; staticDirectory?: string; agentRunner?: AgentRunner; agentRunQueue?: AgentRunQueue; agentRuntimeDescriptor?: AgentRunnerDescriptor; evidenceStore?: LocalEvidenceStore; githubOAuth?: GithubOAuthConfig; codeHostSyncer?: CodeHostSyncer; secureCookies?: boolean; host?: string; loginProtection?: LoginProtectionOptions }) {
   const { database, staticDirectory, agentRunner, agentRunQueue } = input
   const secureCookies = input.secureCookies ?? false
   const loginThrottle = new LoginThrottle(input.loginProtection)
@@ -301,6 +302,27 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         return [requested]
       }
       const requireIn = (projectId: string, roles: TeamRole[] = ALL_ROLES, code = 'forbidden') => database.requireProjectRole(actor.id, projectId, roles, code)
+
+      if (method === 'GET' && path === '/api/operational-attestations') {
+        requireRole(actor, ['owner'])
+        return sendJson(response, 200, { operationalAttestations: database.listOperationalAttestations() })
+      }
+
+      if (method === 'POST' && path === '/api/operational-attestations/recovery-drill') {
+        requireRole(actor, ['owner'])
+        if (!input.migrationDirectory) throw new AppError(503, 'Recovery drills are not configured for this server', 'recovery_drill_unavailable')
+        const body = await readJson(request)
+        const validDays = body.validDays === undefined ? undefined : Number(body.validDays)
+        const operationalAttestation = performRecoveryDrill({ database, migrationDirectory: input.migrationDirectory, backupDirectory: requireString(body, 'backupDirectory'), dataDirectory: database.dataDirectory, actorId: actor.id, validDays })
+        return sendJson(response, 201, { operationalAttestation })
+      }
+
+      const operationalAttestationRevokeRoute = routeMatch(path, /^\/api\/operational-attestations\/(?<attestationId>[^/]+)\/revoke$/u)
+      if (method === 'POST' && operationalAttestationRevokeRoute) {
+        requireRole(actor, ['owner'])
+        const body = await readJson(request)
+        return sendJson(response, 200, { operationalAttestation: database.revokeOperationalAttestation(operationalAttestationRevokeRoute.attestationId, requireString(body, 'reason'), actor.id) })
+      }
 
       if (method === 'GET' && path === '/api/actors') return sendJson(response, 200, { actors: database.listActors() })
 

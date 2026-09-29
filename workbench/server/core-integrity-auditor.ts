@@ -1,6 +1,7 @@
 import { join } from 'node:path'
 import type { ControlPlaneDatabase } from './database.ts'
 import { LocalEvidenceStore } from './local-evidence-store.ts'
+import { readOperationalEvidence } from './operational-evidence.ts'
 import { sha256 } from './security.ts'
 
 export type IntegritySeverity = 'critical' | 'warning' | 'info'
@@ -152,6 +153,58 @@ export function auditCoreIntegrity(input: { database: ControlPlaneDatabase; evid
     }
     checkedBindings += 1
     try { database.getReleaseCandidate(release.id) } catch (error) { add({ severity: 'critical', code: 'release_candidate_invalid', message: error instanceof Error ? error.message : String(error), aggregateType: 'release_candidate', aggregateId: release.id }) }
+  }
+
+  const attestations = database.db.prepare(`
+    SELECT a.*, r.id AS revocation_id, r.reason AS revocation_reason, r.revoked_by_actor_id, r.identity_json AS revocation_identity_json, r.revoked_at
+    FROM operational_attestations a
+    LEFT JOIN operational_attestation_revocations r ON r.operational_attestation_id = a.id
+    ORDER BY a.created_at
+  `).all() as Array<Record<string, string | null>>
+  for (const row of attestations) {
+    const attestationId = String(row.id)
+    const summaryJson = String(row.summary_json)
+    const identityJson = String(row.identity_json)
+    requireBinding({
+      aggregateType: 'operational_attestation',
+      aggregateId: attestationId,
+      eventType: 'operational_attestation.recorded',
+      code: 'operational_attestation_unbound',
+      message: `Operational Attestation ${attestationId} has no matching recorded event`,
+      predicate: (event) => event.actorId === row.attested_by_actor_id
+        && event.payload.attestationType === row.attestation_type
+        && event.payload.subjectType === row.subject_type
+        && event.payload.subjectId === row.subject_id
+        && event.payload.evidenceUri === row.evidence_uri
+        && event.payload.evidenceDigest === row.evidence_digest
+        && event.payload.summaryDigest === `sha256:${sha256(summaryJson)}`
+        && event.payload.performedAt === row.performed_at
+        && event.payload.validUntil === row.valid_until
+        && JSON.stringify(event.payload.identity) === identityJson,
+    })
+    try {
+      const evidence = readOperationalEvidence(database.dataDirectory, String(row.evidence_uri), String(row.evidence_digest))
+      if (evidence.document.schemaVersion !== 'aperture.recovery-drill.v1') throw new Error(`unsupported schema ${String(evidence.document.schemaVersion)}`)
+      if (evidence.document.performedAt !== row.performed_at || evidence.document.validUntil !== row.valid_until) throw new Error('evidence validity does not match the attestation row')
+      if (JSON.stringify(evidence.document) !== JSON.stringify(JSON.parse(summaryJson))) throw new Error('evidence document does not match the recorded summary')
+    } catch (error) {
+      add({ severity: 'critical', code: 'operational_evidence_invalid', message: error instanceof Error ? error.message : String(error), aggregateType: 'operational_attestation', aggregateId: attestationId })
+    }
+    if (row.revocation_id) {
+      const revocationIdentityJson = String(row.revocation_identity_json)
+      requireBinding({
+        aggregateType: 'operational_attestation',
+        aggregateId: attestationId,
+        eventType: 'operational_attestation.revoked',
+        code: 'operational_attestation_revocation_unbound',
+        message: `Operational Attestation ${attestationId} has no matching revocation event`,
+        predicate: (event) => event.actorId === row.revoked_by_actor_id
+          && event.payload.revocationId === row.revocation_id
+          && event.payload.reason === row.revocation_reason
+          && event.payload.revokedAt === row.revoked_at
+          && JSON.stringify(event.payload.identity) === revocationIdentityJson,
+      })
+    }
   }
 
   const holdouts = database.db.prepare("SELECT aggregate_id, payload_json FROM domain_events WHERE aggregate_type = 'project' AND event_type = 'project.evaluation_holdout_registered'").all() as Array<{ aggregate_id: string; payload_json: string }>

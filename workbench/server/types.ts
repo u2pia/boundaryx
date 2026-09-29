@@ -251,6 +251,26 @@ export type ReleaseCandidate = {
   }
 }
 
+export type OperationalAttestation = {
+  id: string
+  attestationType: 'backup_restore_drill'
+  subjectType: 'control_plane'
+  subjectId: 'local'
+  evidenceUri: string
+  evidenceDigest: string
+  summary: Record<string, unknown>
+  performedAt: string
+  validUntil: string
+  attestedByActorId: string
+  identity: DecisionIdentity
+  createdAt: string
+  revokedAt?: string
+  revokedByActorId?: string
+  revocationReason?: string
+  revocationIdentity?: DecisionIdentity
+  active: boolean
+}
+
 export type ReviewRecord = {
   id: string
   changeProposalId: string

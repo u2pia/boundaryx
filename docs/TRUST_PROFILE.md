@@ -9,7 +9,8 @@ Environment Facts
   ├─ Transport Security
   ├─ Event Seal Separation
   ├─ Runtime Isolation
-  └─ Network Policy
+  ├─ Network Policy
+  └─ Recovery Attestation
           ↓
       Trust Profile
           ↓
@@ -82,9 +83,9 @@ GET /api/trust-profile
 | `runtime_available` | Agent Runtime Descriptor | `release_qualified` |
 | `runtime_isolation` | Isolation 与 Production Eligibility | `release_qualified` |
 | `network_egress` | Runtime Network Policy | `release_qualified` |
-| `recovery_verification` | 恢复验证证明 | 当前只作为独立能力，不参与等级升级 |
+| `recovery_verification` | 有效的恢复演练 Operational Attestation | 独立能力，不参与等级升级 |
 
-`recovery_verification` 当前通常是 `unknown`。备份和恢复已有验证命令，但尚未把最近一次演练证明注册到运行中的 Control Plane。Profile 因此会明确显示 `verifiedRecovery=false`，不能把 `release_qualified` 误读为灾难恢复已经验证。
+`recovery_verification` 只有在未过期、未撤销、Evidence 与事件绑定均通过 Core Integrity，且签发身份为 `external` 时才是 `pass`。Development Mode 的 Self-asserted Owner 可以完成技术演练，但不会把 `verifiedRecovery` 升级为 `true`。详细合同见 `OPERATIONAL_ATTESTATION.md`。
 
 ## 固定限制
 
@@ -96,4 +97,4 @@ GET /api/trust-profile
 
 ## 后续方向
 
-下一阶段可以把经过验证的 Backup / Restore Drill 注册为独立 Operational Attestation，再使 `verifiedRecovery` 成为有时效的事实。实现前必须先定义 Attestation 的签发者、有效期、撤销和 Event Log 绑定，不能仅增加一个用户可勾选的“已备份”字段。
+下一阶段应设计 Event Chain Head 的外部锚定合同，并验证离线、私有化环境可采用的锚定介质。Operational Attestation 已解决“恢复事实如何登记”，但尚未解决“平台管理员与 Seal Key 持有者合谋重写全部历史”这一信任边界。

@@ -8,7 +8,7 @@ import { requestContext } from './request-context.ts'
 import { loadEventSealKeyring, type EventSealKeyring } from './event-seal.ts'
 import { normalizeProjectHost, type ProjectHostInput } from './code-host/index.ts'
 import type { GeneratedIntentDraft, IntentDraftContent } from './intent-drafter.ts'
-import type { IntentDraftField, IntentVersionDraft, AcceptanceCriterionInput, BuilderStopReason, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionBrief, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentExample, IntentVersion, MergeEvidence, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
+import type { IntentDraftField, IntentVersionDraft, AcceptanceCriterionInput, BuilderStopReason, Actor, CodeHostLink, HostMergeRecord, AuthMethod, CriterionOverride, DecisionBrief, DecisionIdentity, IdentityBinding, IdentityMode, GovernanceDecision, AgentProviderSettings, Project, ProjectMember, ProjectRole, AgentProviderSettingsView, AgentRun, ChangeProposal, DomainEvent, IntentExample, IntentVersion, MergeEvidence, OperationalAttestation, ReleaseCandidate, ReviewAssignment, ReviewDecision, ReviewerLoad, ReviewMetrics, ReviewReadiness, ReviewRecord, SessionActor, TeamRole, WorkItem } from './types.ts'
 import { AppError } from './types.ts'
 
 type SqlValue = string | number | null
@@ -1696,6 +1696,72 @@ export class ControlPlaneDatabase {
     }
   }
 
+  recordOperationalAttestation(input: { evidenceUri: string; evidenceDigest: string; summary: Record<string, unknown>; performedAt: string; validUntil: string }, actorId: string): OperationalAttestation {
+    this.assertDecisionActor(actorId, ['owner'], 'operational_attestation_forbidden')
+    const evidenceUri = input.evidenceUri.trim()
+    if (!/^local:\/\/operational-evidence\/recovery\/[A-Za-z0-9._-]+\.json$/u.test(evidenceUri)) throw new AppError(400, 'Recovery evidence must be a managed local JSON document', 'invalid_operational_evidence_uri')
+    const evidenceDigest = input.evidenceDigest.trim().toLowerCase()
+    if (!/^sha256:[a-f0-9]{64}$/u.test(evidenceDigest)) throw new AppError(400, 'Operational evidence digest must be sha256:<64 lowercase hex characters>', 'invalid_operational_evidence_digest')
+    const performedAt = new Date(input.performedAt)
+    const validUntil = new Date(input.validUntil)
+    if (!Number.isFinite(performedAt.getTime()) || !Number.isFinite(validUntil.getTime())) throw new AppError(400, 'Operational attestation timestamps must be valid ISO dates', 'invalid_operational_attestation_time')
+    if (validUntil.getTime() <= performedAt.getTime()) throw new AppError(400, 'Operational attestation expiry must be after the drill', 'invalid_operational_attestation_expiry')
+    if (validUntil.getTime() - performedAt.getTime() > 45 * 24 * 60 * 60 * 1000) throw new AppError(400, 'Operational attestations may be valid for at most 45 days', 'operational_attestation_too_long')
+    const identity = this.decisionIdentity(actorId)
+    const attestationId = id('OPA')
+    const createdAt = nowIso()
+    const summaryJson = JSON.stringify(input.summary)
+    return this.inTransaction(() => {
+      this.db.prepare(`
+        INSERT INTO operational_attestations(id, attestation_type, subject_type, subject_id, evidence_uri, evidence_digest, summary_json, performed_at, valid_until, attested_by_actor_id, identity_json, created_at)
+        VALUES (?, 'backup_restore_drill', 'control_plane', 'local', ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(attestationId, evidenceUri, evidenceDigest, summaryJson, performedAt.toISOString(), validUntil.toISOString(), actorId, JSON.stringify(identity), createdAt)
+      this.appendEvent({ aggregateType: 'operational_attestation', aggregateId: attestationId, eventType: 'operational_attestation.recorded', actorId, payload: { attestationType: 'backup_restore_drill', subjectType: 'control_plane', subjectId: 'local', evidenceUri, evidenceDigest, summaryDigest: `sha256:${sha256(summaryJson)}`, performedAt: performedAt.toISOString(), validUntil: validUntil.toISOString(), identity } })
+      return this.getOperationalAttestation(attestationId)
+    })
+  }
+
+  revokeOperationalAttestation(attestationId: string, reason: string, actorId: string): OperationalAttestation {
+    this.assertDecisionActor(actorId, ['owner'], 'operational_attestation_forbidden')
+    const attestation = this.getOperationalAttestation(attestationId)
+    if (attestation.revokedAt) throw new AppError(409, `Operational attestation ${attestationId} is already revoked`, 'operational_attestation_revoked')
+    const normalizedReason = reason.trim()
+    if (!normalizedReason) throw new AppError(400, 'A revocation reason is required', 'operational_attestation_revocation_reason_required')
+    const identity = this.decisionIdentity(actorId)
+    const revokedAt = nowIso()
+    const revocationId = id('OPR')
+    return this.inTransaction(() => {
+      this.db.prepare('INSERT INTO operational_attestation_revocations(id, operational_attestation_id, reason, revoked_by_actor_id, identity_json, revoked_at) VALUES (?, ?, ?, ?, ?, ?)').run(revocationId, attestationId, normalizedReason, actorId, JSON.stringify(identity), revokedAt)
+      this.appendEvent({ aggregateType: 'operational_attestation', aggregateId: attestationId, eventType: 'operational_attestation.revoked', actorId, payload: { revocationId, reason: normalizedReason, revokedAt, identity } })
+      return this.getOperationalAttestation(attestationId)
+    })
+  }
+
+  listOperationalAttestations(): OperationalAttestation[] {
+    const rows = this.db.prepare(`
+      SELECT a.*, r.id AS revocation_id, r.reason AS revocation_reason, r.revoked_by_actor_id, r.identity_json AS revocation_identity_json, r.revoked_at
+      FROM operational_attestations a
+      LEFT JOIN operational_attestation_revocations r ON r.operational_attestation_id = a.id
+      ORDER BY a.performed_at DESC, a.created_at DESC
+    `).all() as Array<Record<string, SqlValue>>
+    return rows.map((row) => this.mapOperationalAttestation(row))
+  }
+
+  getOperationalAttestation(attestationId: string): OperationalAttestation {
+    const row = this.db.prepare(`
+      SELECT a.*, r.id AS revocation_id, r.reason AS revocation_reason, r.revoked_by_actor_id, r.identity_json AS revocation_identity_json, r.revoked_at
+      FROM operational_attestations a
+      LEFT JOIN operational_attestation_revocations r ON r.operational_attestation_id = a.id
+      WHERE a.id = ?
+    `).get(attestationId) as Record<string, SqlValue> | undefined
+    if (!row) throw new AppError(404, `Operational attestation ${attestationId} not found`, 'operational_attestation_not_found')
+    return this.mapOperationalAttestation(row)
+  }
+
+  getLatestOperationalAttestation(attestationType: OperationalAttestation['attestationType']): OperationalAttestation | undefined {
+    return this.listOperationalAttestations().find((attestation) => attestation.attestationType === attestationType)
+  }
+
   recordDecisionBriefView(proposalId: string, reviewerActorId: string) {
     const brief = this.getDecisionBrief(proposalId, reviewerActorId)
     if (!brief.viewer.canRecordTerminalDecision) throw new AppError(403, 'Only the actor currently eligible to make a terminal decision can record a Decision Brief view', 'decision_brief_view_forbidden')
@@ -1853,6 +1919,32 @@ export class ControlPlaneDatabase {
 
   private mapProject(row: Record<string, SqlValue>): Project {
     return { id: String(row.id), slug: String(row.slug), name: String(row.name), description: String(row.description), codeHost: String(row.code_host) as Project['codeHost'], codeHostConfig: parseJson<Project['codeHostConfig']>(String(row.code_host_config)), ...(row.repository_path ? { repositoryPath: String(row.repository_path) } : {}), defaultBranch: String(row.default_branch), mergeMode: String(row.merge_mode) as Project['mergeMode'], status: String(row.status) as Project['status'], ...(row.created_by_actor_id ? { createdByActorId: String(row.created_by_actor_id) } : {}), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }
+  }
+
+  private mapOperationalAttestation(row: Record<string, SqlValue>): OperationalAttestation {
+    const revokedAt = row.revoked_at ? String(row.revoked_at) : undefined
+    const validUntil = String(row.valid_until)
+    return {
+      id: String(row.id),
+      attestationType: String(row.attestation_type) as OperationalAttestation['attestationType'],
+      subjectType: String(row.subject_type) as OperationalAttestation['subjectType'],
+      subjectId: String(row.subject_id) as OperationalAttestation['subjectId'],
+      evidenceUri: String(row.evidence_uri),
+      evidenceDigest: String(row.evidence_digest),
+      summary: parseJson<Record<string, unknown>>(String(row.summary_json)),
+      performedAt: String(row.performed_at),
+      validUntil,
+      attestedByActorId: String(row.attested_by_actor_id),
+      identity: parseJson<DecisionIdentity>(String(row.identity_json)),
+      createdAt: String(row.created_at),
+      ...(revokedAt ? {
+        revokedAt,
+        revokedByActorId: String(row.revoked_by_actor_id),
+        revocationReason: String(row.revocation_reason),
+        revocationIdentity: parseJson<DecisionIdentity>(String(row.revocation_identity_json)),
+      } : {}),
+      active: !revokedAt && validUntil > nowIso(),
+    }
   }
 
   private mapIdentityBinding(row: Record<string, SqlValue>): IdentityBinding {

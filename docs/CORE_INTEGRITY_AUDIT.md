@@ -57,6 +57,7 @@ CONTROL_PLANE_DATA_DIR=.aperture-live npm run audit:verify
 - 本地 Evidence Package 的内容 Digest；
 - Evidence Summary 与 `evidence.recorded` 事件的 Summary Digest；
 - 已登记 Holdout 的文件与 Digest。
+- Operational Attestation 的 Evidence 文件、摘要、有效期、身份快照、撤销记录及对应事件。
 
 ## 严重程度
 
@@ -74,4 +75,4 @@ CONTROL_PLANE_DATA_DIR=.aperture-live npm run audit:verify
 
 ## 与备份的关系
 
-`backup:verify` 会在备份临时副本上调用同一 Core Integrity Auditor。因此，一个备份只有在数据库文件可读还不够；关键状态必须能与 Event Log、Evidence 和 Holdout 对账后才算有效。
+`backup:verify` 会在备份临时副本上调用同一 Core Integrity Auditor。因此，一个备份只有在数据库文件可读还不够；关键状态必须能与 Event Log、Evidence、Holdout 和 Operational Attestation 对账后才算有效。

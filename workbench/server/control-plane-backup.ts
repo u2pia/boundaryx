@@ -73,6 +73,8 @@ function assertRelativePath(path: string) {
 function copyManagedData(databaseDataDirectory: string, runtimeDataDirectory: string, destinationDirectory: string, includeColocatedKey: boolean) {
   const evidence = join(runtimeDataDirectory, 'evidence')
   if (existsSync(evidence)) cpSync(evidence, join(destinationDirectory, 'evidence'), { recursive: true, errorOnExist: true, force: false, preserveTimestamps: true })
+  const operationalEvidence = join(databaseDataDirectory, 'operational-evidence')
+  if (existsSync(operationalEvidence)) cpSync(operationalEvidence, join(destinationDirectory, 'operational-evidence'), { recursive: true, errorOnExist: true, force: false, preserveTimestamps: true })
   const holdouts = join(databaseDataDirectory, 'holdouts')
   if (existsSync(holdouts)) cpSync(holdouts, join(destinationDirectory, 'holdouts'), { recursive: true, errorOnExist: true, force: false, preserveTimestamps: true })
   if (includeColocatedKey) copyFileSync(join(databaseDataDirectory, COLOCATED_SEAL_KEY_FILE), join(destinationDirectory, COLOCATED_SEAL_KEY_FILE))

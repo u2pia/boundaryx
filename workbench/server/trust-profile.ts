@@ -34,7 +34,7 @@ export type TrustFacts = {
   secureCookies: boolean
   eventSealKeySource: 'env' | 'file' | 'colocated'
   runtime?: AgentRunnerDescriptor
-  recoveryVerification?: { valid: boolean; verifiedAt: string }
+  recoveryVerification?: { valid: boolean; verifiedAt: string; reason?: string }
 }
 
 export function computeTrustProfile(facts: TrustFacts): TrustProfile {
@@ -61,8 +61,8 @@ export function computeTrustProfile(facts: TrustFacts): TrustProfile {
       ? { id: 'network_egress', status: 'pass', evidence: `Agent Runtime network egress is ${facts.runtime.networkEgress}.` }
       : { id: 'network_egress', status: 'fail', evidence: facts.runtime ? 'Agent Runtime network egress is unrestricted.' : 'Agent Runtime network policy is unavailable.', remediation: 'Deny network egress or use an explicit allowlist.' },
     facts.recoveryVerification?.valid
-      ? { id: 'recovery_verification', status: 'pass', evidence: `A recovery verification was supplied from ${facts.recoveryVerification.verifiedAt}.` }
-      : { id: 'recovery_verification', status: 'unknown', evidence: 'No current recovery verification is registered in the Trust Profile.', remediation: 'Run backup:create, backup:verify and a periodic restore drill; recovery registration will be added in a later contract.' },
+      ? { id: 'recovery_verification', status: 'pass', evidence: `A current externally attested recovery drill completed at ${facts.recoveryVerification.verifiedAt}.` }
+      : { id: 'recovery_verification', status: 'unknown', evidence: facts.recoveryVerification?.reason ?? 'No current recovery verification is registered in the Trust Profile.', remediation: 'Run an Owner-authorized recovery drill from an externally authenticated Team-mode session.' },
   ]
   const passed = (id: TrustControl['id']) => controls.find((control) => control.id === id)?.status === 'pass'
   const governedHumanDecisions = ['core_integrity', 'external_identity', 'transport_security', 'event_seal_separation'].every((id) => passed(id as TrustControl['id']))
@@ -96,6 +96,12 @@ export function computeTrustProfile(facts: TrustFacts): TrustProfile {
 export function trustProfileForControlPlane(input: { database: ControlPlaneDatabase; integrity?: CoreIntegrityReport; evidenceDirectory?: string; runtime?: AgentRunnerDescriptor; secureCookies: boolean; host?: string; recoveryVerification?: TrustFacts['recoveryVerification'] }) {
   const integrity = input.integrity ?? auditCoreIntegrity({ database: input.database, evidenceDirectory: input.evidenceDirectory })
   const host = input.host ?? '127.0.0.1'
+  const attestation = input.database.listOperationalAttestations().find((item) => item.attestationType === 'backup_restore_drill' && item.active)
+  const recoveryVerification = input.recoveryVerification ?? (attestation
+    ? attestation.identity.assurance === 'external' && integrity.valid
+      ? { valid: true, verifiedAt: attestation.performedAt }
+      : { valid: false, verifiedAt: attestation.performedAt, reason: attestation.identity.assurance !== 'external' ? `The recovery drill completed at ${attestation.performedAt}, but its signer identity was self-asserted.` : 'The recorded recovery drill cannot be trusted while Core Integrity has critical findings.' }
+    : undefined)
   return computeTrustProfile({
     integrityValid: integrity.valid,
     integrityCriticalCount: integrity.summary.critical,
@@ -104,7 +110,7 @@ export function trustProfileForControlPlane(input: { database: ControlPlaneDatab
     secureCookies: input.secureCookies,
     eventSealKeySource: input.database.getEventSealStatus().keySource,
     runtime: input.runtime,
-    recoveryVerification: input.recoveryVerification,
+    recoveryVerification,
   })
 }
 
