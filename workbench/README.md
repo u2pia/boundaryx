@@ -110,6 +110,8 @@ npm run server:start
 
 真实案例驱动脚本为 `npm run case:real`。它需要显式提供 `REAL_CASE_OWNER_PASSWORD`、`REAL_CASE_REVIEWER_PASSWORD` 和 `REAL_CASE_RELEASE_APPROVER_PASSWORD`，并要求服务已配置 `CONTROL_PLANE_AGENT_EXECUTABLE` 和 `CONTROL_PLANE_AGENT_ARGS_JSON`。未提供 `REAL_CASE_REPOSITORY` 时，脚本从受版本控制的模板生成一个带独立 Git 历史的临时案例仓库；提供时则使用指定仓库。Check、Context、Skill 与项目执行策略从基线 Revision 的 `.aperture/project.json` 加载。成功后脚本走通 Intent → Run → Evidence → Review → Merge → Release → Event Log，并把 JSON 与 Markdown 报告写入 `../output/real-cases/`。脚本不保存明文密码。
 
+真实团队 10-Change 试点遵循 `../docs/PILOT_10_CHANGE_PROTOCOL.md`。`case:real` 的 Reviewer 与 Release Approver 动作由脚本执行，只验证控制闭环，不计作真实采用样本。真实成员完成一个 Change 后，以 `PILOT_CHANGE_PROPOSAL_ID=CP-... PILOT_HUMAN_ATTESTATION=true PILOT_ATTESTED_BY=... npm run pilot:capture` 只读采集到 `../output/pilot-cases/`；补录 Reviewer Active Minutes、页面切换和 7 天质量结果后运行 `npm run pilot:report`。汇总器输出 `../output/pilot/pilot-summary.json` 与 Markdown 摘要，并按审查投入、Evidence 展开率和质量护栏给出继续、补数据或暂停复盘建议。
+
 ## Agent Runner 启动
 
 推荐只配置一个入口 `scripts/agents/builder.mjs`，执行引擎由集成页保存的 LLM Provider 在每次 Run 时自动选择，切换模型无需重启服务：

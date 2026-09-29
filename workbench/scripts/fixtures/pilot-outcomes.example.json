@@ -1,0 +1,19 @@
+{
+  "pilotId": "team-repository-10-change-pilot",
+  "baseline": {
+    "medianReviewerActiveMinutes": 20,
+    "escapedDefectsPer10Changes": 1,
+    "rollbacksPer10Changes": 0
+  },
+  "outcomes": [
+    {
+      "caseId": "replace-with-real-case-id",
+      "reviewerActiveMinutes": 10,
+      "reviewerPageSwitches": 2,
+      "escapedDefects": 0,
+      "rollbacks": 0,
+      "manualRemediations": 0,
+      "notes": "Record production outcomes after the observation window."
+    }
+  ]
+}

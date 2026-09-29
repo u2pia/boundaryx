@@ -42,7 +42,7 @@ type ProjectView = { id: string; slug: string; repositoryPath?: string; defaultB
 type AgentRunView = { id: string; status: string; changeProposalId: string; errorMessage?: string }
 type EvidenceCheck = { name: string; kind: string; conclusion: string; provenance?: string }
 type TestProvenance = { independent: boolean; agentModifiedTestFiles: string[]; note: string }
-type DomainEvent = { aggregateType: string; aggregateId: string; aggregateVersion: number; eventType: string; previousEventDigest: string; eventDigest: string; recordedAt: string }
+type DomainEvent = { aggregateType: string; aggregateId: string; aggregateVersion: number; eventType: string; payload: Record<string, unknown>; previousEventDigest: string; eventDigest: string; recordedAt: string }
 type ReleaseCandidateView = {
   id: string
   status: string
@@ -191,14 +191,24 @@ function verifyEventChain(aggregateType: string, aggregateId: string, expectedTy
 }
 
 verifyEventChain('work_item', workItem.id, ['work_item.created', 'intent.versioned', 'intent.approved'])
-verifyEventChain('agent_run', agentRun.id, ['agent_run.started', 'agent_run.succeeded'])
+const agentEvents = verifyEventChain('agent_run', agentRun.id, ['agent_run.started', 'agent_run.succeeded'])
 const proposalEvents = verifyEventChain('change_proposal', approvedProposal.id, ['change_proposal.created', 'review.assigned', 'review.decision_brief_opened', 'evidence.viewed', 'review.approved', 'change_proposal.merged'])
 const releaseEvents = verifyEventChain('release_candidate', released.id, ['release_candidate.created', 'release_candidate.approved'])
 assert.equal(proposalEvents.filter((event) => event.eventType === 'review.decision_brief_opened').length, 1, 'Decision Brief view event must be idempotent')
 
+const eventAt = (chain: DomainEvent[], eventType: string) => chain.find((event) => event.eventType === eventType)?.recordedAt
+const elapsedSeconds = (startedAt: string | undefined, endedAt: string | undefined) => startedAt && endedAt ? Math.max(0, Math.floor((Date.parse(endedAt) - Date.parse(startedAt)) / 1000)) : undefined
+const assignmentAt = eventAt(proposalEvents, 'review.assigned')
+const briefOpenedAt = eventAt(proposalEvents, 'review.decision_brief_opened')
+const evidenceOpenedAt = eventAt(proposalEvents, 'evidence.viewed')
+const decisionAt = eventAt(proposalEvents, 'review.approved')
+const contextConsumed = agentEvents.filter((event) => event.eventType === 'agent_run.context_consumed')
+
 const report = {
   caseId,
   result: 'release_approved',
+  pilotEligible: false,
+  pilotExclusionReasons: ['Reviewer and Release Approver actions were executed by the validation script, so this case proves the control loop but not human adoption value.'],
   completedAt: new Date().toISOString(),
   repositoryPath,
   actors: { ownerActorId: owner.id, reviewerActorId: reviewer.id, releaseApproverActorId: releaseApprover.id },
@@ -213,6 +223,23 @@ const report = {
   mergeEvidence: { id: merged.evidence.id, digest: merged.evidence.evidenceDigest, mergedSha: merged.evidence.mergedSha },
   releaseCandidate: { id: released.id, status: released.status, contentDigest: released.contentDigest, sourceTreeDigest: released.sourceTreeDigest, artifactBindingDigest: released.artifactBindingDigest, artifactDigests: released.artifactEvidence.flatMap((evidence) => evidence.artifactDigests) },
   eventChainHeads: { changeProposal: proposalEvents.at(-1)?.eventDigest, releaseCandidate: releaseEvents.at(-1)?.eventDigest },
+  pilotMetrics: {
+    review: {
+      assignmentToDecisionSeconds: elapsedSeconds(assignmentAt, decisionAt),
+      briefToDecisionSeconds: elapsedSeconds(briefOpenedAt, decisionAt),
+      evidenceToDecisionSeconds: elapsedSeconds(evidenceOpenedAt, decisionAt),
+      evidenceExpandedBeforeDecision: Boolean(evidenceOpenedAt && decisionAt && evidenceOpenedAt <= decisionAt),
+      reworkRounds: proposalEvents.filter((event) => event.eventType === 'review.changes_requested').length,
+    },
+    context: {
+      controlPlaneInjected: contextConsumed.filter((event) => event.payload.reportSource === 'control_plane_injection').length,
+      builderReported: contextConsumed.filter((event) => event.payload.reportSource !== 'control_plane_injection').length,
+      undeclared: contextConsumed.filter((event) => event.payload.declared === false).length,
+      rejected: agentEvents.filter((event) => event.eventType === 'agent_run.context_rejected').length,
+      skillsLoaded: agentEvents.filter((event) => event.eventType === 'agent_run.skill_loaded').length,
+      skillsRejected: agentEvents.filter((event) => event.eventType === 'agent_run.skill_rejected').length,
+    },
+  },
   worstHealthLatencyMsDuringRun: worstHealthLatencyMs,
   testProvenance: { agentModifiedTestFiles: testProvenance.agentModifiedTestFiles, conclusions: viewed.body.evidencePackage.checks.filter((check) => check.kind === 'test').map((check) => `${check.name}=${check.conclusion}/${check.provenance ?? 'unknown'}`) },
 }

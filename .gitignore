@@ -2,3 +2,5 @@
 # A real-case target repository with its own history; it is not part of BoundaryX.
 examples/real-case-import-validator/
 /output/real-cases/
+/output/pilot-cases/
+/output/pilot/
