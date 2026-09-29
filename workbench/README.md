@@ -92,7 +92,7 @@
 
 P1 的 Builder Agent 协议见 `../docs/LOCAL_AGENT_PROTOCOL.md`。当前阶段不依赖 Docker Desktop、Podman Machine 或其他本地 VM；Process Runtime 始终标记为 `degraded / unisolated_process` 且不能获得生产资格。OCI Runtime 仅保留为 Lab 参考，不进入默认启动路径。
 
-2026-09-23 已完成首个真实本地案例：Codex 在独立 Git Worktree 中修改 TypeScript 应用，自动测试 6/6 通过，生成可复验 Evidence Package，由独立 Reviewer 身份查看 Evidence 后批准确定 Head SHA。案例报告见 `../docs/REAL_CASE_2026-09-23_IMPORT_VALIDATOR.md`；目标分支保持未合并，避免把脚本审批冒充真实人工合并授权。
+2026-09-23 已完成首个真实本地案例：Codex 在独立 Git Worktree 中修改 TypeScript 应用，自动测试 6/6 通过，生成可复验 Evidence Package，由独立 Reviewer 身份查看 Evidence 后批准确定 Head SHA。案例报告见 `../docs/REAL_CASE_2026-09-23_IMPORT_VALIDATOR.md`。2026-09-29 起，重复执行脚本进一步覆盖 Reviewer 指派、Decision Brief、合并、Application 构建产物绑定、独立 Release Approver 批准和 Event Log 链校验。
 
 ## 本地运行
 
@@ -108,7 +108,7 @@ npm run server:start
 
 完成首次初始化（创建 Owner）后，`npm run seed:demo` 给默认项目写入一套演示：在数据目录下建一个发票服务示例仓库并接到默认项目，由一个脚本化 Builder（不调模型、不联网）走真实流水线——Run、仓库声明的 Check、`@baseline` 复跑、证据包、审查与合并——留下五条工作项：已合并、待审查、被失败测试阻塞、到时间预算交出的部分变更（批准需书面确认）、Intent 待批准。演示成员（`demo-*`）用随机密码创建、写完即停用，没人能以它们登录；待审查那条留给真实成员来审。默认项目已有工作项时脚本什么都不做；`npm run test:seed-demo` 在临时库上验证这套结果。
 
-真实案例驱动脚本为 `npm run case:real`。它需要显式提供 Owner、Reviewer 密码与目标仓库路径，并要求服务已配置 `CONTROL_PLANE_AGENT_EXECUTABLE` 和 `CONTROL_PLANE_AGENT_ARGS_JSON`。Check、Context 与项目执行策略不再由服务启动变量提供，而是从目标仓库基线 Revision 的 `.aperture/project.json` 加载。脚本不保存明文密码。
+真实案例驱动脚本为 `npm run case:real`。它需要显式提供 `REAL_CASE_OWNER_PASSWORD`、`REAL_CASE_REVIEWER_PASSWORD` 和 `REAL_CASE_RELEASE_APPROVER_PASSWORD`，并要求服务已配置 `CONTROL_PLANE_AGENT_EXECUTABLE` 和 `CONTROL_PLANE_AGENT_ARGS_JSON`。未提供 `REAL_CASE_REPOSITORY` 时，脚本从受版本控制的模板生成一个带独立 Git 历史的临时案例仓库；提供时则使用指定仓库。Check、Context、Skill 与项目执行策略从基线 Revision 的 `.aperture/project.json` 加载。成功后脚本走通 Intent → Run → Evidence → Review → Merge → Release → Event Log，并把 JSON 与 Markdown 报告写入 `../output/real-cases/`。脚本不保存明文密码。
 
 ## Agent Runner 启动
 

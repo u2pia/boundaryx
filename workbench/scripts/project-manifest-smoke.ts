@@ -5,9 +5,10 @@ import { execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { loadProjectManifest } from '../server/project-manifest.ts'
+import { loadProjectManifest, validateIntentVerifiedBy } from '../server/project-manifest.ts'
 import { bindProjectSkills, PROJECT_SKILL_MAX_BYTES } from '../server/project-skills.ts'
 import { sha256 } from '../server/security.ts'
+import type { IntentVersion } from '../server/types.ts'
 
 const root = mkdtempSync(join(tmpdir(), 'aperture-project-manifest-'))
 const git = (...args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' }).trim()
@@ -50,6 +51,28 @@ try {
   const tooLarge = load({ schemaVersion: 'aperture.project.v2', ...base, skills: [{ name: 'too-large', path: '.aperture/skills/too-large.md', description: 'Too large.' }] })
   assert.throws(() => bindProjectSkills(root, tooLarge.baseSha, tooLarge.manifest.skills), refused('project_skill_too_large'))
 
+  const verifiedIntent = {
+    id: 'WI-1:v1',
+    riskLevel: 'medium',
+    acceptanceCriteria: [{
+      id: 'WI-1:v1:AC-1',
+      ordinal: 1,
+      statement: 'the unit suite passes',
+      criticality: 'critical',
+      verificationType: 'deterministic',
+      verifiedBy: ['unit'],
+    }],
+  } as IntentVersion
+  assert.doesNotThrow(() => validateIntentVerifiedBy(v2.manifest, verifiedIntent), 'deterministic criteria may bind a declared test check')
+  assert.throws(() => validateIntentVerifiedBy(v2.manifest, {
+    ...verifiedIntent,
+    acceptanceCriteria: [{ ...verifiedIntent.acceptanceCriteria[0], verifiedBy: ['made-up-check'] }],
+  }), refused('intent_verified_by_invalid', /declares missing check made-up-check/u))
+  assert.throws(() => validateIntentVerifiedBy(v2.manifest, {
+    ...verifiedIntent,
+    acceptanceCriteria: [{ ...verifiedIntent.acceptanceCriteria[0], verificationType: 'model', verifiedBy: ['unit'] }],
+  }), refused('intent_verified_by_invalid', /model.*cannot be verified by unit \(test\)/u))
+
   assert.throws(() => load({ schemaVersion: 'aperture.project.v2', ...base, builder: { allowShell: 'yes' } }), refused('invalid_project_manifest', /builder\.allowShell must be boolean/u))
   assert.throws(() => load({ schemaVersion: 'aperture.project.v2', ...base, builder: { allowShell: true, network: true } }), refused('invalid_project_manifest', /Unknown builder settings: network/u))
   assert.throws(() => load({ schemaVersion: 'aperture.project.v2', ...base, builder: [] }), refused('invalid_project_manifest'))
@@ -58,7 +81,7 @@ try {
   assert.throws(() => load({ schemaVersion: 'aperture.project.v2', ...base, skills: [{ name: 'bad', path: '../outside.md', description: 'bad' }] }), refused('invalid_project_manifest', /normalized repository-relative path/u))
   assert.throws(() => load({ schemaVersion: 'aperture.project.v3', ...base }), refused('unsupported_project_manifest'))
 
-  console.log('project manifest smoke passed · v1 unchanged · v2 builder.allowShell defaults to no shell · Skills catalog validated and digested')
+  console.log('project manifest smoke passed · v1 unchanged · v2 builder.allowShell defaults to no shell · Skills catalog and Intent check bindings validated')
 } finally {
   rmSync(root, { recursive: true, force: true })
 }

@@ -289,9 +289,26 @@ export function loadProjectManifest(repositoryPath: string, baseSha: string): Pr
   return { path: PROJECT_MANIFEST_PATH, baseSha, digest: `sha256:${sha256(JSON.stringify(manifest))}`, manifest, evaluationDatasetDigest }
 }
 
+export function validateIntentVerifiedBy(manifest: ProjectManifest, intent: IntentVersion) {
+  const checks = new Map(manifest.checks.map((check) => [check.name, check]))
+  const compatibleKinds: Record<IntentVersion['acceptanceCriteria'][number]['verificationType'], Set<ProjectManifestCheck['kind']>> = {
+    deterministic: new Set(['test', 'evaluation', 'build']),
+    model: new Set(['evaluation']),
+    human: new Set(),
+  }
+  const invalid = intent.acceptanceCriteria.flatMap((criterion) => (criterion.verifiedBy ?? []).flatMap((name) => {
+    const check = checks.get(name)
+    if (!check) return [`AC-${criterion.ordinal} declares missing check ${name}`]
+    if (!compatibleKinds[criterion.verificationType].has(check.kind)) return [`AC-${criterion.ordinal} (${criterion.verificationType}) cannot be verified by ${name} (${check.kind})`]
+    return []
+  }))
+  if (invalid.length) throw new AppError(409, `Intent verifiedBy does not match ${PROJECT_MANIFEST_PATH}@${intent.id}: ${invalid.join('; ')}`, 'intent_verified_by_invalid')
+}
+
 export function applyProjectManifest(input: { binding: ProjectManifestBinding; workItem: WorkItem; intent: IntentVersion; runtime: AgentRunnerDescriptor; declaredContextPaths: string[] }) {
   const { manifest } = input.binding
   if (manifest.productType !== input.workItem.productType) throw new AppError(409, `Work item product type does not match the project manifest: the work item is ${input.workItem.productType}, .aperture/project.json declares ${manifest.productType}. Rebuild the Intent with the project's type (Intents → 详情 → 按项目类型重建).`, 'project_manifest_product_mismatch')
+  validateIntentVerifiedBy(manifest, input.intent)
   const riskRank = { low: 0, medium: 1, high: 2 }
   if (riskRank[input.intent.riskLevel] > riskRank[manifest.policy.maximumRisk]) throw new AppError(409, `Intent risk ${input.intent.riskLevel} exceeds project maximum ${manifest.policy.maximumRisk}`, 'project_manifest_risk_exceeded')
   if (input.runtime.isolation === 'unisolated_process' && !manifest.policy.allowUnisolatedRuntime) throw new AppError(409, 'Project policy forbids the configured unisolated process runtime', 'project_manifest_runtime_forbidden')

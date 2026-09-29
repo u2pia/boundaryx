@@ -1,0 +1,54 @@
+{
+  "schemaVersion": "aperture.project.v2",
+  "productType": "application",
+  "context": {
+    "required": [
+      "README.md",
+      "package.json",
+      "src/import-validator.ts",
+      "test/import-validator.test.ts",
+      "scripts/build.mjs"
+    ],
+    "allowed": [
+      "README.md",
+      "package.json",
+      "src/import-validator.ts",
+      "test/import-validator.test.ts",
+      "scripts/build.mjs"
+    ]
+  },
+  "skills": [
+    {
+      "name": "validate-import",
+      "path": ".aperture/skills/validate-import.md",
+      "description": "Implement import validation without weakening the governed tests."
+    }
+  ],
+  "checks": [
+    {
+      "name": "node-tests",
+      "kind": "test",
+      "command": ["npm", "test"],
+      "timeoutMs": 300000
+    },
+    {
+      "name": "application-build",
+      "kind": "build",
+      "command": ["node", "scripts/build.mjs"],
+      "timeoutMs": 300000
+    }
+  ],
+  "testPaths": ["test"],
+  "artifact": {
+    "profile": "application_build",
+    "buildCheck": "application-build",
+    "outputs": ["dist/import-validator.js"]
+  },
+  "builder": {
+    "allowShell": true
+  },
+  "policy": {
+    "maximumRisk": "medium",
+    "allowUnisolatedRuntime": true
+  }
+}

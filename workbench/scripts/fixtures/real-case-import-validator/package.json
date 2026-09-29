@@ -1,0 +1,9 @@
+{
+  "name": "real-case-import-validator",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/import-validator.test.ts",
+    "build": "node scripts/build.mjs"
+  }
+}
