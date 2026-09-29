@@ -63,6 +63,10 @@ export class AgentRunQueue {
     if (!entry) {
       const current = this.input.database.getAgentRun(runId)
       if (current.status === 'cancelled') return current
+      // Executing, but not by this process's queue (another Control Plane shares the database): there is no worker
+      // here to signal, so the request is recorded. The owning worker checks it before recording a result, and
+      // startup recovery closes a run with an accepted cancellation as cancelled.
+      if (current.status === 'running') return this.input.database.requestAgentRunCancellation(runId, actorId)
       this.pending = this.pending.filter((pending) => pending !== runId)
       // Cancelled while waiting in line: no worker ever claimed it, so the worktree it was admitted with is
       // removed right here rather than in a worker process that will never run.

@@ -185,6 +185,29 @@ try {
   database.completeAgentRun({ runId: orphanFailed.id, status: 'failed', actorId: setup.body!.actor.id, errorMessage: recoveredFailure.errorMessage })
   assert.equal(database.listAggregateEvents('agent_run', orphanFailed.id).filter((event) => event.eventType === 'agent_run.failed').length, failureEventCount)
 
+  // 5. An admission refused at insert time — here the unique Idempotency-Key index, as when another Control Plane
+  // process on the same database won the race — leaves neither a worktree nor an agent branch behind.
+  const keyedRequest = { workItemId, intentVersionId: recoveryIntent, baseRef: 'main', declaredContextPaths: ['README.md'], requestKey: 'raced-key-001', admissionRequestDigest: 'sha256:raced' }
+  const keyedRun = configured.runner!.prepare(keyedRequest, setup.body!.actor.id)
+  const worktreesBefore = git('worktree', 'list', '--porcelain')
+  const branchesBefore = git('branch', '--list', 'agent/*')
+  assert.throws(() => configured.runner!.prepare(keyedRequest, setup.body!.actor.id))
+  assert.equal(git('worktree', 'list', '--porcelain'), worktreesBefore)
+  assert.equal(git('branch', '--list', 'agent/*'), branchesBefore)
+  recoveryQueue.cancel(keyedRun.id, setup.body!.actor.id)
+
+  // 6. A run executing outside this queue (another process owns its worker) is not refused: the cancellation is
+  // recorded once, and recovery closes the run as cancelled.
+  const foreignRun = configured.runner!.prepare({ workItemId, intentVersionId: recoveryIntent, baseRef: 'main', declaredContextPaths: ['README.md'] }, setup.body!.actor.id)
+  assert.equal(database.claimAgentRun(foreignRun.id, 999_999, setup.body!.actor.id), true)
+  const foreignCancel = recoveryQueue.cancel(foreignRun.id, setup.body!.actor.id)
+  assert.equal(foreignCancel.status, 'running')
+  assert.ok(foreignCancel.cancellationRequestedAt)
+  recoveryQueue.cancel(foreignRun.id, setup.body!.actor.id)
+  assert.equal(database.listAggregateEvents('agent_run', foreignRun.id).filter((event) => event.eventType === 'agent_run.cancellation_requested').length, 1)
+  assert.deepEqual(recoveryQueue.reconcile(), [foreignRun.id])
+  assert.equal(database.getAgentRun(foreignRun.id).status, 'cancelled')
+
   console.log(`agent run queue smoke passed · worst /api/health latency during a run: ${worstProbe}ms over ${probes.length} probes · cancellation retry and restart recovery are idempotent`)
 } finally {
   agentRunQueue.close()

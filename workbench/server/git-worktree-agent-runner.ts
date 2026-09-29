@@ -189,14 +189,26 @@ export class GitWorktreeAgentRunner implements AgentRunner {
     const requestPath = join(runRoot, 'request.json')
     const timeoutMs = this.input.timeoutMs ?? 10 * 60 * 1000
     mkdirSync(runRoot, { recursive: true })
-    git(repositoryPath, ['worktree', 'add', '-b', branchRef, worktreePath, startSha])
-    const worktree = worktreeGitDirectories(repositoryPath, worktreePath)
-    gitIn(worktree, ['config', 'user.name', 'BoundaryX Local Agent'])
-    gitIn(worktree, ['config', 'user.email', 'local-agent@aperture.invalid'])
-    writeFileSync(requestPath, JSON.stringify({ runId, workItem, intent, workspace: worktreePath, projectManifest: { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, skills: projectSkills, evaluation: { profile: projectManifest.manifest.evaluation.profile, datasetPath: projectManifest.manifest.evaluation.datasetPath, holdout: Boolean(holdout), datasetDigest: projectManifest.evaluationDatasetDigest, thresholds: projectManifest.manifest.evaluation.thresholds }, artifact: projectManifest.manifest.artifact ?? null, builder: { allowShell: projectManifest.manifest.builder?.allowShell === true } }, declaredContextPaths, declaredContext: { baseSha, entries: declaredContext.entries.map((entry) => ({ path: entry.path, required: entry.required, fileBytes: entry.fileBytes, truncatedAt: entry.truncatedAt, content: entry.content })), omitted: declaredContext.omitted }, revision: revisionProposal ? { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedback: reviewFeedback } : null }, null, 2))
-    const runtimeContext = { runId, worktreePath, git: worktree, requestPath, timeoutMs }
-    const attestation = this.input.runtime.attest(runtimeContext)
-    const run = this.input.database.createAgentRun({ id: runId, workItemId: workItem.id, intentVersionId: intent.id, repositoryPath, baseRef: request.baseRef, baseSha, startSha, revisionOfProposalId: revisionProposal?.id, branchRef, worktreePath, adapterId: this.id, isolation: attestation.isolation, runtimeImageRef: attestation.imageRef, runtimeAttestationDigest: attestation.attestationDigest, networkEgress: attestation.networkEgress, productionEligible: attestation.productionEligible, requestKey: request.requestKey, admissionRequestDigest: request.admissionRequestDigest, startedByActorId: actorId, status: 'queued' })
+    let attestation: ReturnType<AgentExecutionRuntime['attest']>
+    let run: AgentRun
+    try {
+      git(repositoryPath, ['worktree', 'add', '-b', branchRef, worktreePath, startSha])
+      const worktree = worktreeGitDirectories(repositoryPath, worktreePath)
+      gitIn(worktree, ['config', 'user.name', 'BoundaryX Local Agent'])
+      gitIn(worktree, ['config', 'user.email', 'local-agent@aperture.invalid'])
+      writeFileSync(requestPath, JSON.stringify({ runId, workItem, intent, workspace: worktreePath, projectManifest: { path: projectManifest.path, baseSha: projectManifest.baseSha, digest: projectManifest.digest, skills: projectSkills, evaluation: { profile: projectManifest.manifest.evaluation.profile, datasetPath: projectManifest.manifest.evaluation.datasetPath, holdout: Boolean(holdout), datasetDigest: projectManifest.evaluationDatasetDigest, thresholds: projectManifest.manifest.evaluation.thresholds }, artifact: projectManifest.manifest.artifact ?? null, builder: { allowShell: projectManifest.manifest.builder?.allowShell === true } }, declaredContextPaths, declaredContext: { baseSha, entries: declaredContext.entries.map((entry) => ({ path: entry.path, required: entry.required, fileBytes: entry.fileBytes, truncatedAt: entry.truncatedAt, content: entry.content })), omitted: declaredContext.omitted }, revision: revisionProposal ? { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedback: reviewFeedback } : null }, null, 2))
+      const runtimeContext = { runId, worktreePath, git: worktree, requestPath, timeoutMs }
+      attestation = this.input.runtime.attest(runtimeContext)
+      run = this.input.database.createAgentRun({ id: runId, workItemId: workItem.id, intentVersionId: intent.id, repositoryPath, baseRef: request.baseRef, baseSha, startSha, revisionOfProposalId: revisionProposal?.id, branchRef, worktreePath, adapterId: this.id, isolation: attestation.isolation, runtimeImageRef: attestation.imageRef, runtimeAttestationDigest: attestation.attestationDigest, networkEgress: attestation.networkEgress, productionEligible: attestation.productionEligible, requestKey: request.requestKey, admissionRequestDigest: request.admissionRequestDigest, startedByActorId: actorId, status: 'queued' })
+    } catch (error) {
+      // Refused before the run row existed (e.g. its Idempotency-Key was taken by a concurrent admission), so
+      // nothing in the database points at this checkout or branch and no reconciler would ever remove them.
+      removeRunWorktree({ repositoryPath, worktreePath, runRoot })
+      try {
+        git(repositoryPath, ['branch', '-D', branchRef])
+      } catch {}
+      throw error
+    }
     this.input.database.saveAgentRunPlan({ runId, declaredContextPaths, requestPath, timeoutMs })
     this.input.database.recordAgentRunEvent(runId, 'agent_run.runtime_attested', attestation, actorId)
     if (revisionProposal) this.input.database.recordAgentRunEvent(runId, 'agent_run.revision_feedback_bound', { changeProposalId: revisionProposal.id, previousHeadRef: revisionProposal.headRef, previousHeadSha: revisionProposal.headSha, feedbackReviewIds: reviewFeedback.map((feedback) => feedback.reviewId), feedbackDigest: `sha256:${sha256(JSON.stringify(reviewFeedback))}` }, actorId)

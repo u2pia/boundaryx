@@ -20,7 +20,7 @@ import { independentTestSignalFromCriteria } from './criteria-coverage.ts'
 import { agentRunProgress } from './run-progress.ts'
 import { createSessionToken, sha256 } from './security.ts'
 import { trustProfileForControlPlane } from './trust-profile.ts'
-import { AppError, type AgentRunner, type AgentRunnerDescriptor, type CodeHostKind, type MergeMode, type ProjectRole, type SessionActor, type TeamRole } from './types.ts'
+import { AppError, type AgentRun, type AgentRunner, type AgentRunnerDescriptor, type CodeHostKind, type MergeMode, type ProjectRole, type SessionActor, type TeamRole } from './types.ts'
 
 const SESSION_COOKIE = 'aperture_session'
 
@@ -190,13 +190,24 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
   function startAgentRun(request: Parameters<AgentRunner['prepare']>[0], actorId: string, requestKey?: string, operation = 'agent_run.start') {
     if (!agentRunner) throw new AppError(503, 'Local Agent Runner is not configured', 'agent_runner_unavailable')
     const admissionRequestDigest = `sha256:${sha256(JSON.stringify({ operation, request }))}`
-    if (requestKey) {
-      const existing = database.getAgentRunByRequestKey(actorId, requestKey, admissionRequestDigest)
-      if (existing) return { agentRun: existing, status: 200, queuePosition: agentRunQueue?.position(existing.id), idempotentReplay: true }
+    const replay = () => {
+      const existing = requestKey ? database.getAgentRunByRequestKey(actorId, requestKey, admissionRequestDigest) : undefined
+      return existing ? { agentRun: existing, status: 200, queuePosition: agentRunQueue?.position(existing.id), idempotentReplay: true } : undefined
     }
+    const replayed = replay()
+    if (replayed) return replayed
     const boundRequest = requestKey ? { ...request, requestKey, admissionRequestDigest } : request
     if (!agentRunQueue) return { agentRun: agentRunner.run(boundRequest, actorId), status: 201, queuePosition: undefined, idempotentReplay: false }
-    const agentRun = agentRunner.prepare(boundRequest, actorId)
+    let agentRun: AgentRun
+    try {
+      agentRun = agentRunner.prepare(boundRequest, actorId)
+    } catch (error) {
+      // Another Control Plane process on the same database admitted this key between the lookup and the insert;
+      // the unique index refused ours, and the caller gets the run that won.
+      const raced = replay()
+      if (raced) return raced
+      throw error
+    }
     return { agentRun, status: 202, queuePosition: agentRunQueue.enqueue(agentRun.id), idempotentReplay: false }
   }
 
