@@ -16,6 +16,10 @@ const port = Number(process.env.CONTROL_PLANE_PORT ?? 8787)
 // Loopback by default. A small team on one LAN sets CONTROL_PLANE_HOST=0.0.0.0 (or the machine's LAN address).
 const host = process.env.CONTROL_PLANE_HOST ?? '127.0.0.1'
 const loopback = host === '127.0.0.1' || host === '::1' || host === 'localhost'
+const publicUrl = process.env.CONTROL_PLANE_PUBLIC_URL?.trim()
+const secureCookieSetting = process.env.CONTROL_PLANE_SECURE_COOKIES?.trim().toLowerCase()
+if (secureCookieSetting && secureCookieSetting !== 'true' && secureCookieSetting !== 'false') throw new Error('CONTROL_PLANE_SECURE_COOKIES must be true or false')
+const secureCookies = secureCookieSetting ? secureCookieSetting === 'true' : Boolean(publicUrl?.startsWith('https://'))
 
 function joinDefault(...parts: string[]) {
   return parts.join('/')
@@ -23,18 +27,23 @@ function joinDefault(...parts: string[]) {
 
 mkdirSync(dataDirectory, { recursive: true })
 const database = new ControlPlaneDatabase(databasePath, resolve(serverDirectory, 'migrations'))
+if (!loopback && !database.hasActors()) {
+  database.close()
+  throw new Error('Refusing to expose an uninitialized Control Plane on a network interface. Start on 127.0.0.1, create the Owner, stop it, then bind CONTROL_PLANE_HOST to the LAN address.')
+}
 const configuredAgent = createConfiguredAgentRunner({ database, dataDirectory })
 const agentRunQueue = configuredAgent.runner ? new AgentRunQueue({ database, databasePath, dataDirectory, concurrency: Number(process.env.CONTROL_PLANE_RUN_CONCURRENCY ?? 2), runner: configuredAgent.runner }) : undefined
 const orphaned = agentRunQueue?.reconcile() ?? []
 const githubOAuth = githubOAuthConfigFromEnv(process.env, `http://127.0.0.1:${port}`)
-const codeHostSyncer = new CodeHostSyncer({ database, publicUrl: process.env.CONTROL_PLANE_PUBLIC_URL })
+const codeHostSyncer = new CodeHostSyncer({ database, publicUrl })
 const codeHostSyncSeconds = Number(process.env.CONTROL_PLANE_CODE_HOST_SYNC_SECONDS ?? 30)
 codeHostSyncer.start(codeHostSyncSeconds)
-const server = createControlPlaneServer({ database, staticDirectory: resolve(workbenchDirectory, 'dist'), agentRunner: configuredAgent.runner, agentRunQueue, agentRuntimeDescriptor: configuredAgent.descriptor, evidenceStore: configuredAgent.evidenceStore, githubOAuth, codeHostSyncer })
+const server = createControlPlaneServer({ database, staticDirectory: resolve(workbenchDirectory, 'dist'), agentRunner: configuredAgent.runner, agentRunQueue, agentRuntimeDescriptor: configuredAgent.descriptor, evidenceStore: configuredAgent.evidenceStore, githubOAuth, codeHostSyncer, secureCookies })
 
 server.listen(port, host, () => {
   console.log(`${new Date().toISOString()} Local Control Plane listening on http://${host}:${port}`)
-  if (!loopback) console.log('Warning: reachable from the network over plain HTTP; passwords and session cookies travel unencrypted. Keep it on a trusted LAN or put a TLS proxy in front.')
+  if (!loopback && !secureCookies) console.log('Warning: reachable from the network without Secure session cookies; passwords and sessions need a trusted LAN or an HTTPS proxy with CONTROL_PLANE_SECURE_COOKIES=true.')
+  if (secureCookies) console.log('Session cookies: Secure enabled; browsers must enter through an HTTPS public URL.')
   console.log(`SQLite: ${databasePath}`)
   console.log(`Agent Runner: ${configuredAgent.runner?.id ?? 'disabled'} · ${configuredAgent.descriptor.status} · ${configuredAgent.descriptor.isolation}`)
   console.log(`Identity: ${database.getIdentityMode()} mode · GitHub sign-in ${githubOAuth ? `configured · callback ${githubOAuth.redirectUri}` : 'not configured'}`)

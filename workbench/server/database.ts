@@ -28,6 +28,7 @@ function parseJson<T>(value: string): T {
 export const DEFAULT_PROJECT_ID = 'PRJ-DEFAULT'
 /** Migration 020: records what a code host reported. Disabled, has no credential, and can never decide anything. */
 export const SYSTEM_CODE_HOST_ACTOR_ID = 'ACT-SYSTEM-CODE-HOST'
+const DUMMY_PASSWORD_HASH = hashPassword('aperture-invalid-credential-sentinel')
 const ALL_ROLES: TeamRole[] = ['owner', 'maintainer', 'reviewer', 'developer']
 const intentDraftFields: IntentDraftField[] = ['goal', 'constraints', 'nonGoals', 'examples', 'riskLevel', 'acceptanceCriteria']
 const PROJECT_ROLES: ProjectRole[] = ['maintainer', 'reviewer', 'developer']
@@ -550,7 +551,8 @@ export class ControlPlaneDatabase {
 
   authenticate(username: string, password: string) {
     const row = this.db.prepare('SELECT a.id, a.username, a.display_name, a.role, a.status, c.password_hash FROM actors a JOIN local_credentials c ON c.actor_id = a.id WHERE a.username = ?').get(username.trim()) as Record<string, string> | undefined
-    if (!row || row.status !== 'active' || !verifyPassword(password, row.password_hash)) throw new AppError(401, 'Invalid username or password', 'invalid_credentials')
+    const passwordValid = verifyPassword(password, row?.password_hash ?? DUMMY_PASSWORD_HASH)
+    if (!row || row.status !== 'active' || !passwordValid) throw new AppError(401, 'Invalid username or password', 'invalid_credentials')
     return { id: row.id, username: row.username, displayName: row.display_name, role: row.role as TeamRole, authMethod: 'password' } satisfies SessionActor
   }
 
@@ -1792,6 +1794,19 @@ export class ControlPlaneDatabase {
 
   verifyAggregateEventChain(aggregateType: string, aggregateId: string) {
     return this.eventChainFaults(aggregateType, aggregateId).length === 0
+  }
+
+  getEventIntegrity(aggregateType: string, aggregateId: string) {
+    const events = this.listAggregateEvents(aggregateType, aggregateId)
+    const faults = events.length ? this.eventChainFaults(aggregateType, aggregateId) : ['event chain is empty']
+    return {
+      aggregateType,
+      aggregateId,
+      valid: faults.length === 0,
+      eventCount: events.length,
+      chainHead: events.at(-1)?.eventDigest ?? 'genesis',
+      faults,
+    }
   }
 
   /**

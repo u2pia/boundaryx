@@ -20,7 +20,7 @@ const database = new ControlPlaneDatabase(join(root, 'control-plane.db'), migrat
 const agentScript = join(root, 'http-agent.mjs')
 const agentRunner = new LocalCommandAgentRunner({ database, executable: process.execPath, args: [agentScript], worktreeRoot: join(root, 'agent-runs'), timeoutMs: 10_000 })
 const evidenceStore = new LocalEvidenceStore(join(root, 'evidence'))
-const handler = createControlPlaneRequestHandler({ database, agentRunner, evidenceStore })
+const handler = createControlPlaneRequestHandler({ database, agentRunner, evidenceStore, secureCookies: true, loginProtection: { maxAccountFailures: 2, maxSourceFailures: 20 } })
 
 function git(...args: string[]) {
   return execFileSync('git', ['-C', repositoryPath, ...args], { encoding: 'utf8' }).trim()
@@ -46,7 +46,7 @@ async function request<T>(path: string, input: { method?: string; cookie?: strin
   const text = Buffer.concat(chunks).toString('utf8')
   const setCookie = responseHeaders['set-cookie']
   const cookieValue = Array.isArray(setCookie) ? setCookie[0] : typeof setCookie === 'string' ? setCookie : undefined
-  return { status, cookie: cookieValue?.split(';')[0], body: text ? JSON.parse(text) as T : undefined }
+  return { status, cookie: cookieValue?.split(';')[0], setCookie: cookieValue, body: text ? JSON.parse(text) as T : undefined }
 }
 
 mkdirSync(repositoryPath)
@@ -78,6 +78,7 @@ try {
   const setup = await request<{ actor: { id: string } }>('/api/setup', { body: { username: 'owner', displayName: 'Local Owner', password: 'owner-password-2026' } })
   assert.equal(setup.status, 201)
   assert.ok(setup.cookie)
+  assert.match(setup.setCookie!, /; Secure$/u)
   const ownerCookie = setup.cookie!
   const ownerId = setup.body!.actor.id
   assert.equal((await request('/api/projects/PRJ-DEFAULT/settings', { cookie: ownerCookie, body: { repositoryPath } })).status, 200)
@@ -307,6 +308,23 @@ try {
   const session = await request<{ actor: { id: string } }>('/api/session', { cookie: ownerCookie })
   assert.equal(session.body?.actor.id, ownerId)
   assert.equal((await request('/api/events?limit=50', { cookie: ownerCookie })).status, 200)
+  assert.equal((await request(`/api/event-integrity/change_proposal/${proposal.id}`)).status, 401)
+  const integrity = await request<{ integrity: { valid: boolean; eventCount: number; chainHead: string; faults: string[] } }>(`/api/event-integrity/change_proposal/${proposal.id}`, { cookie: ownerCookie })
+  assert.equal(integrity.status, 200)
+  assert.equal(integrity.body?.integrity.valid, true)
+  assert.ok((integrity.body?.integrity.eventCount ?? 0) > 0)
+  assert.match(integrity.body!.integrity.chainHead, /^sha256:[0-9a-f]{64}$/u)
+  assert.deepEqual(integrity.body?.integrity.faults, [])
+
+  const firstFailedLogin = await request<{ error: { code: string } }>('/api/auth/login', { body: { username: 'reviewer', password: 'wrong-reviewer-password' } })
+  assert.equal(firstFailedLogin.status, 401)
+  assert.equal(firstFailedLogin.body?.error.code, 'invalid_credentials')
+  const secondFailedLogin = await request<{ error: { code: string } }>('/api/auth/login', { body: { username: 'reviewer', password: 'wrong-reviewer-password' } })
+  assert.equal(secondFailedLogin.status, 429)
+  assert.equal(secondFailedLogin.body?.error.code, 'login_rate_limited')
+  const blockedCorrectLogin = await request<{ error: { code: string } }>('/api/auth/login', { body: { username: 'reviewer', password: 'reviewer-password-2026' } })
+  assert.equal(blockedCorrectLogin.status, 429)
+  assert.equal(blockedCorrectLogin.body?.error.code, 'login_rate_limited')
 
   console.log(`local control plane HTTP smoke passed · ${proposal.id} · direct handler`)
 } finally {

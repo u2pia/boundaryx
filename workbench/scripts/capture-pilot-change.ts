@@ -7,6 +7,7 @@ type ChangeProposal = { id: string; projectId: string; workItemId: string; inten
 type MergeEvidence = { id: string; approvedHeadSha: string; mergedSha: string; evidenceDigest: string }
 type ReleaseCandidate = { id: string; changeProposalId: string; mergeEvidenceId: string; commitSha: string; sourceTreeDigest: string; contentDigest: string; artifactClass: string; artifactBindingDigest?: string; artifactEvidence: Array<{ packageDigest: string; artifactDigests: string[]; sourceCommitSha: string }>; status: string; createdByActorId: string; approval?: { approverActorId: string; candidateContentDigest: string } }
 type DecisionBrief = { context: { observation: string; controlPlaneInjected: number; builderReported: number; rejected: number; undeclared: number; skillsLoaded: number; skillsRejected: number }; execution: { source: string; runId?: string } }
+type EventIntegrity = { aggregateType: string; aggregateId: string; valid: boolean; eventCount: number; chainHead: string; faults: string[] }
 
 const baseUrl = process.env.PILOT_CONTROL_PLANE_URL ?? 'http://127.0.0.1:8787'
 const proposalId = process.env.PILOT_CHANGE_PROPOSAL_ID
@@ -36,6 +37,8 @@ const brief = (await request<{ decisionBrief: DecisionBrief }>(`/api/change-prop
 const candidates = (await request<{ releaseCandidates: ReleaseCandidate[] }>('/api/release-candidates', cookie)).body.releaseCandidates
 const candidate = candidates.find((item) => item.changeProposalId === proposal.id)
 const allEvents = (await request<{ events: DomainEvent[] }>('/api/events?limit=1000', cookie)).body.events
+const proposalIntegrity = (await request<{ integrity: EventIntegrity }>(`/api/event-integrity/change_proposal/${encodeURIComponent(proposal.id)}`, cookie)).body.integrity
+const releaseIntegrity = candidate ? (await request<{ integrity: EventIntegrity }>(`/api/event-integrity/release_candidate/${encodeURIComponent(candidate.id)}`, cookie)).body.integrity : undefined
 
 function orderedChain(events: DomainEvent[], aggregateType: string, aggregateId: string) {
   return events.filter((event) => event.aggregateType === aggregateType && event.aggregateId === aggregateId).sort((left, right) => left.aggregateVersion - right.aggregateVersion)
@@ -76,6 +79,8 @@ const reasons = [
   ...(proposalResponse.mergeEvidence && proposalResponse.mergeEvidence.approvedHeadSha === proposal.headSha ? [] : ['Merge Evidence is not bound to the approved Head']),
   ...(proposalResponse.mergeEvidence && candidate?.commitSha === proposalResponse.mergeEvidence.mergedSha ? [] : ['Release Candidate commit is not bound to Merge Evidence']),
   ...(candidate?.approval?.candidateContentDigest === candidate?.contentDigest ? [] : ['Release approval is not bound to the candidate content digest']),
+  ...(proposalIntegrity.valid ? [] : [`Change Proposal event seals do not verify: ${proposalIntegrity.faults.join('; ')}`]),
+  ...(releaseIntegrity?.valid ? [] : [`Release Candidate event seals do not verify: ${releaseIntegrity?.faults.join('; ') ?? 'candidate missing'}`]),
   ...chainIssues(proposalEvents, 'Change Proposal'),
   ...chainIssues(releaseEvents, 'Release Candidate'),
 ]
@@ -97,6 +102,7 @@ const report = {
   mergeEvidence: proposalResponse.mergeEvidence ? { id: proposalResponse.mergeEvidence.id, digest: proposalResponse.mergeEvidence.evidenceDigest, mergedSha: proposalResponse.mergeEvidence.mergedSha } : undefined,
   releaseCandidate: candidate ? { id: candidate.id, status: candidate.status, contentDigest: candidate.contentDigest, sourceTreeDigest: candidate.sourceTreeDigest, artifactClass: candidate.artifactClass, artifactBindingDigest: candidate.artifactBindingDigest, artifactDigests: candidate.artifactEvidence.flatMap((evidence) => evidence.artifactDigests) } : undefined,
   eventChainHeads: { changeProposal: proposalEvents.at(-1)?.eventDigest, releaseCandidate: releaseEvents.at(-1)?.eventDigest },
+  eventIntegrity: { changeProposal: proposalIntegrity, releaseCandidate: releaseIntegrity },
   pilotMetrics: {
     review: {
       assignmentToDecisionSeconds: elapsedSeconds(assignmentEvent?.recordedAt, approvalEvent?.recordedAt),

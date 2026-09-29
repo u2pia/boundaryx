@@ -9,6 +9,7 @@ import { createPkcePair, fetchGithubIdentity, githubAuthorizeUrl, type GithubOAu
 import type { LocalEvidenceStore, StoredEvidencePackage } from './local-evidence-store.ts'
 import { LocalGitAuthority } from './local-git-authority.ts'
 import { LocalReleaseAuthority } from './local-release-authority.ts'
+import { LoginThrottle, type LoginProtectionOptions } from './login-protection.ts'
 import { requestContext, type RequestContext } from './request-context.ts'
 import { projectContext, projectContextFile } from './project-context.ts'
 import { projectProductType } from './project-product-type.ts'
@@ -60,12 +61,12 @@ function sendNoContent(response: ServerResponse, headers: Record<string, string>
   response.end()
 }
 
-function sessionCookie(token: string, expiresAt: string) {
-  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Expires=${new Date(expiresAt).toUTCString()}`
+function sessionCookie(token: string, expiresAt: string, secure: boolean) {
+  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Expires=${new Date(expiresAt).toUTCString()}${secure ? '; Secure' : ''}`
 }
 
-function clearSessionCookie() {
-  return `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`
+function clearSessionCookie(secure: boolean) {
+  return `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure ? '; Secure' : ''}`
 }
 
 function requireString(body: Record<string, unknown>, key: string) {
@@ -158,8 +159,10 @@ function serveStatic(response: ServerResponse, staticDirectory: string, pathname
   return true
 }
 
-export function createControlPlaneRequestHandler(input: { database: ControlPlaneDatabase; staticDirectory?: string; agentRunner?: AgentRunner; agentRunQueue?: AgentRunQueue; agentRuntimeDescriptor?: AgentRunnerDescriptor; evidenceStore?: LocalEvidenceStore; githubOAuth?: GithubOAuthConfig; codeHostSyncer?: CodeHostSyncer }) {
+export function createControlPlaneRequestHandler(input: { database: ControlPlaneDatabase; staticDirectory?: string; agentRunner?: AgentRunner; agentRunQueue?: AgentRunQueue; agentRuntimeDescriptor?: AgentRunnerDescriptor; evidenceStore?: LocalEvidenceStore; githubOAuth?: GithubOAuthConfig; codeHostSyncer?: CodeHostSyncer; secureCookies?: boolean; loginProtection?: LoginProtectionOptions }) {
   const { database, staticDirectory, agentRunner, agentRunQueue } = input
+  const secureCookies = input.secureCookies ?? false
+  const loginThrottle = new LoginThrottle(input.loginProtection)
   // Without a running syncer (tests, a server started without one) the sync route still works on demand.
   const codeHostSyncer = input.codeHostSyncer ?? new CodeHostSyncer({ database })
   const agentRuntimeDescriptor = input.agentRuntimeDescriptor ?? agentRunner?.descriptor
@@ -226,7 +229,7 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
           const proof = await fetchGithubIdentity(input.githubOAuth, url.searchParams.get('code') ?? '', verifier)
           const actor = database.completeGithubLogin(proof)
           const session = database.createSession(actor.id, 8 * 60 * 60, 'github')
-          return redirect(response, back('identity=github'), { 'set-cookie': sessionCookie(session.token, session.expiresAt) })
+          return redirect(response, back('identity=github'), { 'set-cookie': sessionCookie(session.token, session.expiresAt, secureCookies) })
         } catch (error) {
           const code = error instanceof AppError ? error.code : 'github_login_failed'
           if (!(error instanceof AppError)) console.error(error)
@@ -239,20 +242,37 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
         const body = await readJson(request)
         const actor = database.createActor({ username: requireString(body, 'username'), displayName: requireString(body, 'displayName'), password: requireString(body, 'password'), role: 'owner' })
         const session = database.createSession(actor.id)
-        return sendJson(response, 201, { actor, expiresAt: session.expiresAt }, { 'set-cookie': sessionCookie(session.token, session.expiresAt) })
+        return sendJson(response, 201, { actor, expiresAt: session.expiresAt }, { 'set-cookie': sessionCookie(session.token, session.expiresAt, secureCookies) })
       }
 
       if (method === 'POST' && path === '/api/auth/login') {
         const body = await readJson(request)
-        const actor = database.authenticate(requireString(body, 'username'), requireString(body, 'password'))
+        const username = requireString(body, 'username')
+        const password = requireString(body, 'password')
+        const accountKey = `account:${username.toLocaleLowerCase('en-US')}`
+        const sourceKey = `source:${request.socket?.remoteAddress ?? 'unknown-source'}`
+        if (loginThrottle.isBlocked(accountKey) || loginThrottle.isBlocked(sourceKey)) throw new AppError(429, 'Too many failed sign-in attempts; try again later', 'login_rate_limited')
+        let actor: SessionActor
+        try {
+          actor = database.authenticate(username, password)
+        } catch (error) {
+          if (error instanceof AppError && error.code === 'invalid_credentials') {
+            const accountBlocked = loginThrottle.recordFailure(accountKey, loginThrottle.maxAccountFailures)
+            const sourceBlocked = loginThrottle.recordFailure(sourceKey, loginThrottle.maxSourceFailures)
+            if (accountBlocked || sourceBlocked) throw new AppError(429, 'Too many failed sign-in attempts; try again later', 'login_rate_limited')
+          }
+          throw error
+        }
+        loginThrottle.clear(accountKey)
+        loginThrottle.clear(sourceKey)
         const session = database.createSession(actor.id)
-        return sendJson(response, 200, { actor, expiresAt: session.expiresAt }, { 'set-cookie': sessionCookie(session.token, session.expiresAt) })
+        return sendJson(response, 200, { actor, expiresAt: session.expiresAt }, { 'set-cookie': sessionCookie(session.token, session.expiresAt, secureCookies) })
       }
 
       if (method === 'POST' && path === '/api/auth/logout') {
         const token = parseCookies(request.headers.cookie)[SESSION_COOKIE]
         if (token) database.revokeSession(token)
-        return sendNoContent(response, { 'set-cookie': clearSessionCookie() })
+        return sendNoContent(response, { 'set-cookie': clearSessionCookie(secureCookies) })
       }
 
       if (method === 'GET' && path === '/api/session') {
@@ -723,6 +743,15 @@ export function createControlPlaneRequestHandler(input: { database: ControlPlane
       if (method === 'GET' && path === '/api/decisions') {
         const visibleProposals = new Set(database.listChangeProposals(scope()).map((proposal) => proposal.id))
         return sendJson(response, 200, { decisions: database.listGovernanceDecisions().filter((decision) => visibleProposals.has(decision.changeProposalId)) })
+      }
+
+      const eventIntegrityRoute = routeMatch(path, /^\/api\/event-integrity\/(?<aggregateType>change_proposal|release_candidate)\/(?<aggregateId>[^/]+)$/u)
+      if (method === 'GET' && eventIntegrityRoute) {
+        const projectId = eventIntegrityRoute.aggregateType === 'change_proposal'
+          ? database.getChangeProposal(eventIntegrityRoute.aggregateId).projectId
+          : database.getReleaseCandidate(eventIntegrityRoute.aggregateId).projectId
+        requireIn(projectId)
+        return sendJson(response, 200, { integrity: database.getEventIntegrity(eventIntegrityRoute.aggregateType, eventIntegrityRoute.aggregateId) })
       }
 
       if (method === 'GET' && path === '/api/events') return sendJson(response, 200, { events: database.listEvents(Number(url.searchParams.get('limit') ?? 200), scope()) })

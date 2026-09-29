@@ -12,6 +12,7 @@
 
 - 地址：`http://<服务所在机器的局域网 IP>:8787`，由管理员告诉你。
 - 账号：由管理员创建。目前只有管理员能改密码，要改密码请找管理员。
+- 连续输错密码会触发临时封锁；封锁期间即使密码正确也不能登录，请等待 15 分钟或联系管理员。
 - 侧栏顶部的项目切换器选 **试用项目**。「默认项目」里是演示数据，可以随便看，不要在里面干活。
 
 ## 角色：谁能做什么
@@ -98,9 +99,9 @@
 
 ## 附：管理员准备清单（Owner）
 
-1. 服务机器设为不休眠，并固定局域网 IP。启动服务时加上 `CONTROL_PLANE_HOST=0.0.0.0`，否则服务只接受本机访问，同事连不上。这时是明文 HTTP，只在可信内网使用。
+1. 先用默认 `127.0.0.1` 启动并在本机创建 Owner；未初始化的服务会拒绝绑定局域网，避免他人抢占第一个管理员。停止后再设置 `CONTROL_PLANE_HOST=0.0.0.0` 并固定局域网 IP。纯 HTTP 只用于可信内网；有 TLS 反向代理时设置 `CONTROL_PLANE_PUBLIC_URL=https://...`（会自动启用 Secure Cookie），或显式设置 `CONTROL_PLANE_SECURE_COOKIES=true`。启用后不要再让成员直接访问后端 HTTP 地址。
 2. 在「团队」页为每个人创建账号。
 3. 在「项目」页新建 **试用项目**，接入要试用的仓库（本地 Git 或 GitHub），并把成员加进项目、分好角色。审查人至少两位。
 4. 在仓库里提交 `.aperture/project.json`，写明 `productType`（`application` 或 `agent_system`）和测试命令。项目下所有 Intent 的类型都取自这里；没提交它之前，项目里建不了 Intent。如果有现成测试，用 `testPaths` 声明测试目录，这样能避开「仅自带测试」的卡点。格式见 `workbench/README.md` 的「Project Manifest」一节。
 5. 在「集成」页确认 LLM Provider 可用，先自己跑通一条低风险需求。
-6. 每天备份一次数据目录 `workbench/.aperture-live/`，备份前先停服务，或者用 `sqlite3 .backup` 备份数据库。
+6. 每天运行 `CONTROL_PLANE_DATA_DIR=.aperture-live npm run backup:create -- <备份目录>`；它会创建一致快照并验证 Event Log、Evidence 与 Holdout。外置 Event Seal Key 和项目 Git 仓库要分开备份。每月至少按 `docs/BACKUP_RECOVERY.md` 恢复到新目录演练一次。
